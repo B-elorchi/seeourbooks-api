@@ -1,0 +1,16 @@
+[Unit]
+Description=See Our Book Summarizer API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/services/summarizer
+ExecStart=/opt/services/summarizer/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8080 --workers 2
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=summarizer
+
+[Install]
+WantedBy=multi-user.target
