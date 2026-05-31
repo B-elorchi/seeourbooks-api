@@ -44,6 +44,8 @@ def _resolve_steps(requested: list[str]) -> set[str]:
     # Enforce dependencies
     if "audio_full" in steps or "audio_chapters" in steps:
         steps.add("summarize")
+    if "mindmap" in steps or "mindmap_chapters" in steps:
+        steps.add("summarize")
     if "alt_text" in steps:
         steps.add("cover")
     return steps
@@ -377,10 +379,67 @@ async def run_pipeline(req: PipelineReq) -> dict:
                 errors["mindmap"] = str(e)
                 step_status["mindmap"] = "failed"
 
+        # ─────────────────────────────────────────────────────────────────────
+        # STEP: mindmap_chapters  (one mindmap per chapter)
+        # ─────────────────────────────────────────────────────────────────────
+        # index → {"url": str, "data": dict | None, "format": "mermaid" | "json"}
+        chapter_mindmap: dict[int, dict] = {}
+
+        if "mindmap_chapters" in steps and mindmap_enabled and chapter_results:
+            step_status["mindmap_chapters"] = "running"
+            set_step("mindmap_chapters")
+            ch_errors = 0
+            for ch in chapter_results:
+                if not ch.get("summary"):
+                    continue
+                try:
+                    idx       = ch["index"]
+                    ch_title  = ch.get("title") or f"Chapter {idx}"
+                    ch_text   = ch["summary"]
+
+                    if mindmap_format == "json":
+                        data = await generate_json_mindmap(
+                            ch_title, ch_text, req.language, model=model_mindmap
+                        )
+                        json_path = os.path.join(tmp, f"ch{idx}_mindmap.json")
+                        with open(json_path, "w", encoding="utf-8") as f:
+                            json_module.dump(data, f, ensure_ascii=False)
+                        key = f"books/{req.book_id}/chapters/ch_{idx:02d}_mindmap.json"
+                        url = upload_file(json_path, key, CONTENT_TYPES[".json"])
+                        chapter_mindmap[idx] = {"url": url, "data": data, "format": "json"}
+                    else:
+                        mermaid = await generate_mermaid_code(
+                            ch_title, ch_text, req.language, model=model_mindmap
+                        )
+                        svg_path = os.path.join(tmp, f"ch{idx}_mindmap.svg")
+                        await render_mermaid_svg(mermaid, svg_path)
+                        key = f"books/{req.book_id}/chapters/ch_{idx:02d}_mindmap.svg"
+                        url = upload_file(svg_path, key, CONTENT_TYPES[".svg"])
+                        chapter_mindmap[idx] = {"url": url, "data": None, "format": "mermaid"}
+                except Exception as e:
+                    ch_errors += 1
+                    errors[f"mindmap_chapter_{ch['index']}"] = str(e)
+
+            # Status reflects how many chapter mindmaps actually got generated
+            attempted = sum(1 for c in chapter_results if c.get("summary"))
+            step_status["mindmap_chapters"] = (
+                "failed"  if ch_errors == attempted and attempted > 0 else
+                "partial" if ch_errors > 0 else
+                "done"    if attempted > 0 else
+                "skipped"
+            )
+
     # ── Attach audio URLs to chapter results ─────────────────────────────────
     lang = req.language
     for ch in chapter_results:
         ch[f"audio_{lang}"] = chapter_audio.get(ch["index"])
+        # Attach per-chapter mindmap if generated
+        cm = chapter_mindmap.get(ch["index"])
+        if cm:
+            ch["mindmap_url"]    = cm["url"]
+            ch["mindmap_format"] = cm["format"]
+            if cm["data"] is not None:
+                ch["mindmap_data"] = cm["data"]
 
     # ── Determine overall status ──────────────────────────────────────────────
     active = {s for s in steps if s in ALL_STEPS}

@@ -2,7 +2,11 @@ from pydantic import BaseModel, field_validator
 
 
 # Valid pipeline step names — keep in sync with ALL_STEPS in orchestrator.py
-VALID_STEPS = {"summarize", "audio_full", "audio_chapters", "cover", "alt_text", "mindmap"}
+VALID_STEPS = {
+    "summarize", "audio_full", "audio_chapters",
+    "cover", "alt_text",
+    "mindmap", "mindmap_chapters",
+}
 
 
 class SumReq(BaseModel):
