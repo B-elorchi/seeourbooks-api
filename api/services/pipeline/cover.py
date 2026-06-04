@@ -388,8 +388,23 @@ async def generate_cover(
     The prompt is built from the book's actual content (summary, genres, year)
     so the generated image reflects the story — not just the title.
     """
-    cfg     = cfg or {}
-    model   = cfg.get("IMAGE_MODEL",   settings.IMAGE_MODEL)
+    cfg = cfg or {}
+
+    # ── Resolve image model per language ────────────────────────────────────
+    # Fallback chain:
+    #   1. IMAGE_MODEL_{LANG}  in admin config (admin picked a language-specific model)
+    #   2. IMAGE_MODEL         in admin config (legacy single-language setting)
+    #   3. IMAGE_MODEL_{LANG}  hard default from settings.py
+    #   4. IMAGE_MODEL         hard default from settings.py
+    lang_key = "IMAGE_MODEL_AR" if (language or "").lower() == "ar" else "IMAGE_MODEL_EN"
+    lang_default = settings.IMAGE_MODEL_AR if (language or "").lower() == "ar" else settings.IMAGE_MODEL_EN
+    model = (
+        cfg.get(lang_key)
+        or cfg.get("IMAGE_MODEL")
+        or lang_default
+        or settings.IMAGE_MODEL
+    )
+
     quality = cfg.get("IMAGE_QUALITY", settings.IMAGE_QUALITY)
     size    = cfg.get("IMAGE_SIZE",    settings.IMAGE_SIZE)
     prompt  = _build_prompt(title, author, summary, genres, year, language)

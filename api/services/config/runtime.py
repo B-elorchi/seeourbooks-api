@@ -23,6 +23,8 @@ def _defaults() -> dict[str, str]:
         "CARTESIA_MODEL":                 settings.CARTESIA_MODEL,
         "GEMINI_TTS_MODEL":               settings.GEMINI_TTS_MODEL,
         "IMAGE_MODEL":                    settings.IMAGE_MODEL,
+        "IMAGE_MODEL_EN":                 settings.IMAGE_MODEL_EN,
+        "IMAGE_MODEL_AR":                 settings.IMAGE_MODEL_AR,
         "IMAGE_QUALITY":                  settings.IMAGE_QUALITY,
         "IMAGE_SIZE":                     settings.IMAGE_SIZE,
         "ALTTEXT_PROVIDER_EN":            settings.ALTTEXT_PROVIDER_EN,
@@ -35,6 +37,14 @@ def _defaults() -> dict[str, str]:
         "PIPELINE_STEP_MINDMAP":          str(settings.PIPELINE_STEP_MINDMAP).lower(),
         "PIPELINE_STEP_ALTTEXT":          str(settings.PIPELINE_STEP_ALTTEXT).lower(),
         "PIPELINE_STEP_AUDIO_PROCESSING": str(settings.PIPELINE_STEP_AUDIO_PROCESSING).lower(),
+        "ENABLE_MODEL_FALLBACK":          str(settings.ENABLE_MODEL_FALLBACK).lower(),
+        # Documents pipeline
+        "DOC_AI_PROVIDER":                settings.DOC_AI_PROVIDER,
+        "DOC_AI_MODEL":                   settings.DOC_AI_MODEL,
+        "DOC_OCR_LANGUAGES":              settings.DOC_OCR_LANGUAGES,
+        "DOC_CHUNK_SIZE_WORDS":           str(settings.DOC_CHUNK_SIZE_WORDS),
+        "EMBEDDING_PROVIDER":             settings.EMBEDDING_PROVIDER,
+        "EMBEDDING_MODEL":                settings.EMBEDDING_MODEL,
     }
 
 

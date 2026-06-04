@@ -34,7 +34,14 @@ class Settings(BaseSettings):
 
     # ── OpenAI ────────────────────────────────────────────────────────────────
     OPENAI_API_KEY:    str = ""
-    IMAGE_MODEL:       str = "google/gemini-2.5-flash-image"  # OpenRouter — switch to dall-e-3/gpt-image-1 if using native OpenAI
+    # Legacy single-language model — kept as a fallback when the per-language
+    # IMAGE_MODEL_{EN,AR} settings aren't configured in the admin panel yet.
+    IMAGE_MODEL:       str = "google/gemini-2.5-flash-image"
+    # Per-language image generation models. Either can be:
+    #   - native OpenAI: dall-e-3, gpt-image-1, dall-e-2
+    #   - OpenRouter:    any vendor/model name accepted by openrouter.ai (free-typed in admin)
+    IMAGE_MODEL_EN:    str = "google/gemini-2.5-flash-image"
+    IMAGE_MODEL_AR:    str = "google/gemini-2.5-flash-image"
     # Use "gpt-image-1" only if your OpenAI project has been granted access to it.
     IMAGE_QUALITY:     str = "high"          # high | standard | auto
     IMAGE_SIZE:        str = "1024x1536"   # gpt-image-1 portrait (1024x1792 is no longer valid)
@@ -92,6 +99,48 @@ class Settings(BaseSettings):
 
     # ── Summary parameters ────────────────────────────────────────────────────
     CHUNK_SIZE_WORDS: int = 1500
+
+    # ── Reliability / fallback ────────────────────────────────────────────────
+    # When True, recoverable text-model failures (credit exhausted, rate-limited,
+    # provider 5xx, network timeout) automatically retry the request against the
+    # next model in the fallback chain defined in ai_client._DEFAULT_FALLBACK_CHAINS.
+    # Per-model overrides can be set in the admin panel as FALLBACK_<model>=...
+    ENABLE_MODEL_FALLBACK: bool = True
+
+    # ── Documents pipeline (OCR → text → AI summary + structured JSON) ────────
+    # Storage root for uploaded PDFs (originals + OCR'd outputs).
+    # The processor writes:
+    #   {DOCUMENTS_DIR}/{document_id}/original.pdf
+    #   {DOCUMENTS_DIR}/{document_id}/ocr.pdf
+    DOCUMENTS_DIR: Path = Path("/var/data/documents")
+
+    # OCR languages handed to tesseract via ocrmypdf, e.g. "ara+eng" for Arabic + English.
+    # Add more codes (fra, deu, spa, …) as needed; the corresponding tesseract
+    # language packs must be installed on the host.
+    DOC_OCR_LANGUAGES: str = "ara+eng"
+
+    # Hard upload limit (bytes).  Large Arabic books can run 50–100 MB.
+    DOC_MAX_UPLOAD_BYTES: int = 200 * 1024 * 1024     # 200 MB
+
+    # Hard page-count limit — guards against accidental >1000-page uploads.
+    DOC_MAX_PAGES: int = 2000
+
+    # AI provider for summary + structured JSON.  Falls through ai_client fallback
+    # chains when ENABLE_MODEL_FALLBACK is on.
+    DOC_AI_PROVIDER: str = "deepseek"                  # deepseek | openai | claude
+    DOC_AI_MODEL:    str = "deepseek-chat"             # OR openai/gpt-4.1-mini, claude-sonnet-4-6, etc.
+
+    # Chunk size for the knowledge base (used for future RAG search).
+    DOC_CHUNK_SIZE_WORDS: int = 750
+
+    # Embeddings — leave provider empty to skip embedding generation (chunks
+    # are still stored without vectors and can be embedded later in batch).
+    EMBEDDING_PROVIDER: str = ""                       # openai | deepseek | ""  (disabled)
+    EMBEDDING_MODEL:    str = "text-embedding-3-small"
+
+    # DeepSeek API key — OpenAI-compatible endpoint at api.deepseek.com
+    DEEPSEEK_API_KEY: str = ""
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
 
     model_config = SettingsConfigDict(
         # Looks for .env in api/ first, then in the project root (seeourbook-summarizer-api/)

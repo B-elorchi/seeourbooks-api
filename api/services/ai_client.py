@@ -17,6 +17,7 @@ Usage:
 """
 from __future__ import annotations
 
+import logging
 from typing import AsyncIterator
 
 import anthropic
@@ -24,6 +25,8 @@ import openai
 
 from api.config.settings import settings
 from api.services.usage_logger import log_text_usage
+
+log = logging.getLogger(__name__)
 
 _OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
@@ -35,6 +38,117 @@ def _provider_label(model: str) -> str:
     if model.startswith("claude-"):
         return "anthropic"
     return "openai"
+
+
+# ── Fallback chains ──────────────────────────────────────────────────────────
+# If a primary model fails with a recoverable error (credit exhausted, rate-limit,
+# provider 5xx, network timeout), the request is retried with the next model in
+# this chain.  Each entry is the list of fallbacks tried AFTER the primary.
+#
+# Design notes:
+#   - Claude → equivalent OpenAI tier (Haiku → 4.1-mini, Sonnet/Opus → 4.1)
+#   - OpenAI → equivalent Claude tier
+#   - OpenRouter wrappers fall back to native — if OpenRouter is down, native
+#     Anthropic/OpenAI is often still up.
+#
+# Admins can override per-model via the provider_config table: set
+# FALLBACK_<model> = "<m1>,<m2>,<m3>" to use a custom chain.
+_DEFAULT_FALLBACK_CHAINS: dict[str, list[str]] = {
+    # Native Anthropic → OpenRouter Anthropic → Native OpenAI tier-equivalent
+    "claude-haiku-4-5":          ["anthropic/claude-haiku-4-5",  "openai/gpt-4.1-mini", "gpt-4.1-mini"],
+    "claude-haiku-4-5-20251001": ["anthropic/claude-haiku-4-5",  "openai/gpt-4.1-mini", "gpt-4.1-mini"],
+    "claude-sonnet-4-6":         ["anthropic/claude-sonnet-4-6", "openai/gpt-4.1",      "gpt-4.1"],
+    "claude-opus-4-7":           ["anthropic/claude-opus-4-7",   "openai/gpt-4.1",      "gpt-4.1"],
+    # Native OpenAI → Claude tier-equivalent via OpenRouter then native
+    "gpt-4.1-mini":              ["openai/gpt-4.1-mini",  "anthropic/claude-haiku-4-5",  "claude-haiku-4-5"],
+    "gpt-4.1":                   ["openai/gpt-4.1",       "anthropic/claude-sonnet-4-6", "claude-sonnet-4-6"],
+    # OpenRouter wrappers → native counterpart
+    "anthropic/claude-haiku-4-5":  ["claude-haiku-4-5",  "openai/gpt-4.1-mini", "gpt-4.1-mini"],
+    "anthropic/claude-sonnet-4-6": ["claude-sonnet-4-6", "openai/gpt-4.1",      "gpt-4.1"],
+    "anthropic/claude-opus-4-7":   ["claude-opus-4-7",   "openai/gpt-4.1",      "gpt-4.1"],
+    "openai/gpt-4.1-mini":         ["gpt-4.1-mini",      "anthropic/claude-haiku-4-5",  "claude-haiku-4-5"],
+    "openai/gpt-4.1":              ["gpt-4.1",           "anthropic/claude-sonnet-4-6", "claude-sonnet-4-6"],
+}
+
+
+# Substrings that flag a known-recoverable error.  Lower-cased message check —
+# keeps us decoupled from anthropic/openai SDK exception class names.
+_RECOVERABLE_KEYWORDS: tuple[str, ...] = (
+    # Billing / quota
+    "credit balance", "credit_balance", "out of credits",
+    "insufficient_quota", "insufficient quota",
+    "billing", "payment required",
+    # Rate limit
+    "rate limit", "rate_limit", "rate_limit_error", "too many requests",
+    # Network / outage
+    "timed out", "timeout",
+    "connection refused", "connection reset", "remote disconnected",
+    "service unavailable", "temporarily unavailable",
+    "bad gateway", "gateway timeout",
+    "name or service not known",
+)
+
+# HTTP status codes considered recoverable when we can extract them.
+_RECOVERABLE_STATUS: frozenset[int] = frozenset({402, 408, 425, 429, 500, 502, 503, 504})
+
+
+def _exception_status(exc: BaseException) -> int | None:
+    """Extract an HTTP status code from an SDK exception if available."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        status = getattr(resp, "status_code", None)
+        if isinstance(status, int):
+            return status
+    return None
+
+
+def _is_recoverable(exc: BaseException) -> bool:
+    """Should this exception trigger a fallback to the next model in the chain?"""
+    status = _exception_status(exc)
+    if status in _RECOVERABLE_STATUS:
+        return True
+    msg = str(exc).lower()
+    return any(k in msg for k in _RECOVERABLE_KEYWORDS)
+
+
+async def _resolve_fallback_chain(model: str) -> list[str]:
+    """
+    Return the ordered list of models to try.  The first element is always the
+    caller-supplied model; the rest come from the admin override (if any) or
+    the hardcoded default chain.
+    """
+    # Admin override: provider_config key  FALLBACK_<model> = "m1,m2,m3"
+    chain_override: list[str] = []
+    try:
+        from api.services.config.runtime import get_config_value
+        raw = await get_config_value(f"FALLBACK_{model}", "")
+        if raw:
+            chain_override = [m.strip() for m in raw.split(",") if m.strip()]
+    except Exception:
+        pass  # config lookup is best-effort
+
+    extras = chain_override or _DEFAULT_FALLBACK_CHAINS.get(model, [])
+    # De-duplicate while keeping order; ensure primary is at index 0
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for m in [model, *extras]:
+        if m and m not in seen:
+            ordered.append(m)
+            seen.add(m)
+    return ordered
+
+
+async def _fallback_enabled() -> bool:
+    try:
+        from api.services.config.runtime import get_config_value
+        raw = (await get_config_value("ENABLE_MODEL_FALLBACK",
+                                       str(settings.ENABLE_MODEL_FALLBACK))).lower()
+        return raw in ("1", "true", "yes", "on")
+    except Exception:
+        return settings.ENABLE_MODEL_FALLBACK
 
 
 # ── Client factories ──────────────────────────────────────────────────────────
@@ -91,7 +205,50 @@ async def chat_complete(
     """
     Single-turn completion. Returns the full response text.
     Works with any model — Anthropic native, OpenAI native, or OpenRouter.
+
+    If ENABLE_MODEL_FALLBACK is on (default) and the call fails with a
+    recoverable error — credit exhausted, rate-limit, provider 5xx, network
+    timeout — the request is automatically retried with the next model in the
+    fallback chain.  Non-recoverable errors (bad input, auth, unknown model)
+    surface immediately so they are not silently masked.
     """
+    if not await _fallback_enabled():
+        return await _chat_complete_single(model, messages, max_tokens, system)
+
+    chain = await _resolve_fallback_chain(model)
+    last_exc: BaseException | None = None
+
+    for attempt_model in chain:
+        try:
+            result = await _chat_complete_single(attempt_model, messages, max_tokens, system)
+            if attempt_model != model:
+                log.warning(
+                    "Model fallback succeeded: primary=%r → used=%r (after %s)",
+                    model, attempt_model, last_exc and type(last_exc).__name__,
+                )
+            return result
+        except Exception as exc:
+            last_exc = exc
+            if not _is_recoverable(exc):
+                # Bad input, auth failure, unknown model — don't mask.
+                raise
+            log.warning(
+                "Model %r failed with %s — %s; trying next in fallback chain",
+                attempt_model, type(exc).__name__, str(exc)[:240],
+            )
+
+    # Every model in the chain failed with a recoverable error.
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _chat_complete_single(
+    model: str,
+    messages: list[dict],
+    max_tokens: int,
+    system: str | None,
+) -> str:
+    """One attempt at a chat completion, no fallback logic."""
     if _is_openrouter(model):
         client = _openrouter_client()
         resp = await client.chat.completions.create(

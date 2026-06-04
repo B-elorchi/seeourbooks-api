@@ -6,10 +6,14 @@ Admin routes:
   GET  /api/admin/jobs                → all pipeline jobs (alias with full detail)
   POST /api/admin/jobs/{job_id}/retry → manually retry a failed/partial job
   GET  /api/admin/costs               → aggregated cost breakdown for the last N days
+  GET  /api/admin/openrouter-models   → cached, optionally-filtered live OpenRouter model list
 """
+import logging
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
@@ -17,6 +21,8 @@ from api.services.config.runtime import get_all_config, set_config_key
 from api.services.db import find
 from api.jobs.store import get_job, reset_for_manual_retry
 from api.models.requests import PipelineReq
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -182,4 +188,85 @@ async def admin_retry_job(job_id: str, background_tasks: BackgroundTasks) -> dic
         "status":        "queued",
         "retrying_steps": failed or "all",   # "all" when there's no prior result
         "status_url":    f"/api/pipeline/status/{job_id}",
+    }
+
+
+# ── OpenRouter live model list (cached proxy) ────────────────────────────────
+#
+# OpenRouter's public /api/v1/models endpoint requires no auth and lists every
+# model currently routable through them — including newly-added image, chat,
+# and vision models.  We proxy + cache it for the admin Providers tab so the
+# dropdowns always reflect what's actually available without us pushing code.
+
+_OR_MODELS_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_OR_MODELS_CACHE_TTL_SEC = 3600   # 1 hour
+
+
+async def _fetch_openrouter_models_raw() -> list[dict]:
+    """Fetch the full OpenRouter model list (cached).  Returns stale cache on failure."""
+    now    = time.time()
+    cached = _OR_MODELS_CACHE.get("all")
+    if cached and (now - cached[0]) < _OR_MODELS_CACHE_TTL_SEC:
+        return cached[1]
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get("https://openrouter.ai/api/v1/models")
+            r.raise_for_status()
+            models = (r.json() or {}).get("data") or []
+    except Exception as exc:
+        log.warning("OpenRouter /models fetch failed: %s", exc)
+        # Return stale cache if any, else empty
+        return cached[1] if cached else []
+
+    _OR_MODELS_CACHE["all"] = (now, models)
+    return models
+
+
+@router.get("/openrouter-models")
+async def openrouter_models(modality: str = "all") -> dict:
+    """
+    Live OpenRouter model list, optionally filtered by modality.
+
+    `modality` values:
+      - "all"     every model OpenRouter routes
+      - "image"   models with image OUTPUT (for cover gen)
+      - "vision"  models with image INPUT and text OUTPUT (for alt-text)
+      - "chat"    models with text OUTPUT (for summarization / mindmap)
+
+    Cached server-side for 1 hour.  Safe to call on every admin tab mount.
+    """
+    raw = await _fetch_openrouter_models_raw()
+
+    def _out_mods(m: dict) -> list[str]:
+        arch = m.get("architecture") or {}
+        return arch.get("output_modalities") or []
+
+    def _in_mods(m: dict) -> list[str]:
+        arch = m.get("architecture") or {}
+        return arch.get("input_modalities") or []
+
+    if modality == "image":
+        filtered = [m for m in raw if "image" in _out_mods(m)]
+    elif modality == "vision":
+        filtered = [m for m in raw if "image" in _in_mods(m) and "text" in _out_mods(m)]
+    elif modality == "chat":
+        filtered = [m for m in raw if "text" in _out_mods(m) and "image" not in _out_mods(m)]
+    else:
+        filtered = raw
+
+    # Sort: by name when present, else by id — stable and predictable in the dropdown.
+    filtered.sort(key=lambda m: (m.get("name") or m["id"]).lower())
+
+    return {
+        "modality": modality,
+        "count":    len(filtered),
+        "models": [
+            {
+                "id":      m["id"],
+                "name":    m.get("name") or m["id"],
+                "context": m.get("context_length"),
+            }
+            for m in filtered
+        ],
     }

@@ -10,3 +10,14 @@ python-dotenv==1.0.1
 pypdf==4.3.1
 python-multipart==0.0.9
 asyncpg==0.30.0
+
+# ── Documents pipeline (PDF OCR + structured extraction) ─────────────────────
+# OCR — wraps tesseract.  System packages required on the host:
+#   apt-get install -y tesseract-ocr tesseract-ocr-ara tesseract-ocr-eng \
+#                      ghostscript ocrmypdf
+# (the python package below shells out to the system `ocrmypdf` binary)
+ocrmypdf==16.5.0
+
+# Native PDF text extraction (already-searchable PDFs skip the OCR step)
+PyMuPDF==1.24.10
+pdfplumber==0.11.4
