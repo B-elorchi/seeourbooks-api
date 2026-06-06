@@ -245,7 +245,16 @@ class ClaudeProvider:
     def __init__(self, model: str | None = None) -> None:
         # Default to Sonnet for document analysis — better at long-form
         # structured output than Haiku.
-        self.model = model or settings.DOC_AI_MODEL or settings.MODEL_SONNET
+        #
+        # NOTE: We do NOT default to settings.DOC_AI_MODEL here — that field
+        # may hold a value tailored for a DIFFERENT provider (e.g. when the
+        # admin set DOC_AI_PROVIDER=deepseek + DOC_AI_MODEL=deepseek-chat
+        # and we're falling back to Claude because the DeepSeek key is missing).
+        # We only honor an explicitly-passed Claude/OpenRouter model.
+        if model and (model.startswith("claude-") or "/" in model):
+            self.model = model
+        else:
+            self.model = settings.MODEL_SONNET
 
     async def generate_summary(self, text: str, language: str) -> str:
         try:
@@ -272,45 +281,152 @@ class ClaudeProvider:
         return _coerce_json(out)
 
 
+# ── OpenRouter (any vendor/model, including DeepSeek, Llama, Qwen, etc.) ────
+
+class OpenRouterProvider:
+    """
+    Route any `vendor/model` identifier through OpenRouter.
+
+    Why this exists in addition to DeepSeekProvider:
+      - You already have OPENROUTER_API_KEY — no extra account / billing needed.
+      - OpenRouter relays to every major lab (DeepSeek, Anthropic, OpenAI,
+        Google, Meta, Mistral, Qwen, Cohere, etc.) under one key.
+      - Best ratio of price-to-quality for document analysis is typically
+        `deepseek/deepseek-chat` (≈$0.14 per 1M input tokens).
+
+    Common admin pick:
+        DOC_AI_PROVIDER = openrouter
+        DOC_AI_MODEL    = deepseek/deepseek-chat
+    """
+    name = "openrouter"
+
+    def __init__(self, model: str | None = None) -> None:
+        if not settings.OPENROUTER_API_KEY:
+            raise AIFailureError(
+                "OPENROUTER_API_KEY is not set — add it to .env or switch "
+                "DOC_AI_PROVIDER to 'openai' or 'claude'.",
+                detail={"code": "missing_api_key"},
+            )
+        chosen = model or settings.DOC_AI_MODEL or "deepseek/deepseek-chat"
+        # Sanity: must look like a `vendor/model` identifier for OpenRouter
+        if "/" not in chosen:
+            log.warning(
+                "OpenRouterProvider got non-OpenRouter model %r — defaulting to "
+                "deepseek/deepseek-chat", chosen,
+            )
+            chosen = "deepseek/deepseek-chat"
+        self.model = chosen
+        self._client = AsyncOpenAI(
+            api_key  = settings.OPENROUTER_API_KEY,
+            base_url = "https://openrouter.ai/api/v1",
+            default_headers={
+                "HTTP-Referer": "https://seeourbook.sa",
+                "X-Title":      "SeeOurBook",
+            },
+        )
+
+    async def _chat(self, prompt: str, *, json_mode: bool) -> str:
+        kwargs: dict[str, Any] = dict(
+            model       = self.model,
+            messages    = [{"role": "user", "content": prompt}],
+            max_tokens  = 4000,
+            temperature = 0.3,
+        )
+        if json_mode:
+            # Most OpenAI-compatible vendors on OpenRouter accept this.
+            # If a specific model doesn't, the request still succeeds —
+            # response_format is simply ignored, and _coerce_json mops up.
+            kwargs["response_format"] = {"type": "json_object"}
+        try:
+            resp = await self._client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            raise AIFailureError(f"OpenRouter call failed: {exc}") from exc
+
+        usage = getattr(resp, "usage", None)
+        await log_text_usage(
+            provider     = "openrouter",
+            model        = self.model,
+            input_tokens = getattr(usage, "prompt_tokens",     0) if usage else 0,
+            output_tokens= getattr(usage, "completion_tokens", 0) if usage else 0,
+        )
+        return resp.choices[0].message.content or ""
+
+    async def generate_summary(self, text: str, language: str) -> str:
+        return (await self._chat(_pick_prompt(text, language), json_mode=False)).strip()
+
+    async def generate_structured_json(self, text: str, language: str) -> dict[str, Any]:
+        raw = await self._chat(_structured_prompt(text, language), json_mode=True)
+        return _coerce_json(raw)
+
+
 # ── Factory ──────────────────────────────────────────────────────────────────
 
 _PROVIDER_CLASSES: dict[str, type] = {
-    "deepseek": DeepSeekProvider,
-    "openai":   OpenAIProvider,
-    "claude":   ClaudeProvider,
+    "deepseek":   DeepSeekProvider,
+    "openai":     OpenAIProvider,
+    "claude":     ClaudeProvider,
+    "openrouter": OpenRouterProvider,
 }
 
 
 async def get_provider(name: str | None = None) -> TextAnalysisProvider:
     """
-    Resolve a provider by name, with admin-config override and graceful fallback.
+    Resolve a provider by name + model, with admin-config override and
+    graceful fallback.
 
-    Resolution order:
+    Smart routing
+    ─────────────
+    If `DOC_AI_MODEL` contains a "/" (e.g. "deepseek/deepseek-chat",
+    "anthropic/claude-sonnet-4-6"), we auto-route to OpenRouterProvider
+    regardless of what `DOC_AI_PROVIDER` says — that's what the admin
+    obviously intended.  Saves admins from having to keep two settings
+    in sync.
+
+    Resolution order for provider:
         1. explicit `name` argument
-        2. runtime config key DOC_AI_PROVIDER
+        2. runtime config DOC_AI_PROVIDER
         3. settings.DOC_AI_PROVIDER (default 'deepseek')
 
-    Resolution order for the model:
-        1. runtime config key DOC_AI_MODEL
+    Resolution order for model:
+        1. runtime config DOC_AI_MODEL
         2. settings.DOC_AI_MODEL
 
-    If the chosen provider's API key isn't configured, we log a warning and
-    fall back to ClaudeProvider so the pipeline still has a path forward.
+    If the chosen provider can't initialise (missing API key), we fall back
+    to ClaudeProvider with ITS OWN default model — never pass through the
+    original provider's model (which wouldn't work for Anthropic).
     """
-    chosen = (name
-              or await get_config_value("DOC_AI_PROVIDER", "")
-              or settings.DOC_AI_PROVIDER
-              or "deepseek").lower()
-    model  = await get_config_value("DOC_AI_MODEL", settings.DOC_AI_MODEL) or None
+    explicit = (name or await get_config_value("DOC_AI_PROVIDER", "")
+                or settings.DOC_AI_PROVIDER or "deepseek").lower()
+    model    = await get_config_value("DOC_AI_MODEL", settings.DOC_AI_MODEL) or None
 
-    cls = _PROVIDER_CLASSES.get(chosen)
+    # ── Auto-route OpenRouter-style models regardless of the provider field ─
+    if model and "/" in model and explicit != "openrouter":
+        log.info(
+            "DOC_AI_MODEL %r looks like an OpenRouter identifier — auto-routing "
+            "via OpenRouterProvider (ignoring DOC_AI_PROVIDER=%s).",
+            model, explicit,
+        )
+        try:
+            return OpenRouterProvider(model=model)
+        except AIFailureError as exc:
+            log.warning(
+                "OpenRouterProvider init failed (%s); falling back to Claude.", exc,
+            )
+            return ClaudeProvider()
+
+    cls = _PROVIDER_CLASSES.get(explicit)
     if cls is None:
-        log.warning("Unknown DOC_AI_PROVIDER %r — falling back to ClaudeProvider", chosen)
-        return ClaudeProvider(model=model)
+        log.warning(
+            "Unknown DOC_AI_PROVIDER %r — falling back to ClaudeProvider (model=%s).",
+            explicit, settings.MODEL_SONNET,
+        )
+        return ClaudeProvider()
 
     try:
         return cls(model=model)
     except AIFailureError as exc:
-        # Missing API key etc. — try Claude as the safety net.
-        log.warning("Provider %s init failed (%s); falling back to Claude", chosen, exc)
-        return ClaudeProvider(model=model)
+        log.warning(
+            "Provider %s init failed (%s); falling back to ClaudeProvider with model=%s.",
+            explicit, exc, settings.MODEL_SONNET,
+        )
+        return ClaudeProvider()

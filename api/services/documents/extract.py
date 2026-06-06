@@ -88,8 +88,12 @@ def extract_pages(pdf_path: str | Path) -> tuple[list[PageText], int]:
     """
     try:
         import fitz  # PyMuPDF
-    except ImportError as exc:
-        raise InvalidPDFError("PyMuPDF is not installed") from exc
+    except Exception as exc:
+        import sys as _sys
+        raise InvalidPDFError(
+            f"PyMuPDF (fitz) failed to import: {type(exc).__name__}: {exc}. "
+            f"Python interpreter: {_sys.executable!r}"
+        ) from exc
 
     pdf_path = str(pdf_path)
 

@@ -19,5 +19,29 @@ asyncpg==0.30.0
 ocrmypdf==16.5.0
 
 # Native PDF text extraction (already-searchable PDFs skip the OCR step)
-PyMuPDF==1.24.10
+# Pin >= 1.24.14 — earlier wheels had a "DLL load failed while importing
+# _extra" bug on Windows.
+PyMuPDF==1.24.14
 pdfplumber==0.11.4
+
+# EPUB read/write — used by inject_epub step to enrich existing books with
+# AI-generated summaries + covers.
+EbookLib==0.18
+
+# Video generation — slideshow with TTS narration + Ken-Burns + subtitles.
+# moviepy shells out to ffmpeg (system package) for encoding.
+moviepy==1.0.3
+imageio==2.36.0
+imageio-ffmpeg==0.5.1
+# Pillow is already pulled in transitively; pin for safety.
+Pillow==10.4.0
+# Arabic shaping + bidi for proper RTL text rendering in title/chapter cards
+arabic-reshaper==3.0.0
+python-bidi==0.6.6
+# numpy is required by moviepy
+numpy==1.26.4
+
+# Supabase Auth JWT verification — both HS256 (legacy projects) and
+# ES256 / RS256 via JWKS (newer projects with asymmetric signing keys).
+# The [crypto] extra pulls in `cryptography` for asymmetric algorithms.
+PyJWT[crypto]==2.10.1

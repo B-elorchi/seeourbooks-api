@@ -2,20 +2,27 @@
 Pipeline job store — backed by either Supabase or Postgres (see DB_BACKEND).
 All functions use the unified db interface: find / insert / upsert / update.
 """
+import uuid
+
 from api.services.db import find, insert, update
 
 MAX_RETRIES = 3
 
 
 async def create_job(book_id: str, input_data: dict) -> str:
+    # Generate the UUID client-side because the `id` column on `pipeline_jobs`
+    # is declared `TEXT PRIMARY KEY` with no DEFAULT — inserting without an
+    # explicit id triggers a NOT NULL violation and PostgREST returns 400.
+    job_id = uuid.uuid4().hex
     row = await insert("pipeline_jobs", {
+        "id":          job_id,
         "book_id":     book_id,
         "status":      "queued",
         "input":       input_data,
         "retry_count": 0,
         "max_retries": MAX_RETRIES,
     })
-    return str(row["id"])
+    return str(row.get("id") or job_id)
 
 
 async def set_running(job_id: str) -> None:

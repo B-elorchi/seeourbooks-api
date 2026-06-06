@@ -189,7 +189,7 @@ async def _run_job(
 
     await set_running(job_id)
     try:
-        result = await run_pipeline(req)
+        result = await run_pipeline(req, job_id=job_id)
 
         # Merge new outputs with the previous partial result (if any)
         if previous_result:
@@ -231,7 +231,10 @@ async def _handle_failure(
 @router.get("/status/{job_id}")
 async def pipeline_status(job_id: str):
     """Return current job status and result (once done)."""
-    job = await get_job(job_id)
+    try:
+        job = await get_job(job_id)
+    except Exception as exc:
+        raise HTTPException(503, f"Database unreachable: {exc}") from exc
     if not job:
         raise HTTPException(404, "Job not found")
     return job
@@ -240,7 +243,10 @@ async def pipeline_status(job_id: str):
 @router.get("/output/{book_id}")
 async def pipeline_output(book_id: str):
     """Return the latest completed pipeline output for a book."""
-    job = await get_output(book_id)
+    try:
+        job = await get_output(book_id)
+    except Exception as exc:
+        raise HTTPException(503, f"Database unreachable: {exc}") from exc
     if not job:
         raise HTTPException(404, "No completed pipeline job found for this book")
     return job.get("result", {})
@@ -249,4 +255,9 @@ async def pipeline_output(book_id: str):
 @router.get("/jobs")
 async def pipeline_jobs(limit: int = 50):
     """List all pipeline jobs (newest first)."""
-    return await list_jobs(limit=limit)
+    try:
+        return await list_jobs(limit=limit)
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning("pipeline_jobs: DB unreachable — %s", exc)
+        return []

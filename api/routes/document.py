@@ -94,7 +94,7 @@ async def _run_job(job_id: str, req: PipelineReq) -> None:
 
     await set_running(job_id)
     try:
-        result = await run_pipeline(req)
+        result = await run_pipeline(req, job_id=job_id)
         if result["status"] == "done":
             await set_done(job_id, result)
         elif result["status"] == "partial":
@@ -106,6 +106,24 @@ async def _run_job(job_id: str, req: PipelineReq) -> None:
 
 
 # ── PDF text extraction ───────────────────────────────────────────────────────
+
+def _sanitize_pdf_text(text: str) -> str:
+    """
+    Strip characters PostgreSQL can't store.
+
+    PDFs often contain stray NUL bytes (\x00) from raw PDF stream content
+    that pypdf doesn't filter.  Postgres rejects \x00 in TEXT/JSONB columns
+    with `UntranslatableCharacterError: unsupported Unicode escape sequence`.
+    We also normalize a few other control chars that aren't worth keeping.
+    """
+    if not text:
+        return ""
+    # Remove NULs and other C0 controls except tab/newline/CR
+    return "".join(
+        ch for ch in text
+        if ch == "\t" or ch == "\n" or ch == "\r" or ord(ch) >= 0x20
+    )
+
 
 def _extract_chapters(raw: bytes, filename: str) -> list[Chapter]:
     """
@@ -120,7 +138,8 @@ def _extract_chapters(raw: bytes, filename: str) -> list[Chapter]:
     pages  = []
     for page in reader.pages:
         txt = page.extract_text() or ""
-        pages.append(txt.strip())
+        # Strip NUL + other control chars BEFORE the text touches Postgres
+        pages.append(_sanitize_pdf_text(txt).strip())
 
     # Merge all text, note page boundaries
     full_text = "\n".join(pages)

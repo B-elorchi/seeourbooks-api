@@ -6,6 +6,8 @@ VALID_STEPS = {
     "summarize", "audio_full", "audio_chapters",
     "cover", "alt_text",
     "mindmap", "mindmap_chapters",
+    "inject_epub",
+    "video",
 }
 
 

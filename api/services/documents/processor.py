@@ -64,6 +64,45 @@ def _stage_done(current: str, target: str) -> bool:
         return False
 
 
+async def _detect_resume_point(document_id: str, doc: dict) -> str:
+    """
+    Inspect the database state to determine the LAST completed stage.
+
+    Called when a `failed` document is being retried — we can't trust the
+    `status` field (it says "failed", which isn't a position on the
+    progression line), so we read what actually finished:
+
+        - document_summaries row exists  → "ai_processed"
+        - document_pages rows exist      → "text_extracted"
+        - ocr_file_path is set + on disk → "ocr_completed"
+        - otherwise                      → "uploaded"
+
+    Resuming from the detected point skips work that's already done.
+    Saves OCR runs (slow) and AI calls (expensive).
+    """
+    # Most-advanced check first.  Each `try` isolates failures — if one
+    # repo call breaks, we still try the earlier signals.
+    try:
+        summary_row = await repo.get_summary(document_id)
+        if summary_row and (summary_row.get("summary") or summary_row.get("structured_json")):
+            return "ai_processed"
+    except Exception as exc:
+        log.debug("resume: summary lookup failed: %s", exc)
+
+    try:
+        pages = await repo.get_pages(document_id)
+        if pages:
+            return "text_extracted"
+    except Exception as exc:
+        log.debug("resume: pages lookup failed: %s", exc)
+
+    ocr_path = doc.get("ocr_file_path")
+    if ocr_path and Path(ocr_path).exists():
+        return "ocr_completed"
+
+    return "uploaded"
+
+
 async def process_document(document_id: str) -> None:
     """
     Entry point for the background worker. Idempotent — safe to retry.
@@ -106,10 +145,42 @@ async def _run_stages(doc: dict) -> None:
             f"Original PDF missing at {original_path!r}",
         )
 
-    # Move from 'uploaded' → 'processing' immediately so the client sees activity
-    if current in ("uploaded", "failed"):
+    # ── Retry resume detection ─────────────────────────────────────────────
+    # When the document is being retried from a failed state, "failed" isn't
+    # a position on the progression line — so _stage_done() returns False for
+    # every check and the pipeline restarts from zero (wasting OCR + AI work
+    # that already succeeded).  Look at the DB to figure out where we
+    # actually got to.
+    if current == "failed":
+        resume = await _detect_resume_point(document_id, doc)
+        log.info(
+            "doc=%s: retry — resuming at stage=%r (status field was 'failed', "
+            "but DB shows this stage actually completed)",
+            document_id, resume,
+        )
+        current = resume
+
+    # Move from 'uploaded' → 'processing' immediately so the client sees activity.
+    # For RETRIES that already passed earlier stages we just clear the error
+    # message and keep the current resumed stage — don't reset back to processing.
+    if current == "uploaded":
         await repo.set_status(document_id, "processing", progress=5, error_message="")
         current = "processing"
+    else:
+        # Resume path: keep `current` accurate, clear stale error_message.
+        # Also restore the stage's nominal progress % so the UI doesn't jump
+        # backwards from "5%" to "55%" abruptly when text_extracted resumes.
+        stage_progress = {
+            "processing":     8,
+            "ocr_completed":  30,
+            "text_extracted": 55,
+            "ai_processed":   85,
+        }
+        await repo.set_status(
+            document_id, current,
+            progress=stage_progress.get(current, 0),
+            error_message="",
+        )
 
     # ── Stage 1 — OCR (skip when PDF already has a text layer or already done) ──
     set_step("ocr")

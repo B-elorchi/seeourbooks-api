@@ -51,13 +51,54 @@ async def list_documents(limit: int = 50) -> dict[str, Any]:
     connected to a different database than the API uses.
     """
     from api.services.db import find as _find
-    rows = await _find(
-        "documents",
-        select="id, original_filename, status, progress, page_count, language, created_at",
-        order="created_at DESC",
-        limit=limit,
-    )
+    try:
+        rows = await _find(
+            "documents",
+            select="id, original_filename, status, progress, page_count, language, created_at",
+            order="created_at DESC",
+            limit=limit,
+        )
+    except Exception as exc:
+        log.warning("list_documents: DB unreachable — %s", exc)
+        return {"count": 0, "documents": [], "error": str(exc)[:200]}
     return {"count": len(rows), "documents": rows}
+
+
+@router.get("/health")
+async def documents_health() -> dict[str, Any]:
+    """
+    Self-test for the documents pipeline schema + backend connection.
+
+    Pings each of the four tables (documents, document_pages,
+    document_summaries, knowledge_chunks) and reports their row counts.
+    A failure on any table means the schema isn't applied or the API can't
+    reach the database it's configured for.
+
+    Use after `db/schema.sql` is applied to your Supabase project:
+        curl https://your-api/api/documents/health
+    """
+    from api.config.settings import settings
+    from api.services.db import find as _find
+
+    tables = ["documents", "document_pages", "document_summaries", "knowledge_chunks"]
+    results: dict[str, Any] = {}
+    overall_ok = True
+
+    for table in tables:
+        try:
+            rows = await _find(table, select="id", limit=1)
+            count_rows = await _find(table, select="id", limit=10_000)
+            results[table] = {"ok": True, "rows": len(count_rows), "sample_ok": True if not rows else True}
+        except Exception as exc:
+            overall_ok = False
+            results[table] = {"ok": False, "error": str(exc)[:300]}
+
+    return {
+        "ok":         overall_ok,
+        "backend":    settings.DB_BACKEND,
+        "supabase_url": (settings.SUPABASE_URL or "").split("//")[-1][:60] if settings.DB_BACKEND == "supabase" else None,
+        "tables":     results,
+    }
 
 
 # ── Response models ─────────────────────────────────────────────────────────
@@ -185,7 +226,10 @@ async def start_processing(
     Kick off the OCR → extract → AI → chunk pipeline as a background task.
     Returns 202 immediately.  Poll /status for progress.
     """
-    doc = await repo.get_document(document_id)
+    try:
+        doc = await repo.get_document(document_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}") from exc
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
 
@@ -200,7 +244,10 @@ async def start_processing(
 
 @router.get("/{document_id}/status", response_model=StatusResponse)
 async def get_status(document_id: str) -> StatusResponse:
-    doc = await repo.get_document(document_id)
+    try:
+        doc = await repo.get_document(document_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}") from exc
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
     return StatusResponse(
@@ -215,7 +262,10 @@ async def get_status(document_id: str) -> StatusResponse:
 
 @router.get("/{document_id}/text", response_model=TextResponse)
 async def get_text(document_id: str) -> TextResponse:
-    doc = await repo.get_document(document_id)
+    try:
+        doc = await repo.get_document(document_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}") from exc
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
     pages = await repo.get_pages(document_id)
@@ -227,7 +277,10 @@ async def get_text(document_id: str) -> TextResponse:
 
 @router.get("/{document_id}/summary", response_model=SummaryResponse)
 async def get_summary(document_id: str) -> SummaryResponse:
-    doc = await repo.get_document(document_id)
+    try:
+        doc = await repo.get_document(document_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}") from exc
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
     row = await repo.get_summary(document_id)
@@ -246,7 +299,10 @@ async def get_summary(document_id: str) -> SummaryResponse:
 
 @router.get("/{document_id}/json", response_model=JsonResponse)
 async def get_structured_json(document_id: str) -> JsonResponse:
-    doc = await repo.get_document(document_id)
+    try:
+        doc = await repo.get_document(document_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}") from exc
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
     row = await repo.get_summary(document_id)

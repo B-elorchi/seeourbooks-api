@@ -14,9 +14,10 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
+from api.auth import require_admin
 from api.services.config.runtime import get_all_config, set_config_key
 from api.services.db import find
 from api.jobs.store import get_job, reset_for_manual_retry
@@ -24,7 +25,14 @@ from api.models.requests import PipelineReq
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+# Auth: every route in this router requires an admin user when SUPABASE_JWT_SECRET
+# is configured.  In dev (no JWT secret) the dependency returns a dummy admin
+# so the panel stays usable without a Supabase project.
+router = APIRouter(
+    prefix="/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 class ConfigUpdate(BaseModel):
@@ -50,12 +58,17 @@ async def admin_set_config(body: ConfigUpdate) -> dict:
 @router.get("/metrics")
 async def admin_metrics() -> dict:
     """Return job counts and aggregate stats for the last 500 jobs."""
-    jobs = await find(
-        "pipeline_jobs",
-        select="status, created_at",
-        order="created_at DESC",
-        limit=500,
-    )
+    try:
+        jobs = await find(
+            "pipeline_jobs",
+            select="status, created_at",
+            order="created_at DESC",
+            limit=500,
+        )
+    except Exception as exc:
+        log.warning("admin_metrics: DB unreachable — %s", exc)
+        # Return empty metrics rather than 500 so the admin panel still loads
+        return {"total": 0, "done": 0, "partial": 0, "failed": 0, "running": 0, "queued": 0}
 
     counts = Counter(j["status"] for j in jobs)
     return {
@@ -71,7 +84,124 @@ async def admin_metrics() -> dict:
 @router.get("/jobs")
 async def admin_jobs(limit: int = 100) -> list:
     """List all pipeline jobs ordered newest-first."""
-    return await find("pipeline_jobs", order="created_at DESC", limit=limit)
+    try:
+        return await find("pipeline_jobs", order="created_at DESC", limit=limit)
+    except Exception as exc:
+        log.warning("admin_jobs: DB unreachable — %s", exc)
+        return []
+
+
+# ── Catalog inspector — read-only proxy to a whitelist of tables ──────────────
+#
+# Powers the "Catalog" tab in the admin UI.  Useful for verifying that:
+#   - production books / chunks / covers / etc. are visible to the API
+#   - the pipeline is writing into the right tables
+#   - per-book data is laid out as expected
+#
+# Whitelisted to prevent leaking unrelated DB tables through a generic API.
+_CATALOG_TABLES: dict[str, dict] = {
+    # ── client production tables ──
+    "books":                  {"order": "book_id ASC",     "book_id_col": "book_id"},
+    "ai_batches":             {"order": "system_created_at DESC", "book_id_col": "book_id"},
+    "chunks":                 {"order": "chunk_index ASC", "book_id_col": "book_id"},
+    "covers":                 {"order": "created_at DESC", "book_id_col": "bookId"},
+    "reviews":                {"order": "updated_at DESC", "book_id_col": "book_id"},
+    "audio":                  {"order": "updated_at DESC", "book_id_col": "book_id"},
+    # ── seeourbook operational tables ──
+    "pipeline_jobs":          {"order": "created_at DESC", "book_id_col": "book_id"},
+    "pipeline_step_results":  {"order": "created_at DESC", "book_id_col": None},
+    "book_summaries":         {"order": "created_at DESC", "book_id_col": "book_id"},
+    "chunk_summaries":        {"order": "created_at DESC", "book_id_col": "book_id"},
+    "usage_logs":             {"order": "created_at DESC", "book_id_col": None},
+    "provider_config":        {"order": "updated_at DESC", "book_id_col": None},
+    "uploaded_documents":     {"order": "created_at DESC", "book_id_col": None},
+    "summary_jobs":           {"order": "created_at DESC", "book_id_col": "book_id"},
+    # ── new documents pipeline ──
+    "documents":              {"order": "created_at DESC", "book_id_col": None},
+    "document_pages":         {"order": "page_number ASC", "book_id_col": None},
+    "document_summaries":     {"order": "created_at DESC", "book_id_col": None},
+    "knowledge_chunks":       {"order": "chunk_index ASC", "book_id_col": None},
+}
+
+
+@router.get("/catalog/tables")
+async def admin_catalog_tables() -> dict:
+    """List the tables exposed by /catalog/{table} along with their hints."""
+    return {
+        "tables": [
+            {
+                "name":            name,
+                "default_order":   meta["order"],
+                "supports_book_id": meta["book_id_col"] is not None,
+            }
+            for name, meta in _CATALOG_TABLES.items()
+        ],
+    }
+
+
+@router.get("/catalog/{table}")
+async def admin_catalog(
+    table: str,
+    limit:  int = 50,
+    offset: int = 0,
+    book_id: str | None = None,
+) -> dict:
+    """
+    Return up to `limit` rows from the given table.
+
+    Optional filters:
+        book_id — when the table has a book_id-like column.  We map this to the
+                  actual column name (some legacy tables use bookId / book_id).
+
+    This endpoint is intentionally read-only and whitelisted.
+    """
+    if table not in _CATALOG_TABLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"table {table!r} is not in the catalog whitelist. "
+                   f"Allowed: {sorted(_CATALOG_TABLES.keys())}",
+        )
+
+    if limit < 1 or limit > 500:
+        limit = max(1, min(500, limit))
+    if offset < 0:
+        offset = 0
+
+    meta    = _CATALOG_TABLES[table]
+    filters: dict | None = None
+
+    if book_id and meta["book_id_col"]:
+        # The production books / chunks / audio tables use INTEGER book_id.
+        # Try numeric coercion first so eq.<int> matches.
+        bid: object = book_id
+        try:
+            bid = int(book_id)
+        except ValueError:
+            pass
+        filters = {meta["book_id_col"]: bid}
+
+    try:
+        rows = await find(
+            table,
+            filters=filters,
+            order=meta["order"],
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as exc:
+        # Surface DB errors with a clean message instead of generic 500
+        raise HTTPException(
+            status_code=502,
+            detail=f"DB read failed for {table!r}: {exc}",
+        ) from exc
+
+    return {
+        "table":  table,
+        "limit":  limit,
+        "offset": offset,
+        "count":  len(rows),
+        "rows":   rows,
+    }
 
 
 @router.get("/costs")
@@ -160,7 +290,10 @@ async def admin_retry_job(job_id: str, background_tasks: BackgroundTasks) -> dic
     # Lazy imports — avoids circular dependency (admin ↔ pipeline)
     from api.routes.pipeline import _run_job, _failed_steps   # noqa: PLC0415
 
-    job = await get_job(job_id)
+    try:
+        job = await get_job(job_id)
+    except Exception as exc:
+        raise HTTPException(503, f"Database unreachable: {exc}") from exc
     if not job:
         raise HTTPException(404, f"Job {job_id} not found")
 

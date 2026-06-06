@@ -96,6 +96,34 @@ class Settings(BaseSettings):
     PIPELINE_STEP_MINDMAP:          bool = True
     PIPELINE_STEP_ALTTEXT:          bool = True
     PIPELINE_STEP_AUDIO_PROCESSING: bool = True
+    PIPELINE_STEP_INJECT_EPUB:      bool = True
+    PIPELINE_STEP_VIDEO:            bool = True
+
+    # ── EPUB sources ─────────────────────────────────────────────────────────
+    # When set, the inject_epub step fetches the source EPUB from:
+    #     {BOOK_FILES_BASE_URL}/books/english/{book_id}.epub
+    #     {BOOK_FILES_BASE_URL}/books/arabic/{book_id}.epub
+    # Leave empty to disable EPUB injection entirely.
+    BOOK_FILES_BASE_URL: str = ""
+
+    # ── Video generation (slideshow with TTS narration) ──────────────────────
+    # Provider:
+    #   moviepy      — CPU-only, ships everywhere, ~$0 marginal cost (default)
+    #   svd          — Stable Video Diffusion (needs GPU host with 10GB+ VRAM)
+    #   cogvideox    — CogVideoX-5B (needs GPU host)
+    VIDEO_PROVIDER:    str = "moviepy"
+    # Orientation: portrait (mobile / TikTok / Reels) or landscape (YouTube)
+    VIDEO_ORIENTATION: str = "portrait"     # portrait | landscape
+    # Pixel dimensions — overridden if VIDEO_ORIENTATION is set
+    VIDEO_WIDTH:       int = 1080
+    VIDEO_HEIGHT:      int = 1920
+    # Frame rate.  24 fps looks cinematic, 30 fps matches YouTube/TikTok.
+    VIDEO_FPS:         int = 30
+    # Bitrate target (libx264 -b:v).  ~3 Mbps is plenty for slideshow.
+    VIDEO_BITRATE:     str = "3500k"
+    # Optional font file paths.  Empty → use bundled / system defaults.
+    VIDEO_FONT_EN:     str = ""
+    VIDEO_FONT_AR:     str = ""
 
     # ── Summary parameters ────────────────────────────────────────────────────
     CHUNK_SIZE_WORDS: int = 1500
@@ -127,8 +155,13 @@ class Settings(BaseSettings):
 
     # AI provider for summary + structured JSON.  Falls through ai_client fallback
     # chains when ENABLE_MODEL_FALLBACK is on.
-    DOC_AI_PROVIDER: str = "deepseek"                  # deepseek | openai | claude
-    DOC_AI_MODEL:    str = "deepseek-chat"             # OR openai/gpt-4.1-mini, claude-sonnet-4-6, etc.
+    #
+    # Default: route DeepSeek through OpenRouter so admins don't need a separate
+    # DEEPSEEK_API_KEY — OPENROUTER_API_KEY covers it.  Set DOC_AI_MODEL to any
+    # `vendor/model` and the factory auto-routes via OpenRouterProvider
+    # regardless of the DOC_AI_PROVIDER value below.
+    DOC_AI_PROVIDER: str = "openrouter"                # openrouter | deepseek | openai | claude
+    DOC_AI_MODEL:    str = "deepseek/deepseek-chat"    # OR openai/gpt-4.1-mini, claude-sonnet-4-6, etc.
 
     # Chunk size for the knowledge base (used for future RAG search).
     DOC_CHUNK_SIZE_WORDS: int = 750
@@ -141,6 +174,16 @@ class Settings(BaseSettings):
     # DeepSeek API key — OpenAI-compatible endpoint at api.deepseek.com
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+
+    # ── Supabase Auth ─────────────────────────────────────────────────────────
+    # JWT secret for verifying Supabase-issued access tokens.
+    # Get it from: Supabase Dashboard → Project Settings → API → JWT Secret.
+    # When EMPTY, auth is DISABLED — all endpoints stay public (good for local dev).
+    SUPABASE_JWT_SECRET: str = ""
+    # Comma-separated emails that grant the "admin" role.
+    # Anyone NOT in this list is treated as a normal user.
+    # Leave empty to make every authenticated user an admin (single-tenant mode).
+    ADMIN_EMAILS: str = ""
 
     model_config = SettingsConfigDict(
         # Looks for .env in api/ first, then in the project root (seeourbook-summarizer-api/)

@@ -108,22 +108,48 @@ async def find(
     select: str = "*",
     order: str | None = None,
     limit: int | None = None,
+    offset: int | None = None,
 ) -> list[dict]:
     where, values = _build_where(filters)
     cols = _safe_select(select)
 
     # Accept "col DESC" / "col ASC" (SQL style) — used directly
-    order_clause = f"ORDER BY {order}" if order else ""
-    limit_clause = f"LIMIT {limit}" if limit is not None else ""
+    order_clause  = f"ORDER BY {order}" if order else ""
+    limit_clause  = f"LIMIT {limit}" if limit is not None else ""
+    offset_clause = f"OFFSET {offset}" if offset is not None and offset > 0 else ""
 
-    sql = f"SELECT {cols} FROM {table} {where} {order_clause} {limit_clause}".strip()
+    sql = f"SELECT {cols} FROM {table} {where} {order_clause} {limit_clause} {offset_clause}".strip()
 
     async with _pool_or_raise().acquire() as conn:
         rows = await conn.fetch(sql, *values)
     return [dict(r) for r in rows]
 
 
+def _strip_nul(value):
+    """
+    Recursively strip NUL bytes (\\x00) from any string / dict / list value.
+
+    Postgres rejects \\x00 in TEXT and JSONB columns with
+    `UntranslatableCharacterError: unsupported Unicode escape sequence`.
+    Some sources (PDFs, scraped HTML, raw model output) sneak NULs through —
+    catching them here is the last line of defense before they touch the DB.
+    """
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, str):
+        # Fast path — most strings have no NUL
+        if "\x00" not in value:
+            return value
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {k: _strip_nul(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_strip_nul(v) for v in value]
+    return value
+
+
 async def insert(table: str, data: dict) -> dict:
+    data   = {k: _strip_nul(v) for k, v in data.items()}
     cols   = ", ".join(data.keys())
     params = ", ".join(f"${i + 1}" for i in range(len(data)))
     sql    = f"INSERT INTO {table} ({cols}) VALUES ({params}) RETURNING *"
@@ -134,6 +160,7 @@ async def insert(table: str, data: dict) -> dict:
 
 
 async def upsert(table: str, data: dict, conflict: str) -> dict:
+    data          = {k: _strip_nul(v) for k, v in data.items()}
     cols          = ", ".join(data.keys())
     params        = ", ".join(f"${i + 1}" for i in range(len(data)))
     conflict_cols = conflict.replace(" ", "")
@@ -154,6 +181,7 @@ async def upsert(table: str, data: dict, conflict: str) -> dict:
 
 
 async def update(table: str, filters: dict, data: dict) -> None:
+    data = {k: _strip_nul(v) for k, v in data.items()}
     set_parts:   list[str] = []
     values:      list[Any] = []
 

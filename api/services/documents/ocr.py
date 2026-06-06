@@ -57,9 +57,18 @@ def needs_ocr(pdf_path: str | os.PathLike) -> bool:
     """
     try:
         import fitz  # PyMuPDF
-    except ImportError as exc:
+    except Exception as exc:
+        # Catch BaseException-ish failures too — on Windows, PyMuPDF can fail
+        # at import with an OSError / FileNotFoundError when the bundled DLLs
+        # can't be loaded (architecture mismatch, missing VC++ runtime, etc.).
+        # We want to surface the actual cause to the admin, not a misleading
+        # "not installed" message.
+        import sys as _sys
         raise OCRMissingError(
-            "PyMuPDF is not installed — run `pip install PyMuPDF`",
+            f"PyMuPDF (fitz) failed to import: {type(exc).__name__}: {exc}. "
+            f"Python interpreter is {_sys.executable!r} (version {_sys.version.split()[0]}). "
+            f"Install PyMuPDF in THIS interpreter with: "
+            f"\"{_sys.executable}\" -m pip install PyMuPDF==1.24.10"
         ) from exc
 
     try:

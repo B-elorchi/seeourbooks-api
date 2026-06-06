@@ -45,6 +45,15 @@ def _defaults() -> dict[str, str]:
         "DOC_CHUNK_SIZE_WORDS":           str(settings.DOC_CHUNK_SIZE_WORDS),
         "EMBEDDING_PROVIDER":             settings.EMBEDDING_PROVIDER,
         "EMBEDDING_MODEL":                settings.EMBEDDING_MODEL,
+        # EPUB injection step
+        "PIPELINE_STEP_INJECT_EPUB":      str(settings.PIPELINE_STEP_INJECT_EPUB).lower(),
+        "BOOK_FILES_BASE_URL":            settings.BOOK_FILES_BASE_URL,
+        # Video step
+        "PIPELINE_STEP_VIDEO":            str(settings.PIPELINE_STEP_VIDEO).lower(),
+        "VIDEO_PROVIDER":                 settings.VIDEO_PROVIDER,
+        "VIDEO_ORIENTATION":              settings.VIDEO_ORIENTATION,
+        "VIDEO_FPS":                      str(settings.VIDEO_FPS),
+        "VIDEO_BITRATE":                  settings.VIDEO_BITRATE,
     }
 
 

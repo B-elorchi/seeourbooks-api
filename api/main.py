@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from api.routes import summarize, books, jobs, health, pipeline, admin, document, documents
+from api.routes import summarize, books, jobs, health, pipeline, admin, document, documents, auth
 from api.services.db import startup as db_startup, shutdown as db_shutdown
 from api.services.config.migrations import run_migrations
 from api.services.documents.errors import DocumentError
@@ -48,3 +48,4 @@ app.include_router(pipeline.router,  prefix="/api")
 app.include_router(admin.router,     prefix="/api")
 app.include_router(document.router,  prefix="/api")
 app.include_router(documents.router, prefix="/api")
+app.include_router(auth.router,      prefix="/api")
