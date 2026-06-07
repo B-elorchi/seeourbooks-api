@@ -208,6 +208,43 @@ async def _fetch_book_from_catalog(book_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+async def _fetch_gutenberg_metadata(book_id: str) -> dict:
+    """
+    Fetch title and author from the Gutendex API for a numeric Gutenberg book_id.
+
+    Returns a dict with keys 'title' and 'author' (both may be empty strings on failure).
+    """
+    import logging as _log
+    import httpx
+
+    result = {"title": "", "author": ""}
+    try:
+        url = f"https://gutendex.com/books?ids={book_id}"
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+        books = data.get("results", [])
+        if not books:
+            return result
+        book = books[0]
+        result["title"] = book.get("title", "")
+        authors = book.get("authors", [])
+        if authors:
+            # Gutendex format: "Barrie, J. M. (James Matthew)" — reverse to "J. M. Barrie"
+            name = authors[0].get("name", "")
+            if "," in name:
+                parts = name.split(",", 1)
+                result["author"] = f"{parts[1].strip()} {parts[0].strip()}"
+            else:
+                result["author"] = name
+    except Exception as exc:
+        _log.getLogger(__name__).debug(
+            "Gutendex metadata fetch for book_id=%s failed: %s", book_id, exc,
+        )
+    return result
+
+
 def _pick_cached_summary(book_row: dict, language: str) -> str | None:
     """
     Return the best pre-computed summary on the books row for the language.
@@ -366,8 +403,10 @@ async def run_pipeline(
         book_row = await _fetch_book_from_catalog(req.book_id)
         if book_row:
             updates: dict = {}
-            if not req.title and book_row.get("title"):
-                updates["title"] = book_row["title"]
+            # Treat title == book_id as a missing title (placeholder inserted during initial import)
+            catalog_title = book_row.get("title", "")
+            if not req.title and catalog_title and catalog_title != req.book_id:
+                updates["title"] = catalog_title
             if not req.author and book_row.get("author"):
                 updates["author"] = book_row["author"]
             if not req.summary:
@@ -378,6 +417,18 @@ async def run_pipeline(
                 updates["pages"] = book_row["pages"]
             if updates:
                 req = req.model_copy(update=updates)
+
+    # For numeric book_ids still missing a real title (e.g. catalog row had title == book_id),
+    # fall back to Gutendex API to retrieve the actual title and author.
+    if req.book_id and req.book_id.isdigit() and not req.title:
+        gutenberg_meta = await _fetch_gutenberg_metadata(req.book_id)
+        meta_updates: dict = {}
+        if gutenberg_meta.get("title"):
+            meta_updates["title"] = gutenberg_meta["title"]
+        if not req.author and gutenberg_meta.get("author"):
+            meta_updates["author"] = gutenberg_meta["author"]
+        if meta_updates:
+            req = req.model_copy(update=meta_updates)
 
     # Ensure the FK target exists — chunk_summaries / book_summaries reference books(book_id).
     # custom_json requests for a book not in the catalog would otherwise 409.

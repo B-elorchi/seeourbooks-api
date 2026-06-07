@@ -28,51 +28,14 @@ from openai import AsyncOpenAI
 
 from api.config.settings import settings
 from api.services.usage_logger import log_image_usage
+from api.services.config.runtime import get_config_value, PROMPT_COVER_DEFAULT
 
 log = logging.getLogger(__name__)
 
-_PROMPT_TEMPLATE = (
-    "Design a professional, bookstore-quality book cover for the book titled "
-    "\"{title}\" written by {author}.\n"
-    "\n"
-    "BOOK DETAILS:\n"
-    "{details}\n"
-    "\n"
-    "WHAT THE BOOK IS ABOUT:\n"
-    "{summary}\n"
-    "\n"
-    "VISUAL DIRECTION:\n"
-    "- The illustration MUST visually represent the book's actual story, themes, and mood — "
-    "use concrete symbols, characters, settings, or objects from the content above.\n"
-    "- Reflect the {genre_hint} genre and emotional tone of the book.\n"
-    "- Modern, premium publishing aesthetic — cinematic composition, rich atmospheric lighting, "
-    "considered color palette that matches the book's mood.\n"
-    "- Portrait orientation, single strong focal subject, balanced negative space in the upper "
-    "third (where the title sits) and the lower strip (where the author name sits).\n"
-    "- Photorealistic or high-quality illustrated style — NOT cartoon, NOT clip art.\n"
-    "\n"
-    "TEXT ON THE COVER (CRITICAL — render this text directly onto the image):\n"
-    "- Render the TITLE prominently across the upper portion of the cover:\n"
-    "      {title}\n"
-    "  Use a large, bold, elegant serif or modern display typeface. The title must be the\n"
-    "  largest text element, perfectly readable, with high contrast against the background.\n"
-    "- Render the AUTHOR NAME in a smaller, refined typeface at the BOTTOM of the cover:\n"
-    "      {author}\n"
-    "  Author name should be roughly 25–35% the size of the title, centered, with letter-spacing\n"
-    "  suitable for a professional cover.\n"
-    "- Spell the title and author name EXACTLY as written above — every letter, accent, and word.\n"
-    "- Do not invent any additional text, taglines, blurbs, publisher logos, or barcodes.\n"
-    "\n"
-    "STRICT RULES:\n"
-    "- ONLY the title and author name appear as text — no other words, numbers, or labels.\n"
-    "- NO watermarks, NO website URLs, NO frames around the image.\n"
-    "- The final result must look like a finished, printable bookstore cover."
-)
 
-
-def _build_prompt(title: str, author: str, summary: str | None,
-                  genres: list[str] | None, year: int | None,
-                  language: str | None) -> str:
+async def _build_prompt(title: str, author: str, summary: str | None,
+                        genres: list[str] | None, year: int | None,
+                        language: str | None) -> str:
     """Compose a content-aware cover prompt from the book's metadata + summary."""
 
     # ── Details block (only include what we actually have) ──────────────────
@@ -96,12 +59,14 @@ def _build_prompt(title: str, author: str, summary: str | None,
     # ── Genre hint for visual style ──────────────────────────────────────────
     genre_hint = (", ".join(genres) if genres else "general").lower()
 
-    return _PROMPT_TEMPLATE.format(
-        title       = title or "Untitled",
-        author      = author or "Unknown",
-        details     = details,
-        summary     = snippet,
-        genre_hint  = genre_hint,
+    template = await get_config_value("PROMPT_COVER", PROMPT_COVER_DEFAULT)
+
+    return template.format(
+        title      = title or "Untitled",
+        author     = author or "Unknown",
+        details    = details,
+        summary    = snippet,
+        genre_hint = genre_hint,
     )
 
 _OPENROUTER_BASE = "https://openrouter.ai/api/v1"
@@ -407,7 +372,7 @@ async def generate_cover(
 
     quality = cfg.get("IMAGE_QUALITY", settings.IMAGE_QUALITY)
     size    = cfg.get("IMAGE_SIZE",    settings.IMAGE_SIZE)
-    prompt  = _build_prompt(title, author, summary, genres, year, language)
+    prompt  = await _build_prompt(title, author, summary, genres, year, language)
 
     # Silently upgrade any stale/deprecated model name saved in the DB
     if model in _MODEL_ALIASES:

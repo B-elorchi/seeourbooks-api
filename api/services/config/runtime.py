@@ -8,6 +8,96 @@ import time
 from api.config.settings import settings
 from api.services.db import find, upsert
 
+# ── Default prompt templates (editable via admin panel) ───────────────────────
+
+PROMPT_COVER_DEFAULT = (
+    "Design a professional, bookstore-quality book cover for the book titled "
+    "\"{title}\" written by {author}.\n"
+    "\n"
+    "BOOK DETAILS:\n"
+    "{details}\n"
+    "\n"
+    "WHAT THE BOOK IS ABOUT:\n"
+    "{summary}\n"
+    "\n"
+    "VISUAL DIRECTION:\n"
+    "- The illustration MUST visually represent the book's actual story, themes, and mood — "
+    "use concrete symbols, characters, settings, or objects from the content above.\n"
+    "- Reflect the {genre_hint} genre and emotional tone of the book.\n"
+    "- Modern, premium publishing aesthetic — cinematic composition, rich atmospheric lighting, "
+    "considered color palette that matches the book's mood.\n"
+    "- Portrait orientation, single strong focal subject, balanced negative space in the upper "
+    "third (where the title sits) and the lower strip (where the author name sits).\n"
+    "- Photorealistic or high-quality illustrated style — NOT cartoon, NOT clip art.\n"
+    "\n"
+    "TEXT ON THE COVER (CRITICAL — render this text directly onto the image):\n"
+    "- Render the TITLE prominently across the upper portion of the cover:\n"
+    "      {title}\n"
+    "  Use a large, bold, elegant serif or modern display typeface. The title must be the\n"
+    "  largest text element, perfectly readable, with high contrast against the background.\n"
+    "- Render the AUTHOR NAME in a smaller, refined typeface at the BOTTOM of the cover:\n"
+    "      {author}\n"
+    "  Author name should be roughly 25–35% the size of the title, centered, with letter-spacing\n"
+    "  suitable for a professional cover.\n"
+    "- Spell the title and author name EXACTLY as written above — every letter, accent, and word.\n"
+    "- Do not invent any additional text, taglines, blurbs, publisher logos, or barcodes.\n"
+    "\n"
+    "STRICT RULES:\n"
+    "- ONLY the title and author name appear as text — no other words, numbers, or labels.\n"
+    "- NO watermarks, NO website URLs, NO frames around the image.\n"
+    "- The final result must look like a finished, printable bookstore cover."
+)
+
+PROMPT_MINDMAP_MERMAID_DEFAULT = (
+    "Create a Mermaid mind map diagram (graph TD) for the book '{title}'.\n"
+    "Based on this summary:\n\n{summary}\n\n"
+    "STRICT SYNTAX RULES (failure to follow these breaks the renderer):\n"
+    "- First line MUST be exactly: graph TD\n"
+    "- EVERY node MUST use the form  ID[Label]  — single-token ID followed by [bracketed label]\n"
+    "- Edges MUST be:  A[Label] --> B[Label]   (with the brackets)\n"
+    "- IDs are short alphanumeric tokens with no spaces (A, B, C, A1, B2, ROOT, etc.)\n"
+    "- Labels go INSIDE the [] brackets, can have spaces, must be 2-4 English words\n"
+    "- NO quotes, NO parentheses, NO Arabic, NO commas, NO special characters in labels\n"
+    "- 5-7 main topic nodes branching from a single root\n"
+    "- Each main node has 2-3 sub-nodes\n"
+    "- Output ONLY the Mermaid code, no markdown fences, no explanation\n"
+    "\n"
+    "CORRECT example:\n"
+    "  graph TD\n"
+    "    ROOT[Atomic Habits] --> A[Small Changes]\n"
+    "    ROOT --> B[Habit Loop]\n"
+    "    A --> A1[Compound Effect]\n"
+    "\n"
+    "WRONG (do not do this):\n"
+    "  Atomic Habits --> Small Changes      <-- NO brackets, will fail\n"
+    "{lang_note}"
+)
+
+PROMPT_MINDMAP_JSON_DEFAULT = (
+    "Create a mind map in JSON format for the book '{title}'.\n"
+    "Based on this summary:\n\n{summary}\n\n"
+    "Return ONLY valid JSON matching this exact structure:\n"
+    '{{\n'
+    '  "center_node": {{\n'
+    '    "text": "<book title>",\n'
+    '    "branches": [\n'
+    '      {{"category": "Characters", "color": "orange", "sub_nodes": ["item1", "item2", "item3"]}},\n'
+    '      {{"category": "Similar",    "color": "red",    "sub_nodes": ["item1", "item2", "item3"]}},\n'
+    '      {{"category": "Impact",     "color": "green",  "sub_nodes": ["item1", "item2", "item3"]}},\n'
+    '      {{"category": "Background", "color": "pink",   "sub_nodes": ["item1", "item2", "item3"]}},\n'
+    '      {{"category": "Author",     "color": "blue",   "sub_nodes": ["item1", "item2", "item3"]}},\n'
+    '      {{"category": "Quotations", "color": "purple", "sub_nodes": ["item1", "item2", "item3"]}}\n'
+    '    ]\n'
+    '  }}\n'
+    '}}\n\n'
+    "RULES:\n"
+    "- center_node.text must be the book's title\n"
+    "- Keep the 6 branch categories and colors exactly as shown\n"
+    "- Each branch must have exactly 3 concise, meaningful sub_nodes\n"
+    "- Output ONLY the JSON object, no markdown fences, no explanation\n"
+    "{lang_note}"
+)
+
 
 # ── Defaults from env / settings.py ──────────────────────────────────────────
 
@@ -54,6 +144,10 @@ def _defaults() -> dict[str, str]:
         "VIDEO_ORIENTATION":              settings.VIDEO_ORIENTATION,
         "VIDEO_FPS":                      str(settings.VIDEO_FPS),
         "VIDEO_BITRATE":                  settings.VIDEO_BITRATE,
+        # AI prompt templates (editable via admin panel)
+        "PROMPT_COVER":                   PROMPT_COVER_DEFAULT,
+        "PROMPT_MINDMAP_MERMAID":         PROMPT_MINDMAP_MERMAID_DEFAULT,
+        "PROMPT_MINDMAP_JSON":            PROMPT_MINDMAP_JSON_DEFAULT,
     }
 
 

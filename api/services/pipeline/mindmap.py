@@ -20,6 +20,11 @@ import httpx
 
 from api.config.settings import settings
 from api.services.ai_client import chat_complete
+from api.services.config.runtime import (
+    get_config_value,
+    PROMPT_MINDMAP_MERMAID_DEFAULT,
+    PROMPT_MINDMAP_JSON_DEFAULT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -36,29 +41,11 @@ async def generate_mermaid_code(title: str, summary: str, language: str, model: 
         if language == "ar" else ""
     )
 
-    prompt = (
-        f"Create a Mermaid mind map diagram (graph TD) for the book '{title}'.\n"
-        f"Based on this summary:\n\n{summary[:1500]}\n\n"
-        f"STRICT SYNTAX RULES (failure to follow these breaks the renderer):\n"
-        f"- First line MUST be exactly: graph TD\n"
-        f"- EVERY node MUST use the form  ID[Label]  — single-token ID followed by [bracketed label]\n"
-        f"- Edges MUST be:  A[Label] --> B[Label]   (with the brackets)\n"
-        f"- IDs are short alphanumeric tokens with no spaces (A, B, C, A1, B2, ROOT, etc.)\n"
-        f"- Labels go INSIDE the [] brackets, can have spaces, must be 2-4 English words\n"
-        f"- NO quotes, NO parentheses, NO Arabic, NO commas, NO special characters in labels\n"
-        f"- 5-7 main topic nodes branching from a single root\n"
-        f"- Each main node has 2-3 sub-nodes\n"
-        f"- Output ONLY the Mermaid code, no markdown fences, no explanation\n"
-        f"\n"
-        f"CORRECT example:\n"
-        f"  graph TD\n"
-        f"    ROOT[Atomic Habits] --> A[Small Changes]\n"
-        f"    ROOT --> B[Habit Loop]\n"
-        f"    A --> A1[Compound Effect]\n"
-        f"\n"
-        f"WRONG (do not do this):\n"
-        f"  Atomic Habits --> Small Changes      <-- NO brackets, will fail\n"
-        f"{lang_note}"
+    template = await get_config_value("PROMPT_MINDMAP_MERMAID", PROMPT_MINDMAP_MERMAID_DEFAULT)
+    prompt = template.format(
+        title   = title,
+        summary = summary[:1500],
+        lang_note = lang_note,
     )
 
     code = await chat_complete(
@@ -132,29 +119,11 @@ async def generate_json_mindmap(title: str, summary: str, language: str, model: 
         if language == "ar" else ""
     )
 
-    prompt = (
-        f"Create a mind map in JSON format for the book '{title}'.\n"
-        f"Based on this summary:\n\n{summary[:1500]}\n\n"
-        f"Return ONLY valid JSON matching this exact structure:\n"
-        f'{{\n'
-        f'  "center_node": {{\n'
-        f'    "text": "<book title>",\n'
-        f'    "branches": [\n'
-        f'      {{"category": "Characters", "color": "orange", "sub_nodes": ["item1", "item2", "item3"]}},\n'
-        f'      {{"category": "Similar",    "color": "red",    "sub_nodes": ["item1", "item2", "item3"]}},\n'
-        f'      {{"category": "Impact",     "color": "green",  "sub_nodes": ["item1", "item2", "item3"]}},\n'
-        f'      {{"category": "Background", "color": "pink",   "sub_nodes": ["item1", "item2", "item3"]}},\n'
-        f'      {{"category": "Author",     "color": "blue",   "sub_nodes": ["item1", "item2", "item3"]}},\n'
-        f'      {{"category": "Quotations", "color": "purple", "sub_nodes": ["item1", "item2", "item3"]}}\n'
-        f'    ]\n'
-        f'  }}\n'
-        f'}}\n\n'
-        f"RULES:\n"
-        f"- center_node.text must be the book's title\n"
-        f"- Keep the 6 branch categories and colors exactly as shown\n"
-        f"- Each branch must have exactly 3 concise, meaningful sub_nodes\n"
-        f"- Output ONLY the JSON object, no markdown fences, no explanation\n"
-        f"{lang_note}"
+    template = await get_config_value("PROMPT_MINDMAP_JSON", PROMPT_MINDMAP_JSON_DEFAULT)
+    prompt = template.format(
+        title     = title,
+        summary   = summary[:1500],
+        lang_note = lang_note,
     )
 
     raw = await chat_complete(
