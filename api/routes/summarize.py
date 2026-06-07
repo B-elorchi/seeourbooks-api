@@ -7,6 +7,9 @@ from fastapi.responses import StreamingResponse
 from api.config.settings import settings
 from api.models.requests import SumReq
 from api.services.db import find, insert, upsert, update
+from api.services.pipeline.orchestrator import (
+    _fetch_book_from_catalog, _pick_cached_summary,
+)
 from api.services.summarizer.chunker import find_book_text, chunk_text
 from api.services.summarizer.haiku import run_haiku_pass
 from api.services.summarizer.sonnet import run_sonnet_pass
@@ -21,26 +24,54 @@ def sse(event: str, data: dict) -> str:
 
 async def run(req: SumReq) -> AsyncIterator[str]:
 
-    # ── 1. Cache check ────────────────────────────────────────────────────────
-    rows = await find(
-        "book_summaries",
-        filters={
-            "book_id":  req.book_id,
-            "length":   req.length,
-            "style":    req.style,
-            "language": req.language,
-        },
-        select="summary, word_count",
-        limit=1,
-    )
+    # ── 1. Cache check (our internal cache from prior summary runs) ──────────
+    try:
+        rows = await find(
+            "book_summaries",
+            filters={
+                "book_id":  req.book_id,
+                "length":   req.length,
+                "style":    req.style,
+                "language": req.language,
+            },
+            select="summary, word_count",
+            limit=1,
+        )
+    except Exception:
+        rows = []   # book_summaries table missing → fall through gracefully
+
     if rows:
         yield sse("cached", {"summary": rows[0]["summary"], "word_count": rows[0]["word_count"]})
         return
 
+    # ── 1b. Production catalog cache check ───────────────────────────────────
+    # If the book exists in the client's `books` table with a pre-computed
+    # summary (summary_english / summary_en_10min / arabic_summary / etc.),
+    # return that immediately.  Saves an entire AI run for books that were
+    # already summarised by the client's previous batch job.
+    catalog_row = await _fetch_book_from_catalog(req.book_id)
+    if catalog_row:
+        cached = _pick_cached_summary(catalog_row, req.language)
+        if cached:
+            wc = len(cached.split())
+            yield sse("status", {"msg": "Found cached summary in catalog"})
+            yield sse("cached", {"summary": cached, "word_count": wc})
+            return
+
     yield sse("status", {"msg": "Starting…"})
 
-    # ── 2. Ensure book exists in catalog (FK requirement) ─────────────────────
-    await upsert("books", {"book_id": req.book_id, "title": req.book_id, "status": "pending"}, "book_id")
+    # ── 2. Ensure book exists in catalog (FK requirement) — skip for numeric  ──
+    # ids that already exist in the production catalog (integer PK rejects
+    # the upsert anyway, and the row already exists).
+    if not (req.book_id or "").isdigit():
+        try:
+            await upsert(
+                "books",
+                {"book_id": req.book_id, "title": req.book_id, "status": "pending"},
+                "book_id",
+            )
+        except Exception:
+            pass  # production schema may not match; best-effort upsert
 
     # ── 3. Create or reuse job ────────────────────────────────────────────────
     existing = await find(
@@ -69,12 +100,24 @@ async def run(req: SumReq) -> AsyncIterator[str]:
     await update("summary_jobs", {"id": job_id}, {"status": "processing"})
 
     # ── 4. Load chunks ────────────────────────────────────────────────────────
-    chunks = await find(
-        "chunks",
-        filters={"book_id": req.book_id},
-        select="id, chunk_index, content",
-        order="chunk_index ASC",
-    )
+    # Production `chunks` table has `chunk_id` (UUID) — not `id` — and may have
+    # a bigint book_id rather than text.  We try a minimal column selection
+    # that exists on both legacy and production schemas; on failure we fall
+    # through to the find_book_text path below.
+    try:
+        chunks = await find(
+            "chunks",
+            filters={"book_id": req.book_id},
+            select="chunk_index, content",
+            order="chunk_index ASC",
+        )
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "chunks lookup failed for book_id=%s — falling back to text loader: %s",
+            req.book_id, exc,
+        )
+        chunks = []
     if not chunks:
         yield sse("status", {"msg": "Loading book text…"})
         text = find_book_text(req.book_id)

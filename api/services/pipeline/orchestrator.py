@@ -209,9 +209,32 @@ async def _fetch_book_from_catalog(book_id: str) -> dict | None:
 
 
 def _pick_cached_summary(book_row: dict, language: str) -> str | None:
-    """Return the best pre-computed summary on the books row for the language."""
+    """
+    Return the best pre-computed summary on the books row for the language.
+
+    Tries the 10-minute summary first (preferred — sized for our audio target),
+    then falls back to the long-form summary.
+
+    NUL-string handling
+    ───────────────────
+    Production data sometimes stores the LITERAL STRING "null" (or "None",
+    "NULL", etc.) where a real database NULL was intended.  Treating those
+    strings as a real summary would cause downstream TTS to literally narrate
+    the word "null".  We strip those sentinel values out below.
+    """
+    _NULL_SENTINELS = {"", "null", "none", "nil", "n/a", "na", "undefined"}
+
     def _nonempty(value) -> str | None:
-        return value.strip() if isinstance(value, str) and value.strip() else None
+        if not isinstance(value, str):
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        # Reject sentinel strings that production data has been observed using
+        # in place of actual NULL (e.g. "null", "None", etc.).
+        if stripped.lower() in _NULL_SENTINELS:
+            return None
+        return stripped
 
     if (language or "en").lower() == "ar":
         return (
