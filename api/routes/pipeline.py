@@ -169,6 +169,7 @@ async def _run_job(
     job_id: str,
     req: PipelineReq,
     previous_result: dict | str | None = None,
+    force_steps: bool = False,
 ) -> None:
     """
     Execute one pipeline attempt.
@@ -176,12 +177,16 @@ async def _run_job(
     previous_result — the stored result from the last partial/failed run.
                       When provided, only failed steps are re-run and the
                       new outputs are merged back with the old successes.
+    force_steps     — when True, req.steps is used exactly as-is (admin rerun).
+                      When False (default), failed steps from previous_result
+                      take precedence over req.steps (auto-retry behaviour).
     """
-    # If we have a previous result, narrow req.steps to only failed ones
-    failed = _failed_steps(previous_result)
-    if failed:
-        # model_copy keeps all other fields; override steps to the failed subset
-        req = req.model_copy(update={"steps": failed})
+    # If we have a previous result and we're NOT in forced-step mode,
+    # narrow req.steps to only the failed ones (standard auto-retry behaviour).
+    if not force_steps:
+        failed = _failed_steps(previous_result)
+        if failed:
+            req = req.model_copy(update={"steps": failed})
 
     # Tag all downstream usage logs with this job_id (read by usage_logger via contextvars).
     from api.services.usage_logger import set_job_context  # noqa: PLC0415

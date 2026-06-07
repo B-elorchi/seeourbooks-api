@@ -40,6 +40,10 @@ class ConfigUpdate(BaseModel):
     value: str
 
 
+class RerunRequest(BaseModel):
+    steps: list[str]  # e.g. ["audio_full", "cover"]
+
+
 @router.get("/config")
 async def admin_get_config() -> dict:
     """Return all provider settings as a flat key → value dict."""
@@ -273,6 +277,74 @@ async def admin_costs(days: int = 30) -> dict:
         "by_provider":    _round(list(by_provider.values())),
         "by_step":        _round(list(by_step.values())),
         "by_model":       _round(list(by_model.values())),
+    }
+
+
+@router.post("/jobs/{job_id}/rerun", status_code=202)
+async def admin_rerun_steps(
+    job_id: str,
+    body: RerunRequest,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """
+    Re-run specific pipeline steps for an existing job — regardless of their
+    previous status (done, failed, or skipped).
+
+    Useful when you want to regenerate just one output (e.g. re-generate audio
+    or cover) without running the full pipeline again.
+
+    Body: {"steps": ["audio_full", "cover"]}
+
+    - Previous successful results for OTHER steps are preserved in the merged output.
+    - Resets retry_count to 0 so the rerun gets 3 fresh auto-retries.
+    - Works on any job status (done, failed, partial, queued).
+    """
+    from api.routes.pipeline import _run_job          # noqa: PLC0415
+    from api.models.requests import VALID_STEPS       # noqa: PLC0415
+
+    if not body.steps:
+        raise HTTPException(422, "steps list must not be empty")
+
+    unknown = [s for s in body.steps if s not in VALID_STEPS]
+    if unknown:
+        raise HTTPException(
+            422,
+            f"Unknown step(s): {unknown}. Valid: {sorted(VALID_STEPS)}",
+        )
+
+    try:
+        job = await get_job(job_id)
+    except Exception as exc:
+        raise HTTPException(503, f"Database unreachable: {exc}") from exc
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
+
+    raw_input = job.get("input")
+    if not raw_input:
+        raise HTTPException(422, "Job has no stored input — cannot rerun")
+
+    try:
+        req = PipelineReq.model_validate(raw_input)
+    except Exception as exc:
+        raise HTTPException(422, f"Stored input is invalid: {exc}") from exc
+
+    # Override steps to exactly what the admin selected
+    req = req.model_copy(update={"steps": body.steps})
+
+    # Carry the previous result so other steps' outputs are preserved
+    previous_result = job.get("result")
+
+    await reset_for_manual_retry(job_id)
+    # force_steps=True: use exactly the steps the admin chose, don't override
+    # with just-the-failed-steps logic that _run_job normally applies.
+    background_tasks.add_task(_run_job, job_id, req, previous_result, True)
+
+    return {
+        "ok":          True,
+        "job_id":      job_id,
+        "status":      "queued",
+        "rerun_steps": body.steps,
+        "status_url":  f"/api/pipeline/status/{job_id}",
     }
 
 
