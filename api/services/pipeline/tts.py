@@ -242,18 +242,43 @@ async def _dispatch_tts(
 # ── Provider implementations ─────────────────────────────────────────────────
 
 async def _deepgram(text: str, voice: str, output_path: str) -> None:
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(
-            f"https://api.deepgram.com/v1/speak?model={voice}",
-            headers={
-                "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"text": text},
-        )
-        r.raise_for_status()
-    with open(output_path, "wb") as f:
-        f.write(r.content)
+    """Deepgram TTS with retry logic for timeout errors."""
+    import logging
+    log = logging.getLogger(__name__)
+    
+    max_retries = 3
+    base_delay = 2  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                r = await client.post(
+                    f"https://api.deepgram.com/v1/speak?model={voice}",
+                    headers={
+                        "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"text": text},
+                )
+                r.raise_for_status()
+            with open(output_path, "wb") as f:
+                f.write(r.content)
+            return  # Success - exit function
+        except httpx.HTTPStatusError as e:
+            # Check for 408 timeout or 429 rate limit
+            if e.response.status_code in (408, 429) and attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)  # Exponential backoff: 2, 4, 8 seconds
+                log.warning(f"Deepgram TTS attempt {attempt + 1}/{max_retries} failed with {e.response.status_code}, retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                continue
+            raise  # Re-raise if not retryable or last attempt
+        except httpx.TimeoutException as e:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                log.warning(f"Deepgram TTS attempt {attempt + 1}/{max_retries} timed out, retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                continue
+            raise  # Re-raise on last attempt
 
 
 async def _elevenlabs(text: str, language: str, output_path: str) -> None:

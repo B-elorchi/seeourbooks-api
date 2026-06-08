@@ -106,6 +106,13 @@ def _defaults() -> dict[str, str]:
         "MODEL_HAIKU":                    settings.MODEL_HAIKU,
         "MODEL_SONNET":                   settings.MODEL_SONNET,
         "MODEL_OPUS":                     settings.MODEL_OPUS,
+        # Per-chunk summary model (Pass 1). Defaults to OpenRouter GPT-4.1-mini
+        # for cost efficiency. Supports OpenRouter prefix (openai/gpt-4.1-mini)
+        # or native Anthropic models (claude-haiku-4-5-20251001).
+        "MODEL_CHUNK":                    settings.MODEL_CHUNK,
+        # Concurrency knobs for the parallelised steps.
+        "HAIKU_CONCURRENCY":             "6",
+        "MINDMAP_CONCURRENCY":           "4",
         "TTS_PROVIDER_EN":                settings.TTS_PROVIDER_EN,
         "TTS_VOICE_EN":                   settings.TTS_VOICE_EN,
         "TTS_PROVIDER_AR":                settings.TTS_PROVIDER_AR,
@@ -148,6 +155,9 @@ def _defaults() -> dict[str, str]:
         "PROMPT_COVER":                   PROMPT_COVER_DEFAULT,
         "PROMPT_MINDMAP_MERMAID":         PROMPT_MINDMAP_MERMAID_DEFAULT,
         "PROMPT_MINDMAP_JSON":            PROMPT_MINDMAP_JSON_DEFAULT,
+        # Mindmap generation settings
+        # Set to 0 or empty for unlimited tokens (no max_tokens limit sent to API)
+        "MINDMAP_JSON_MAX_TOKENS":        "0",
     }
 
 

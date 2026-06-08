@@ -7,11 +7,18 @@ Admin routes:
   POST /api/admin/jobs/{job_id}/retry → manually retry a failed/partial job
   GET  /api/admin/costs               → aggregated cost breakdown for the last N days
   GET  /api/admin/openrouter-models   → cached, optionally-filtered live OpenRouter model list
+  POST /api/admin/books               → upsert a book row (fetches metadata from Gutenberg if numeric id)
+  GET  /api/admin/books/{book_id}     → fetch a single book row from the DB
 """
+import io
 import logging
+import re
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -19,7 +26,7 @@ from pydantic import BaseModel
 
 from api.auth import require_admin
 from api.services.config.runtime import get_all_config, set_config_key
-from api.services.db import find
+from api.services.db import find, insert, upsert
 from api.jobs.store import get_job, reset_for_manual_retry
 from api.models.requests import PipelineReq
 
@@ -44,6 +51,63 @@ class RerunRequest(BaseModel):
     steps: list[str]  # e.g. ["audio_full", "cover"]
 
 
+class BookUpsertRequest(BaseModel):
+    book_id:     str
+    title:       str | None = None   # auto-fetched from Gutenberg when omitted + book_id is numeric
+    author:      str | None = None   # same
+    language:    str        = "en"
+    year:        int | None = None
+    pages:       int | None = None
+    grade_level: str | None = None
+    genres:      list[str]  = []
+    status:      str        = "pending"
+
+
+# ── Gutenberg metadata helper ─────────────────────────────────────────────────
+
+async def _gutenberg_meta(book_id: str) -> dict:
+    """
+    Fetch title, author, year, pages, and genres from the Gutendex API.
+    Returns a dict with whatever fields are available (may be partial).
+    """
+    result: dict = {}
+    try:
+        url = f"https://gutendex.com/books?ids={book_id}"
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+        books = data.get("results", [])
+        if not books:
+            return result
+        book = books[0]
+
+        result["title"] = book.get("title", "")
+
+        authors = book.get("authors", [])
+        if authors:
+            name = authors[0].get("name", "")
+            # Gutendex format: "Shelley, Mary Wollstonecraft" → "Mary Wollstonecraft Shelley"
+            if "," in name:
+                last, first = name.split(",", 1)
+                result["author"] = f"{first.strip()} {last.strip()}"
+            else:
+                result["author"] = name
+
+        if book.get("download_count"):
+            pass  # no year/pages in Gutendex sadly
+
+        subjects = book.get("subjects", [])
+        bookshelves = book.get("bookshelves", [])
+        genres_raw = subjects[:3] + bookshelves[:2]
+        if genres_raw:
+            result["genres"] = [g.split("--")[0].strip() for g in genres_raw]
+
+    except Exception as exc:
+        log.debug("Gutenberg meta fetch for %s failed: %s", book_id, exc)
+    return result
+
+
 @router.get("/config")
 async def admin_get_config() -> dict:
     """Return all provider settings as a flat key → value dict."""
@@ -57,6 +121,416 @@ async def admin_set_config(body: ConfigUpdate) -> dict:
         raise HTTPException(400, "key is required")
     await set_config_key(body.key, body.value)
     return {"ok": True, "key": body.key, "value": body.value}
+
+
+@router.post("/books", status_code=200)
+async def admin_upsert_book(body: BookUpsertRequest) -> dict:
+    """
+    Insert or update a book row in the database.
+
+    For numeric book_ids (Gutenberg books) where title/author are omitted,
+    metadata is automatically fetched from the Gutendex API so you don't
+    have to look it up manually.
+
+    After this succeeds, run the pipeline with:
+      POST /api/pipeline/run  { "book_id": "<id>", ... }
+    """
+    title  = body.title
+    author = body.author
+    genres = body.genres
+
+    # Auto-fetch from Gutenberg when id is numeric and fields are missing
+    if body.book_id.isdigit() and (not title or not author):
+        meta = await _gutenberg_meta(body.book_id)
+        if not title:
+            title = meta.get("title", "")
+        if not author:
+            author = meta.get("author", "")
+        if not genres:
+            genres = meta.get("genres", [])
+
+    # Last resort: if Gutenberg failed, check whether the book already exists in DB
+    if not title:
+        try:
+            bid_check: object = body.book_id
+            try:
+                bid_check = int(body.book_id)
+            except ValueError:
+                pass
+            existing = await find("books", filters={"book_id": bid_check}, limit=1)
+            if existing:
+                title  = existing[0].get("title", "") or ""
+                author = author or existing[0].get("author", "") or ""
+        except Exception:
+            pass
+
+    if not title:
+        raise HTTPException(
+            422,
+            f"Could not determine title for book_id={body.book_id!r}. "
+            "Pass `title` explicitly or use a valid Gutenberg numeric id."
+        )
+
+    row = {
+        "book_id": body.book_id,
+        "title":   title,
+        "author":  author or "",
+        "status":  body.status,
+    }
+    if body.year:
+        row["year"] = body.year
+    if body.pages:
+        row["pages"] = body.pages
+    if body.grade_level:
+        row["grade_level"] = body.grade_level
+    if genres:
+        row["genres"] = genres
+
+    try:
+        await upsert("books", row, conflict="book_id")
+    except Exception as exc:
+        raise HTTPException(502, f"DB upsert failed: {exc}") from exc
+
+    return {
+        "ok":      True,
+        "book_id": body.book_id,
+        "title":   title,
+        "author":  author or "",
+        "action":  "upserted",
+        "next":    f"POST /api/pipeline/run with book_id={body.book_id!r}",
+    }
+
+
+@router.get("/books/{book_id}")
+async def admin_get_book(book_id: str) -> dict:
+    """Return the book row from the database, or 404 if not found."""
+    try:
+        bid: object = book_id
+        try:
+            bid = int(book_id)
+        except ValueError:
+            pass
+        rows = await find("books", filters={"book_id": bid}, limit=1)
+    except Exception as exc:
+        raise HTTPException(502, f"DB read failed: {exc}") from exc
+
+    if not rows:
+        raise HTTPException(404, f"Book {book_id!r} not found in the database")
+    return rows[0]
+
+
+# ── In-memory ingest status store (keyed by book_id) ─────────────────────────
+# Persists across requests within one server process so the client can poll.
+_ingest_status: dict[str, dict] = {}
+
+
+@router.post("/books/{book_id}/ingest", status_code=202)
+async def admin_ingest_book(book_id: str, background_tasks: BackgroundTasks) -> dict:
+    """
+    Start a background ingest job for this book and return immediately (202).
+
+    Poll GET /api/admin/books/{book_id}/ingest/status to track progress.
+
+    URL resolution order:
+      1. epub_download column in the books row
+      2. BOOK_FILES_BASE_URL/books/english/{book_id}.epub
+      3. txt_download column in the books row
+      4. BOOK_FILES_BASE_URL/books/english/{book_id}.txt
+    """
+    from api.services.config.runtime import get_config_value  # noqa: PLC0415
+
+    # ── Validate book exists ──────────────────────────────────────────────────
+    bid: object = book_id
+    try:
+        bid = int(book_id)
+    except ValueError:
+        pass
+
+    try:
+        rows = await find("books", filters={"book_id": bid}, limit=1)
+    except Exception as exc:
+        raise HTTPException(502, f"DB read failed: {exc}") from exc
+
+    if not rows:
+        raise HTTPException(
+            404,
+            f"Book {book_id!r} not found. Insert it first via POST /api/admin/books.",
+        )
+
+    book = rows[0]
+
+    base = await get_config_value("BOOK_FILES_BASE_URL", "https://files.seeourbook.sa")
+    base = base.rstrip("/")
+
+    epub_candidates = [c for c in [book.get("epub_download"), f"{base}/books/english/{book_id}.epub"] if c]
+    txt_candidates  = [c for c in [book.get("txt_download"),  f"{base}/books/english/{book_id}.txt"]  if c]
+
+    # Mark as running
+    _ingest_status[book_id] = {"status": "running", "book_id": book_id, "title": book.get("title", "")}
+
+    background_tasks.add_task(
+        _run_ingest, book_id, bid, book, epub_candidates, txt_candidates
+    )
+
+    return {
+        "ok":         True,
+        "book_id":    book_id,
+        "status":     "running",
+        "status_url": f"/api/admin/books/{book_id}/ingest/status",
+    }
+
+
+@router.get("/books/{book_id}/ingest/status")
+async def admin_ingest_status(book_id: str) -> dict:
+    """Poll this endpoint to check whether an ingest job has finished."""
+    info = _ingest_status.get(book_id)
+    if not info:
+        return {"status": "not_started", "book_id": book_id}
+    return info
+
+
+async def _run_ingest(
+    book_id: str,
+    bid: object,
+    book: dict,
+    epub_candidates: list[str],
+    txt_candidates:  list[str],
+) -> None:
+    """Background task: download → extract text → chunk → upsert to DB."""
+    from api.services.summarizer.chunker import chunk_text  # noqa: PLC0415
+
+    def _set(status: str, **extra: object) -> None:
+        _ingest_status[book_id] = {"status": status, "book_id": book_id,
+                                    "title": book.get("title", ""), **extra}
+
+    try:
+        # ── Download ──────────────────────────────────────────────────────────
+        _set("running", step="downloading")
+        raw_bytes: bytes = b""
+        used_url:  str   = ""
+        is_epub:   bool  = False
+
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+            for url in epub_candidates:
+                try:
+                    resp = await client.get(url)
+                    if resp.status_code == 200 and len(resp.content) > 1000:
+                        raw_bytes, used_url, is_epub = resp.content, url, True
+                        log.info("Ingest %s: downloaded EPUB from %s (%d bytes)", book_id, url, len(raw_bytes))
+                        break
+                except Exception as exc:
+                    log.debug("EPUB candidate %s failed: %s", url, exc)
+
+            if not raw_bytes:
+                for url in txt_candidates:
+                    try:
+                        resp = await client.get(url)
+                        if resp.status_code == 200 and len(resp.content) > 500:
+                            raw_bytes, used_url, is_epub = resp.content, url, False
+                            log.info("Ingest %s: downloaded TXT from %s (%d bytes)", book_id, url, len(raw_bytes))
+                            break
+                    except Exception as exc:
+                        log.debug("TXT candidate %s failed: %s", url, exc)
+
+        if not raw_bytes:
+            _set("error", error=f"Could not download from any URL. Tried EPUB: {epub_candidates}, TXT: {txt_candidates}")
+            return
+
+        # ── Extract text ──────────────────────────────────────────────────────
+        _set("running", step="extracting")
+        if is_epub:
+            text = _extract_epub_text(raw_bytes)
+        else:
+            text = _strip_gutenberg(raw_bytes.decode("utf-8", errors="replace"))
+
+        text = text.strip()
+        if len(text) < 500:
+            _set("error", error=f"Extracted text too short ({len(text)} chars). File may be invalid.")
+            return
+
+        # ── Chunk ─────────────────────────────────────────────────────────────
+        _set("running", step="chunking")
+        chunks = chunk_text(text, max_words=1500)
+        if not chunks:
+            _set("error", error="Chunking produced no segments.")
+            return
+
+        # ── Save to DB ────────────────────────────────────────────────────────
+        # Production `chunks` schema: book_id (bigint), chunk_index, content,
+        # total_chunks, wordcount, book_title, author. No token_count column,
+        # no unique (book_id, chunk_index) constraint → plain INSERT.
+        _set("running", step=f"saving {len(chunks)} chunks")
+        total      = len(chunks)
+        book_id_val = bid if isinstance(bid, int) else book_id
+        book_title = book.get("title", "") or ""
+        author     = book.get("author", "") or ""
+        saved = 0
+        first_error: Exception | None = None
+        for idx, content in enumerate(chunks):
+            row = {
+                "book_id":      book_id_val,
+                "chunk_index":  idx,
+                "content":      content,
+                "total_chunks": total,
+                "wordcount":    len(content.split()),
+                "book_title":   book_title,
+                "author":       author,
+            }
+            try:
+                await insert("chunks", row)
+                saved += 1
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                log.warning("chunk[%d] insert failed: %s", idx, exc)
+
+        if saved == 0:
+            _set("error", error=f"No chunks could be saved. DB error: {first_error}")
+            return
+
+        _set(
+            "done",
+            source="epub" if is_epub else "txt",
+            chunks_saved=saved,
+            total_chars=len(text),
+            txt_url=used_url,
+        )
+        log.info("Ingest %s complete: %d chunks saved from %s", book_id, saved, used_url)
+
+    except Exception as exc:
+        log.exception("Ingest background task failed for book %s", book_id)
+        _set("error", error=str(exc))
+
+
+# ── HTML text extractor (stdlib only, no extra deps) ─────────────────────────
+
+class _HtmlTextExtractor(HTMLParser):
+    """Pull visible text out of an HTML/XHTML document."""
+    def __init__(self):
+        super().__init__()
+        self._skip  = False
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "head"):
+            self._skip = True
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "head"):
+            self._skip = False
+
+    def handle_data(self, data):
+        if not self._skip:
+            stripped = data.strip()
+            if stripped:
+                self._parts.append(stripped)
+
+    def get_text(self) -> str:
+        return " ".join(self._parts)
+
+
+def _extract_epub_text(epub_bytes: bytes) -> str:
+    """
+    Extract ordered plain text from an EPUB file (which is a ZIP of HTML/XHTML).
+
+    Reads the OPF spine to get the correct reading order, then extracts
+    visible text from each HTML chapter using a stdlib HTML parser.
+    """
+    with zipfile.ZipFile(io.BytesIO(epub_bytes)) as zf:
+        names = set(zf.namelist())
+        spine_files: list[str] = []
+
+        # ── Parse spine order from OPF ────────────────────────────────────────
+        try:
+            container_xml = zf.read("META-INF/container.xml").decode("utf-8", errors="ignore")
+            container_root = ET.fromstring(container_xml)
+
+            # Find rootfile path (handles namespaced and bare tags)
+            opf_path = ""
+            for elem in container_root.iter():
+                if elem.tag.endswith("rootfile"):
+                    opf_path = elem.get("full-path", "")
+                    break
+
+            if opf_path and opf_path in names:
+                opf_dir = opf_path.rsplit("/", 1)[0] + "/" if "/" in opf_path else ""
+                opf_xml = zf.read(opf_path).decode("utf-8", errors="ignore")
+                opf_root = ET.fromstring(opf_xml)
+
+                # Build id→href manifest
+                manifest: dict[str, str] = {}
+                for elem in opf_root.iter():
+                    if elem.tag.endswith("item"):
+                        item_id   = elem.get("id", "")
+                        item_href = elem.get("href", "")
+                        media     = elem.get("media-type", "")
+                        if "html" in media or item_href.endswith((".html", ".xhtml", ".htm")):
+                            # href may be relative to OPF dir
+                            full = opf_dir + item_href if not item_href.startswith("/") else item_href.lstrip("/")
+                            manifest[item_id] = full
+
+                # Follow spine order
+                for elem in opf_root.iter():
+                    if elem.tag.endswith("itemref"):
+                        idref = elem.get("idref", "")
+                        if idref in manifest and manifest[idref] in names:
+                            spine_files.append(manifest[idref])
+        except Exception as exc:
+            log.debug("EPUB OPF parse failed, falling back to sorted filenames: %s", exc)
+
+        # ── Fallback: all HTML files sorted alphabetically ────────────────────
+        if not spine_files:
+            spine_files = sorted(
+                n for n in names
+                if n.lower().endswith((".html", ".xhtml", ".htm"))
+                and "toc" not in n.lower()
+                and "nav" not in n.lower()
+            )
+
+        # ── Extract text from each file in spine order ────────────────────────
+        parts: list[str] = []
+        for fname in spine_files:
+            if fname not in names:
+                continue
+            try:
+                html = zf.read(fname).decode("utf-8", errors="ignore")
+                parser = _HtmlTextExtractor()
+                parser.feed(html)
+                chapter_text = re.sub(r"\s{2,}", " ", parser.get_text()).strip()
+                if len(chapter_text) > 100:
+                    parts.append(chapter_text)
+            except Exception as exc:
+                log.debug("Failed to read EPUB entry %s: %s", fname, exc)
+
+        return "\n\n".join(parts)
+
+
+def _strip_gutenberg(text: str) -> str:
+    """Remove Project Gutenberg header/footer boilerplate from plain TXT files."""
+    start_markers = [
+        "*** START OF THE PROJECT GUTENBERG",
+        "*** START OF THIS PROJECT GUTENBERG",
+        "*END*THE SMALL PRINT",
+    ]
+    end_markers = [
+        "*** END OF THE PROJECT GUTENBERG",
+        "*** END OF THIS PROJECT GUTENBERG",
+        "End of the Project Gutenberg",
+        "End of Project Gutenberg",
+    ]
+    start_pos = 0
+    for marker in start_markers:
+        idx = text.find(marker)
+        if idx != -1:
+            start_pos = text.find("\n", idx) + 1
+            break
+    end_pos = len(text)
+    for marker in end_markers:
+        idx = text.find(marker, start_pos)
+        if idx != -1:
+            end_pos = idx
+            break
+    return text[start_pos:end_pos].strip()
 
 
 @router.get("/metrics")
@@ -298,6 +772,7 @@ async def admin_rerun_steps(
     - Previous successful results for OTHER steps are preserved in the merged output.
     - Resets retry_count to 0 so the rerun gets 3 fresh auto-retries.
     - Works on any job status (done, failed, partial, queued).
+    - Automatically re-runs inject_epub if it was previously done (to include new assets).
     """
     from api.routes.pipeline import _run_job          # noqa: PLC0415
     from api.models.requests import VALID_STEPS       # noqa: PLC0415
@@ -328,11 +803,29 @@ async def admin_rerun_steps(
     except Exception as exc:
         raise HTTPException(422, f"Stored input is invalid: {exc}") from exc
 
-    # Override steps to exactly what the admin selected
-    req = req.model_copy(update={"steps": body.steps})
-
-    # Carry the previous result so other steps' outputs are preserved
+    # Check if inject_epub was in the original job steps and was completed
+    # If so, we need to re-run it to include the new assets
+    steps_to_run = list(body.steps)
     previous_result = job.get("result")
+    
+    # Auto-add inject_epub if:
+    # 1. It's not already in the requested steps
+    # 2. It was in the original job input steps
+    # 3. It was previously completed (done/partial)
+    if "inject_epub" not in steps_to_run:
+        original_steps = raw_input.get("steps", []) if isinstance(raw_input, dict) else []
+        if "inject_epub" in original_steps and previous_result:
+            result_dict = previous_result if isinstance(previous_result, dict) else {}
+            step_statuses = result_dict.get("steps", {})
+            if step_statuses.get("inject_epub") in ("done", "partial"):
+                steps_to_run.append("inject_epub")
+                log.info("Auto-adding inject_epub to rerun for job %s (needs to include new assets)", job_id)
+
+    # Override steps to exactly what the admin selected (plus auto-added inject_epub)
+    req = req.model_copy(update={"steps": steps_to_run})
+    
+    # Debug logging
+    log.info("Rerun job %s: steps_to_run=%s, req.steps=%s", job_id, steps_to_run, req.steps)
 
     await reset_for_manual_retry(job_id)
     # force_steps=True: use exactly the steps the admin chose, don't override
@@ -343,7 +836,7 @@ async def admin_rerun_steps(
         "ok":          True,
         "job_id":      job_id,
         "status":      "queued",
-        "rerun_steps": body.steps,
+        "rerun_steps": steps_to_run,
         "status_url":  f"/api/pipeline/status/{job_id}",
     }
 

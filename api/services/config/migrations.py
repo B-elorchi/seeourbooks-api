@@ -71,6 +71,22 @@ _CORRECTIONS: list[dict] = [
         "new_value": "sonic-3.5-2026-05-04",
         "reason":    "sonic-2024-10-19 is English-only; upgrading to sonic-3.5 multilingual snapshot",
     },
+
+    # ── Book files CDN host ───────────────────────────────────────────────────
+    # The production CDN lives at files.seeourbook.sa. The .com host does not
+    # serve the EPUB/TXT files and returns 404, breaking ingest + epub injection.
+    {
+        "key":       "BOOK_FILES_BASE_URL",
+        "old_value": "https://files.seeourbook.com",
+        "new_value": "https://files.seeourbook.sa",
+        "reason":    ".com host does not serve book files (404); correct CDN is files.seeourbook.sa",
+    },
+    {
+        "key":       "BOOK_FILES_BASE_URL",
+        "old_value": "https://files.seeourbook.com/",
+        "new_value": "https://files.seeourbook.sa",
+        "reason":    ".com host does not serve book files (404); correct CDN is files.seeourbook.sa",
+    },
 ]
 
 

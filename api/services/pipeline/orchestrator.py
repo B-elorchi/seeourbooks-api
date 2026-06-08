@@ -1,23 +1,27 @@
 """
 Pipeline orchestrator — the core engine.
 
-Steps (each independent, continues even if one fails):
-  summarize       Pass 1 (Haiku chapter summaries) + Pass 2 (Sonnet full) + Pass 3 (Haiku review)
-  audio_full      TTS of full summary → single MP3
-  audio_chapters  TTS of each chapter → one MP3 per chapter
-  cover           AI cover image
-  alt_text        Alt text for the cover (depends on cover)
-  mindmap         AI mind map SVG
+Execution phases
+─────────────────
+  Phase 1  summarize   — 3-pass text summary (must finish first; everything else depends on it)
+  Phase 2  (parallel)  — all independent steps run concurrently once summarize is done:
+               cover · audio_full · audio_chapters · mindmap · mindmap_chapters
+  Phase 3  (parallel)  — steps that depend on Phase-2 outputs:
+               alt_text (needs cover) · video (needs audio_full + cover + mindmap)
+  Phase 4  inject_epub — runs LAST after all other steps complete (needs ALL assets)
 
 Live config is read from Supabase provider_config via runtime.py at job start.
 No restart needed when the admin switches providers.
 """
 import asyncio
 import json as json_module
+import logging
 import os
 import tempfile
 import time
 from datetime import datetime, timezone
+
+log = logging.getLogger(__name__)
 
 from api.config.settings import settings
 from api.models.requests import PipelineReq, VALID_STEPS
@@ -38,14 +42,25 @@ from api.services.pipeline.epub import (
 )
 from api.services.pipeline.video import generate_book_video, VideoError
 from api.services.pipeline.storage import upload_file, CONTENT_TYPES
+from api.jobs.store import is_cancelled
+from api.services.db import insert as db_insert
 
 # Single source of truth lives in api/models/requests.py
 ALL_STEPS = VALID_STEPS
 
 
-def _resolve_steps(requested: list[str]) -> set[str]:
+class JobCancelledError(Exception):
+    pass
+
+
+def _resolve_steps(requested: list[str] | None) -> set[str]:
     """Return the full set of steps to run, including auto-added dependencies."""
-    steps = set(requested) if requested else set(ALL_STEPS)
+    # If requested is None or empty list, run all steps
+    # If requested has specific steps, run only those (plus dependencies)
+    # Note: empty list [] means "run all", explicit steps like ["cover"] means "run only cover"
+    if requested is None or len(requested) == 0:
+        return set(ALL_STEPS)
+    steps = set(requested)
     # Enforce dependencies
     if "audio_full" in steps or "audio_chapters" in steps:
         steps.add("summarize")
@@ -54,13 +69,8 @@ def _resolve_steps(requested: list[str]) -> set[str]:
     if "alt_text" in steps:
         steps.add("cover")
     if "inject_epub" in steps:
-        # Needs the summary text. Cover is OPTIONAL — if the cover step
-        # also runs we use its output; otherwise we keep the original EPUB cover.
         steps.add("summarize")
     if "video" in steps:
-        # Video uses the full TTS audio as its narration track and the summary
-        # text for sentence-aligned subtitles.  Cover + mindmap are visual
-        # bonuses — auto-add them when they aren't explicitly excluded.
         steps.add("summarize")
         steps.add("audio_full")
     return steps
@@ -80,65 +90,202 @@ def _fmt_audio_duration(seconds: int | None) -> str | None:
     return f"{m}:{s:02d}"
 
 
-async def _ensure_book_row(req: "PipelineReq") -> None:
-    """
-    Make sure a row exists in the `books` table for this book_id.
+async def _compute_job_cost(job_id: str | None) -> dict:
+    """Sum cost from usage_logs for this job. Returns zeros if unreachable."""
+    empty = {"total_usd": 0.0, "calls": 0, "by_step": {}, "by_provider": {}}
+    if not job_id:
+        return empty
+    try:
+        rows = await find("usage_logs", filters={"job_id": job_id}, limit=20000)
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).debug("cost rollup failed for job %s: %s", job_id, exc)
+        return empty
 
-    Two cases:
+    total = 0.0
+    by_step: dict[str, float] = {}
+    by_provider: dict[str, float] = {}
+    for r in rows:
+        c = float(r.get("cost_usd") or 0)
+        total += c
+        step = r.get("step") or "unknown"
+        prov = r.get("provider") or "unknown"
+        by_step[step]     = round(by_step.get(step, 0.0) + c, 6)
+        by_provider[prov] = round(by_provider.get(prov, 0.0) + c, 6)
 
-    1. Production catalog book — numeric `book_id`, integer PK.  The row
-       already exists; do nothing.  Trying to upsert a string `book_id`
-       into an INTEGER column fails immediately.
+    return {
+        "total_usd":   round(total, 6),
+        "calls":       len(rows),
+        "by_step":     by_step,
+        "by_provider": by_provider,
+    }
 
-    2. Custom JSON / PDF upload — string `book_id`.  We try to upsert a
-       MINIMAL row (just book_id + title + author).  Many production
-       deployments don't have the extra columns (`language`, `grade_level`,
-       `genres`, `status`) so we don't send them.  If the books table is
-       schema-locked or integer-keyed (most production setups), the upsert
-       silently fails and we just log it — the rest of the pipeline doesn't
-       depend on this row in any modern table (no FKs in our migrations).
-    """
-    # Skip for production catalog ids — the row is already there
-    if req.book_id and req.book_id.isdigit():
+
+# ── Per-step DB persistence helpers ──────────────────────────────────────────
+# All helpers are best-effort: they log on failure but never raise so a DB
+# hiccup never breaks the pipeline result.
+
+async def _persist_step_result(
+    job_id: str | None,
+    step: str,
+    status: str,
+    output_url: str | None = None,
+    error_msg: str | None = None,
+    duration_sec: int | None = None,
+) -> None:
+    """Insert a row into pipeline_step_results."""
+    if not job_id:
+        return
+    try:
+        await db_insert("pipeline_step_results", {
+            "job_id":       job_id,
+            "step":         step,
+            "status":       status,
+            "output_url":   output_url,
+            "error_msg":    error_msg,
+            "duration_sec": duration_sec,
+        })
+    except Exception as exc:
+        log.debug("pipeline_step_results insert failed (%s/%s): %s", step, status, exc)
+
+
+async def _persist_book_summary(
+    book_id: str,
+    language: str,
+    length: str,
+    style: str,
+    full_summary: str,
+    model_sonnet: str,
+) -> None:
+    """Save the full summary to books table columns and book_summaries cache."""
+    if not full_summary:
         return
 
-    # Minimal upsert that won't blow up on schemas missing optional columns.
-    # `title` and `author` are present in every books schema we've seen.
+    # ── books table ───────────────────────────────────────────────────────────
+    if book_id.isdigit():
+        try:
+            # Choose the right column based on language + length
+            if language == "ar":
+                col = "arabic_summary_v2"
+            elif length == "10min":
+                col = "summary_en_10min"
+            else:
+                col = "summary_english"
+            await update(
+                "books",
+                filters={"book_id": int(book_id)},
+                data={col: full_summary, "status": "summarized"},
+            )
+        except Exception as exc:
+            log.debug("books summary update failed for %s: %s", book_id, exc)
+
+    # ── book_summaries cache ──────────────────────────────────────────────────
+    try:
+        await db_insert("book_summaries", {
+            "book_id":    book_id,
+            "length":     length,
+            "style":      style,
+            "language":   language,
+            "summary":    full_summary,
+            "word_count": len(full_summary.split()),
+            "model":      model_sonnet,
+        })
+    except Exception as exc:
+        log.debug("book_summaries insert failed for %s: %s", book_id, exc)
+
+
+async def _persist_chunk_summaries(
+    book_id: str,
+    chapter_results: list[dict],
+) -> None:
+    """Write each chapter's summary back to chunks.summary by chunk_index."""
+    if not book_id.isdigit() or not chapter_results:
+        return
+    for ch in chapter_results:
+        if not ch.get("summary"):
+            continue
+        try:
+            await update(
+                "chunks",
+                filters={"book_id": int(book_id), "chunk_index": ch["index"]},
+                data={"summary": ch["summary"]},
+            )
+        except Exception as exc:
+            log.debug("chunks.summary update failed for chunk %s: %s", ch["index"], exc)
+
+
+async def _persist_cover(
+    book_id: str,
+    title: str,
+    cover_url: str,
+) -> None:
+    """Insert into covers table and set books.cover_status."""
+    try:
+        await db_insert("covers", {
+            "bookid":   int(book_id) if book_id.isdigit() else None,
+            "title":    title,
+            "coverurl": cover_url,
+        })
+    except Exception as exc:
+        log.debug("covers insert failed for %s: %s", book_id, exc)
+
+    if book_id.isdigit():
+        try:
+            await update(
+                "books",
+                filters={"book_id": int(book_id)},
+                data={"cover_status": "done"},
+            )
+        except Exception as exc:
+            log.debug("books.cover_status update failed for %s: %s", book_id, exc)
+
+
+async def _persist_audio(
+    book_id: str,
+    language: str,
+    audio_url: str,
+) -> None:
+    """Upsert into the audio table."""
+    if not book_id.isdigit():
+        return
+    try:
+        url_col    = "ar_url"    if language == "ar" else "en_url"
+        status_col = "ar_status" if language == "ar" else "en_status"
+        await upsert(
+            "audio",
+            {
+                "book_id":   int(book_id),
+                url_col:     audio_url,
+                status_col:  "done",
+            },
+            conflict="book_id",
+        )
+    except Exception as exc:
+        log.debug("audio upsert failed for %s: %s", book_id, exc)
+
+
+async def _ensure_book_row(req: "PipelineReq") -> None:
+    if req.book_id and req.book_id.isdigit():
+        return
     payload: dict = {
         "book_id": req.book_id,
         "title":   req.title or req.book_id,
         "author":  req.author or "",
     }
-
     try:
         await upsert("books", payload, conflict="book_id")
     except Exception as e:
-        # Log at DEBUG — this is best-effort and the rest of the pipeline
-        # does NOT depend on the books row existing.  Surfacing it as a
-        # WARNING in every job cluttered the logs.
         import logging
         logging.getLogger(__name__).debug(
-            "Could not upsert books row for %s (likely schema mismatch — safe to ignore): %s",
-            req.book_id, e,
+            "Could not upsert books row for %s: %s", req.book_id, e,
         )
 
 
 async def _fetch_catalog_chapters(book_id: str) -> list[dict]:
-    """
-    Load chapters from the chunks table when no chapters are supplied in the request.
-
-    Production `chunks` tables typically key `book_id` as BIGINT.  Querying
-    with a non-numeric string (e.g. "book_0127", "pdf_8f8d3285") causes
-    PostgREST to fail with a 400 cast error.  So we only attempt the
-    lookup when the id is actually numeric; otherwise we return an empty
-    list and let the caller decide what to do.
-    """
-    # Skip for non-numeric ids (custom_json / PDF uploads) — saves a guaranteed-400
     try:
         int(book_id)
     except (TypeError, ValueError):
         return []
-
     try:
         rows = await find(
             "chunks",
@@ -152,40 +299,17 @@ async def _fetch_catalog_chapters(book_id: str) -> list[dict]:
             "Could not fetch chunks for book_id=%s: %s", book_id, exc,
         )
         return []
-
     return [
         {"index": r["chunk_index"], "title": f"Chapter {r['chunk_index']}", "text": r["content"]}
         for r in rows
     ]
 
 
-# ── Production catalog enrichment ─────────────────────────────────────────────
-#
-# The production `books` table (integer PK book_id) carries pre-computed
-# summaries in dedicated columns:
-#     summary_english       — long-form English summary
-#     summary_en_10min      — ~10-minute English summary (preferred for audio)
-#     arabic_summary        — long-form Arabic summary
-#     arabic_summary_v2     — newer Arabic summary (preferred for audio)
-#
-# When the client posts just  {"book_id": "12345"}  we look the row up,
-# fill in missing title / author, and reuse the cached summary so audio +
-# cover + mindmap can run without re-summarizing the whole book.
-
 async def _fetch_book_from_catalog(book_id: str) -> dict | None:
-    """
-    Look up a row in the production `books` table by integer book_id.
-
-    Returns None when:
-      - book_id is non-numeric (custom_json upload — not a catalog book)
-      - the books table is unreachable / different schema
-      - no row matches
-    """
     try:
         bid = int(book_id)
     except (TypeError, ValueError):
-        return None  # custom string id — not a catalog book
-
+        return None
     try:
         rows = await find(
             "books",
@@ -198,25 +322,17 @@ async def _fetch_book_from_catalog(book_id: str) -> dict | None:
             limit=1,
         )
     except Exception as exc:
-        # Books table missing / schema mismatch / network — fall through silently
         import logging as _logging
         _logging.getLogger(__name__).debug(
             "catalog lookup for book_id=%s failed: %s", book_id, exc,
         )
         return None
-
     return rows[0] if rows else None
 
 
 async def _fetch_gutenberg_metadata(book_id: str) -> dict:
-    """
-    Fetch title and author from the Gutendex API for a numeric Gutenberg book_id.
-
-    Returns a dict with keys 'title' and 'author' (both may be empty strings on failure).
-    """
     import logging as _log
     import httpx
-
     result = {"title": "", "author": ""}
     try:
         url = f"https://gutendex.com/books?ids={book_id}"
@@ -231,7 +347,6 @@ async def _fetch_gutenberg_metadata(book_id: str) -> dict:
         result["title"] = book.get("title", "")
         authors = book.get("authors", [])
         if authors:
-            # Gutendex format: "Barrie, J. M. (James Matthew)" — reverse to "J. M. Barrie"
             name = authors[0].get("name", "")
             if "," in name:
                 parts = name.split(",", 1)
@@ -246,30 +361,13 @@ async def _fetch_gutenberg_metadata(book_id: str) -> dict:
 
 
 def _pick_cached_summary(book_row: dict, language: str) -> str | None:
-    """
-    Return the best pre-computed summary on the books row for the language.
-
-    Tries the 10-minute summary first (preferred — sized for our audio target),
-    then falls back to the long-form summary.
-
-    NUL-string handling
-    ───────────────────
-    Production data sometimes stores the LITERAL STRING "null" (or "None",
-    "NULL", etc.) where a real database NULL was intended.  Treating those
-    strings as a real summary would cause downstream TTS to literally narrate
-    the word "null".  We strip those sentinel values out below.
-    """
     _NULL_SENTINELS = {"", "null", "none", "nil", "n/a", "na", "undefined"}
 
     def _nonempty(value) -> str | None:
         if not isinstance(value, str):
             return None
         stripped = value.strip()
-        if not stripped:
-            return None
-        # Reject sentinel strings that production data has been observed using
-        # in place of actual NULL (e.g. "null", "None", etc.).
-        if stripped.lower() in _NULL_SENTINELS:
+        if not stripped or stripped.lower() in _NULL_SENTINELS:
             return None
         return stripped
 
@@ -288,53 +386,106 @@ async def run_pipeline(
     req: PipelineReq,
     *,
     job_id: str | None = None,
+    previous_result: dict | str | None = None,
 ) -> dict:
     """
     Execute the pipeline and return the full result dict.
 
-    `job_id`, when supplied, enables live progress checkpointing — after every
-    step the orchestrator writes a partial result to `pipeline_jobs.result`
-    so the frontend's 3s poll sees progress immediately instead of waiting
-    until the whole pipeline finishes.
+    Phase 1  — summarize (sequential)
+    Phase 2  — cover · audio_full · audio_chapters · mindmap · mindmap_chapters  (parallel)
+    Phase 3  — alt_text · video  (parallel, depend on Phase-2 outputs)
+    Phase 4  — inject_epub (runs LAST, after all other steps complete)
     """
 
     started = time.time()
-    cfg     = await get_all_config()          # live admin config — Supabase + settings fallback
+    cfg     = await get_all_config()
     steps   = _resolve_steps(req.steps)
+    log.info("Job %s: req.steps=%s, resolved_steps=%s", job_id, req.steps, steps)
     errors: dict[str, str]   = {}
     step_status: dict[str, str] = {s: "skipped" for s in ALL_STEPS}
 
-    # ── Hoisted result-variables ─────────────────────────────────────────────
-    # Declared up front (instead of inside each step block) so the live
-    # checkpoint closure below can read whatever has been produced so far.
-    # All start as None / [] and get populated by the step that owns them.
+    # ── Shared result variables (updated by each step, read by checkpoint) ───
     chapter_results: list[dict] = []
     full_summary:    str        = ""
     quick_summary:   str        = ""
     full_audio:      dict | None = None
+    full_audio_path: str | None = None
     chapter_audio:   dict[int, str] = {}
     cover_url:       str | None = None
     alt_text:        str | None = None
     mindmap_url:     str | None = None
     mindmap_data:    dict | None = None
+    mindmap_path_saved: str | None = None
     chapter_mindmap: dict[int, dict] = {}
     epub_url:        str | None = None
     video_url:       str | None = None
     video_meta:      dict | None = None
 
-    # ── Live progress checkpointing ──────────────────────────────────────────
-    # After every step, write a snapshot of step_status + every result field
-    # produced so far to `pipeline_jobs.result`.  The frontend's 3-second poll
-    # picks it up — chips turn green AND output panels (cover, audio, mindmap,
-    # epub, video) populate one at a time as each step completes.
+    # ── Pre-load previous result so live checkpoints always carry forward
+    # assets from steps that aren't being re-run in this pass.
+    if previous_result:
+        if isinstance(previous_result, str):
+            try:
+                previous_result = json_module.loads(previous_result)
+            except Exception:
+                previous_result = {}
+        _prev: dict = previous_result or {}
+        _pfiles = _prev.get("files") or {}
+        _pmeta  = _prev.get("metadata") or {}
+        _paudio = _prev.get("audio") or {}
+        _psums  = _prev.get("summaries") or {}
+
+        cover_url   = cover_url   or _pfiles.get("cover")
+        mindmap_url = mindmap_url or _pfiles.get("mindmap")
+        epub_url    = epub_url    or _pfiles.get("epub")
+        video_url   = video_url   or _pfiles.get("video")
+        alt_text    = alt_text    or _pmeta.get("cover_alt_text")
+
+        _lang_key = f"full_{req.language}"
+        if _lang_key in _paudio and not full_audio:
+            full_audio = _paudio[_lang_key]
+
+        # Quick / full summary (needed if summarize is skipped this run)
+        if not full_summary and _psums:
+            _first_sum = next(iter(_psums.values()), {})
+            full_summary  = _first_sum.get("text", "")
+            quick_summary = _prev.get("quick_summary", "")
+
+        # Chapter audio & mindmaps
+        for _fc in _pfiles.get("chapters") or []:
+            _idx = _fc.get("index")
+            if _idx is None:
+                continue
+            if _fc.get("audio_url") and _idx not in chapter_audio:
+                chapter_audio[_idx] = _fc["audio_url"]
+            if _fc.get("mindmap_url") and _idx not in chapter_mindmap:
+                chapter_mindmap[_idx] = {
+                    "url":    _fc["mindmap_url"],
+                    "data":   None,
+                    "format": "mermaid",
+                }
+
+        # Chapter results (summaries)
+        if not chapter_results and _prev.get("chapters"):
+            chapter_results = [dict(ch) for ch in _prev["chapters"]]
+
+    # ── Live checkpoint ───────────────────────────────────────────────────────
     async def _checkpoint() -> None:
         if not job_id:
             return
+        if is_cancelled(job_id):
+            raise JobCancelledError(f"Job {job_id} was cancelled")
         try:
             lang = req.language
+            current_step = next(
+                (s for s, st in step_status.items() if st == "running"), None
+            )
+            running_steps = [s for s, st in step_status.items() if st == "running"]
             partial = {
                 "book_id":         req.book_id,
                 "status":          "running",
+                "current_step":    current_step,
+                "running_steps":   running_steps,
                 "generated_at":    datetime.now(timezone.utc).isoformat(),
                 "processing_time": _fmt_duration(round(time.time() - started, 1)),
                 "steps":           dict(step_status),
@@ -387,23 +538,17 @@ async def run_pipeline(
                 filters={"id": job_id},
                 data={"result": partial, "status": "running"},
             )
+        except JobCancelledError:
+            raise
         except Exception as exc:
-            # Best-effort — a failed checkpoint must never break the pipeline.
             import logging as _log
             _log.getLogger(__name__).warning("checkpoint write failed: %s", exc)
 
     # ── Production catalog enrichment ─────────────────────────────────────────
-    # When the client posts only {"book_id": "12345"} we look up the production
-    # `books` row and fill in any missing title / author / summary from it.
-    # If a pre-computed summary exists on the books row (summary_en_10min for
-    # English or arabic_summary_v2 for Arabic), we use it as `req.summary` so
-    # the Pass 1/2 re-summarization is skipped and downstream steps (audio,
-    # cover, mindmap) run directly on the cached text.
     if not (req.title and req.author and req.summary):
         book_row = await _fetch_book_from_catalog(req.book_id)
         if book_row:
             updates: dict = {}
-            # Treat title == book_id as a missing title (placeholder inserted during initial import)
             catalog_title = book_row.get("title", "")
             if not req.title and catalog_title and catalog_title != req.book_id:
                 updates["title"] = catalog_title
@@ -418,8 +563,6 @@ async def run_pipeline(
             if updates:
                 req = req.model_copy(update=updates)
 
-    # For numeric book_ids still missing a real title (e.g. catalog row had title == book_id),
-    # fall back to Gutendex API to retrieve the actual title and author.
     if req.book_id and req.book_id.isdigit() and not req.title:
         gutenberg_meta = await _fetch_gutenberg_metadata(req.book_id)
         meta_updates: dict = {}
@@ -430,24 +573,14 @@ async def run_pipeline(
         if meta_updates:
             req = req.model_copy(update=meta_updates)
 
-    # Ensure the FK target exists — chunk_summaries / book_summaries reference books(book_id).
-    # custom_json requests for a book not in the catalog would otherwise 409.
     await _ensure_book_row(req)
 
     # ── Resolve chapters ──────────────────────────────────────────────────────
-    # Three valid input sources, checked in order:
-    #   1. req.chapters       — chapter list supplied directly in the request
-    #   2. catalog `chunks`   — only when book_id is numeric and the row exists
-    #   3. req.summary        — pre-computed summary text supplied directly
-    # The pipeline can still run with #3 alone (audio + cover + mindmap all
-    # consume the summary text), even when there are zero chapters.
     if req.chapters:
         chapters = [{"index": c.index, "title": c.title, "text": c.text} for c in req.chapters]
     else:
-        # _fetch_catalog_chapters returns [] on bad book_id / 400 — never raises
         chapters = await _fetch_catalog_chapters(req.book_id)
 
-    # Hard-fail when there's literally NO input the pipeline can work with
     if not chapters and not (req.summary and req.summary.strip()):
         return {
             "book_id":         req.book_id,
@@ -463,57 +596,106 @@ async def run_pipeline(
             )},
         }
 
-    # ── Resolved models from live config ────────────────────────────────────
+    # Mark every planned step as "pending" + write immediate checkpoint
+    for s in steps:
+        step_status[s] = "pending"
+    await _checkpoint()
+
+    # ── Resolved models from live config ─────────────────────────────────────
     model_haiku      = cfg.get("MODEL_HAIKU",      settings.MODEL_HAIKU)
+    model_chunk      = cfg.get("MODEL_CHUNK") or cfg.get("MODEL_HAIKU", settings.MODEL_HAIKU)
     model_sonnet     = cfg.get("MODEL_SONNET",     settings.MODEL_SONNET)
     model_mindmap    = cfg.get("MODEL_MINDMAP",    settings.MODEL_MINDMAP)
     mindmap_format   = cfg.get("MINDMAP_FORMAT",   settings.MINDMAP_FORMAT)
+    tts_enabled      = cfg.get("PIPELINE_STEP_TTS",        "true") == "true"
+    cover_enabled    = cfg.get("PIPELINE_STEP_COVER",       "true") == "true"
+    alttext_enabled  = cfg.get("PIPELINE_STEP_ALTTEXT",     "true") == "true"
+    mindmap_enabled  = cfg.get("PIPELINE_STEP_MINDMAP",     "true") == "true"
+    epub_enabled     = cfg.get("PIPELINE_STEP_INJECT_EPUB", "true") == "true"
+    video_enabled    = cfg.get("PIPELINE_STEP_VIDEO",       "true") == "true"
+    audio_proc_enabled = cfg.get("PIPELINE_STEP_AUDIO_PROCESSING", "true") == "true"
+    base_url         = cfg.get("BOOK_FILES_BASE_URL") or settings.BOOK_FILES_BASE_URL
+    video_provider   = cfg.get("VIDEO_PROVIDER") or settings.VIDEO_PROVIDER
 
     with tempfile.TemporaryDirectory() as tmp:
+        cover_path_saved = os.path.join(tmp, "cover.jpg")
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STEP: summarize  (Pass 1 Haiku + Pass 2 Sonnet + Pass 3 Haiku review)
-        # ─────────────────────────────────────────────────────────────────────
-        chapter_results: list[dict] = []
-        full_summary  = ""
-        quick_summary = ""
-
+        # ═════════════════════════════════════════════════════════════════════
+        # PHASE 1 — SUMMARIZE
+        # Everything downstream needs the full_summary + chapter_results.
+        # ═════════════════════════════════════════════════════════════════════
         if "summarize" in steps:
             step_status["summarize"] = "running"
             set_step("summarize")
+            await _checkpoint()
             try:
-                # ── Pre-computed summary shortcut ──────────────────────────────
-                # If the caller sent a summary field, use it directly and skip
-                # Pass 1 (Haiku) and Pass 2 (Sonnet).  Still runs Pass 3 (review)
-                # if the language is Arabic (tashkeel correction).
                 if req.summary:
                     full_summary = req.summary
                     sentences = [s.strip() for s in full_summary.replace(".\n", ". ").split(". ") if s.strip()]
                     quick_summary = ". ".join(sentences[:2]) + "." if sentences else full_summary[:200]
+                    # Load per-chapter summaries from DB so audio_chapters/mindmap_chapters can run
+                    if chapters and req.book_id and req.book_id.isdigit():
+                        try:
+                            chunk_rows = await find(
+                                "chunks",
+                                filters={"book_id": req.book_id},
+                                select="chunk_index, summary",
+                                order="chunk_index ASC",
+                            )
+                            chunk_sum_map = {r["chunk_index"]: r.get("summary") or "" for r in chunk_rows}
+                            chapter_results = [
+                                {
+                                    "index":         ch["index"],
+                                    "title":         ch["title"],
+                                    "summary":       chunk_sum_map.get(ch["index"], ""),
+                                    "read_time_min": max(1, len((chunk_sum_map.get(ch["index"]) or "").split()) // 200),
+                                }
+                                for ch in chapters
+                                if chunk_sum_map.get(ch["index"])
+                            ]
+                            log.info("Loaded %d chapter summaries from chunks for cached-summary job", len(chapter_results))
+                        except Exception as exc:
+                            log.debug("Could not load chunk summaries for cached summary: %s", exc)
+                            chapter_results = []
+                    else:
+                        chapter_results = []
                     step_status["summarize"] = "done"
-                    # Build placeholder chapter_results (no per-chapter data)
-                    chapter_results = []
-
                 else:
-                    for ch in chapters:
-                        chunk = {
-                            "id":          f"{req.book_id}_ch{ch['index']}",
-                            "chunk_index": ch["index"],
-                            "content":     ch["text"],
-                        }
-                        sums = await run_haiku_pass(
-                            req.book_id, [chunk], req.language, model=model_haiku,
-                        )
-                        chapter_results.append({
-                            "index":         ch["index"],
-                            "title":         ch["title"],
-                            "summary":       sums[0] if sums else "",
-                            "read_time_min": max(1, len(sums[0].split()) // 200) if sums else 1,
-                        })
+                    haiku_conc = max(1, int(cfg.get("HAIKU_CONCURRENCY", "6")))
+                    sem = asyncio.Semaphore(haiku_conc)
+
+                    async def _summarize_chunk(ch: dict) -> dict:
+                        async with sem:
+                            chunk = {
+                                "id":          f"{req.book_id}_ch{ch['index']}",
+                                "chunk_index": ch["index"],
+                                "content":     ch["text"],
+                            }
+                            try:
+                                sums = await run_haiku_pass(
+                                    req.book_id, [chunk], req.language, model=model_chunk,
+                                )
+                            except Exception as exc:
+                                import logging as _log
+                                _log.getLogger(__name__).warning(
+                                    "Haiku pass failed for chunk %s: %s", ch["index"], exc,
+                                )
+                                sums = []
+                            summary = sums[0] if sums else ""
+                            return {
+                                "index":         ch["index"],
+                                "title":         ch["title"],
+                                "summary":       summary,
+                                "read_time_min": max(1, len(summary.split()) // 200) if summary else 1,
+                            }
+
+                    chapter_results = list(await asyncio.gather(
+                        *[_summarize_chunk(ch) for ch in chapters]
+                    ))
+                    chapter_results.sort(key=lambda c: c["index"])
 
                     chunk_summaries = [c["summary"] for c in chapter_results if c.get("summary")]
 
-                    # Pass 2 — Sonnet full summary
                     if chunk_summaries:
                         full_summary = await run_sonnet_pass_sync(
                             chunk_summaries,
@@ -522,8 +704,6 @@ async def run_pipeline(
                             req.language,
                             model_override=model_sonnet,
                         )
-
-                        # Pass 3 — Haiku review (quality check + light correction)
                         full_summary = await run_review_pass(
                             full_summary,
                             req.options.length,
@@ -531,116 +711,44 @@ async def run_pipeline(
                             req.language,
                             model=model_haiku,
                         )
-
-                        # Quick summary — first 2 sentences of the full summary
                         sentences = [s.strip() for s in full_summary.replace(".\n", ". ").split(". ") if s.strip()]
                         quick_summary = ". ".join(sentences[:2]) + "." if sentences else full_summary[:200]
 
                     step_status["summarize"] = "done"
+                    # Save chunk summaries back to chunks.summary
+                    await _persist_chunk_summaries(req.book_id, chapter_results)
+
+            except JobCancelledError:
+                raise
             except Exception as e:
                 errors["summarize"] = str(e)
                 step_status["summarize"] = "failed"
+
+            _sum_status = step_status["summarize"]
+            _sum_t = round(time.time() - started)
+            await _persist_step_result(job_id, "summarize", _sum_status, duration_sec=_sum_t)
+            if _sum_status == "done":
+                await _persist_book_summary(
+                    req.book_id, req.language, req.options.length, req.options.style,
+                    full_summary, model_sonnet,
+                )
             await _checkpoint()
 
-        # Summary key e.g. "10min_en"
-        summary_key = f"{req.options.length}_{req.language}"
+        # ═════════════════════════════════════════════════════════════════════
+        # PHASE 2 — PARALLEL: cover · audio_full · audio_chapters ·
+        #                      mindmap · mindmap_chapters
+        # All of these are independent of each other (only need summarize done).
+        # ═════════════════════════════════════════════════════════════════════
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STEP: audio_full
-        # ─────────────────────────────────────────────────────────────────────
-        full_audio: dict | None = None
-        # Local on-disk path to the finished audio file — kept around so the
-        # video step can re-use it as the narration track without re-downloading.
-        full_audio_path: str | None = None
-        tts_enabled = cfg.get("PIPELINE_STEP_TTS", "true") == "true"
-
-        if "audio_full" in steps and tts_enabled and full_summary:
-            step_status["audio_full"] = "running"
-            set_step("audio_full")
-            try:
-                raw = os.path.join(tmp, "audio_raw.mp3")
-                proc = os.path.join(tmp, "audio.mp3")
-                await synthesize(full_summary, req.language, raw, cfg)
-
-                audio_proc_enabled = cfg.get("PIPELINE_STEP_AUDIO_PROCESSING", "true") == "true"
-                if audio_proc_enabled:
-                    loop = asyncio.get_event_loop()
-                    meta = await loop.run_in_executor(
-                        None, process_audio, raw, proc,
-                        req.title or req.book_id, req.author or "",
-                    )
-                    src = proc
-                else:
-                    meta = {}
-                    src = raw
-
-                key = f"books/{req.book_id}/audio_{req.language}_{req.options.length}.mp3"
-                url = upload_file(src, key, CONTENT_TYPES[".mp3"])
-                full_audio = {
-                    "url":      url,
-                    "duration": _fmt_audio_duration(meta.get("duration_seconds")),
-                    "size_mb":  meta.get("size_mb"),
-                }
-                full_audio_path = src
-                step_status["audio_full"] = "done"
-            except Exception as e:
-                errors["audio_full"] = str(e)
-                step_status["audio_full"] = "failed"
-            await _checkpoint()
-
-        # ─────────────────────────────────────────────────────────────────────
-        # STEP: audio_chapters
-        # ─────────────────────────────────────────────────────────────────────
-        chapter_audio: dict[int, str] = {}   # index → URL
-
-        if "audio_chapters" in steps and tts_enabled and chapter_results:
-            step_status["audio_chapters"] = "running"
-            set_step("audio_chapters")
-            ch_errors = 0
-            for ch in chapter_results:
-                if not ch.get("summary"):
-                    continue
-                try:
-                    ch_raw  = os.path.join(tmp, f"ch{ch['index']}_raw.mp3")
-                    ch_proc = os.path.join(tmp, f"ch{ch['index']}.mp3")
-                    await synthesize(ch["summary"], req.language, ch_raw, cfg)
-
-                    audio_proc_enabled = cfg.get("PIPELINE_STEP_AUDIO_PROCESSING", "true") == "true"
-                    if audio_proc_enabled:
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(
-                            None, process_audio, ch_raw, ch_proc,
-                            ch["title"], req.author or "",
-                        )
-                        src = ch_proc
-                    else:
-                        src = ch_raw
-
-                    idx = ch["index"]
-                    k   = f"books/{req.book_id}/chapters/ch_{idx:02d}_{req.language}.mp3"
-                    chapter_audio[idx] = upload_file(src, k, CONTENT_TYPES[".mp3"])
-                except Exception as e:
-                    ch_errors += 1
-                    errors[f"audio_chapter_{ch['index']}"] = str(e)
-
-            step_status["audio_chapters"] = "failed" if ch_errors == len(chapter_results) else (
-                "partial" if ch_errors else "done"
-            )
-            await _checkpoint()
-
-        # ─────────────────────────────────────────────────────────────────────
-        # STEP: cover
-        # ─────────────────────────────────────────────────────────────────────
-        cover_url: str | None = None
-        cover_path_saved = os.path.join(tmp, "cover.jpg")
-
-        cover_enabled = cfg.get("PIPELINE_STEP_COVER", "true") == "true"
-        if "cover" in steps and cover_enabled:
+        # ── cover ─────────────────────────────────────────────────────────────
+        async def _do_cover() -> None:
+            nonlocal cover_url
+            if "cover" not in steps or not cover_enabled:
+                return
             step_status["cover"] = "running"
             set_step("cover")
+            await _checkpoint()
             try:
-                # Feed the actual book content into the prompt so the cover
-                # visually reflects the story — not just the title.
                 await generate_cover(
                     req.title or req.book_id,
                     req.author or "",
@@ -654,41 +762,136 @@ async def run_pipeline(
                 key = f"books/{req.book_id}/cover.jpg"
                 cover_url = upload_file(cover_path_saved, key, CONTENT_TYPES[".jpg"])
                 step_status["cover"] = "done"
+            except JobCancelledError:
+                raise
             except Exception as e:
                 errors["cover"] = str(e)
                 step_status["cover"] = "failed"
+            _t = round(time.time() - started)
+            await _persist_step_result(job_id, "cover", step_status["cover"], output_url=cover_url, duration_sec=_t)
+            if step_status["cover"] == "done":
+                await _persist_cover(req.book_id, req.title or req.book_id, cover_url)
             await _checkpoint()
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STEP: alt_text  (requires cover)
-        # ─────────────────────────────────────────────────────────────────────
-        alt_text: str | None = None
-        alttext_enabled = cfg.get("PIPELINE_STEP_ALTTEXT", "true") == "true"
-
-        if "alt_text" in steps and alttext_enabled and cover_url and os.path.exists(cover_path_saved):
-            step_status["alt_text"] = "running"
-            set_step("alt_text")
+        # ── audio_full ────────────────────────────────────────────────────────
+        async def _do_audio_full() -> None:
+            nonlocal full_audio, full_audio_path
+            if "audio_full" not in steps or not tts_enabled or not full_summary:
+                return
+            step_status["audio_full"] = "running"
+            set_step("audio_full")
+            await _checkpoint()
             try:
-                alt_text = await generate_alt_text(cover_path_saved, req.title or req.book_id, req.language)
-                step_status["alt_text"] = "done"
+                raw  = os.path.join(tmp, "audio_raw.mp3")
+                proc = os.path.join(tmp, "audio.mp3")
+                await synthesize(full_summary, req.language, raw, cfg)
+                if audio_proc_enabled:
+                    loop = asyncio.get_event_loop()
+                    meta = await loop.run_in_executor(
+                        None, process_audio, raw, proc,
+                        req.title or req.book_id, req.author or "",
+                    )
+                    src = proc
+                else:
+                    meta = {}
+                    src = raw
+                key = f"books/{req.book_id}/audio_{req.language}_{req.options.length}.mp3"
+                url = upload_file(src, key, CONTENT_TYPES[".mp3"])
+                full_audio = {
+                    "url":      url,
+                    "duration": _fmt_audio_duration(meta.get("duration_seconds")),
+                    "size_mb":  meta.get("size_mb"),
+                }
+                full_audio_path = src
+                step_status["audio_full"] = "done"
+            except JobCancelledError:
+                raise
             except Exception as e:
-                errors["alt_text"] = str(e)
-                step_status["alt_text"] = "failed"
+                errors["audio_full"] = str(e)
+                step_status["audio_full"] = "failed"
+            _audio_url = (full_audio or {}).get("url")
+            _t = round(time.time() - started)
+            await _persist_step_result(job_id, "audio_full", step_status["audio_full"], output_url=_audio_url, duration_sec=_t)
+            if step_status["audio_full"] == "done" and _audio_url:
+                await _persist_audio(req.book_id, req.language, _audio_url)
             await _checkpoint()
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STEP: mindmap
-        # ─────────────────────────────────────────────────────────────────────
-        mindmap_url: str | None = None
-        mindmap_data: dict | None = None
-        # Local on-disk path to the mindmap (SVG for mermaid, n/a for JSON)
-        # so the video step can render a mindmap reveal stage.
-        mindmap_path_saved: str | None = None
-        mindmap_enabled = cfg.get("PIPELINE_STEP_MINDMAP", "true") == "true"
+        # ── audio_chapters ────────────────────────────────────────────────────
+        async def _do_audio_chapters() -> None:
+            nonlocal chapter_audio, chapter_results
+            if "audio_chapters" not in steps or not tts_enabled or not chapter_results:
+                return
+            step_status["audio_chapters"] = "running"
+            set_step("audio_chapters")
+            await _checkpoint()
+            ch_errors = 0
+            ch_processed = 0
+            ch_skipped_no_summary = 0
+            
+            # Create a map to update chapter_results by index
+            audio_key = f"audio_{req.language}"
+            
+            for ch in chapter_results:
+                if not ch.get("summary"):
+                    ch_skipped_no_summary += 1
+                    log.warning("Chapter %d has no summary, skipping audio generation", ch["index"])
+                    continue
+                try:
+                    ch_raw  = os.path.join(tmp, f"ch{ch['index']}_raw.mp3")
+                    ch_proc = os.path.join(tmp, f"ch{ch['index']}.mp3")
+                    await synthesize(ch["summary"], req.language, ch_raw, cfg)
+                    if audio_proc_enabled:
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(
+                            None, process_audio, ch_raw, ch_proc,
+                            ch["title"], req.author or "",
+                        )
+                        src = ch_proc
+                    else:
+                        src = ch_raw
+                    idx = ch["index"]
+                    k   = f"books/{req.book_id}/chapters/ch_{idx:02d}_{req.language}.mp3"
+                    audio_url = upload_file(src, k, CONTENT_TYPES[".mp3"])
+                    chapter_audio[idx] = audio_url
+                    
+                    # Update chapter_results with audio URL for dashboard display
+                    ch[audio_key] = audio_url
+                    
+                    ch_processed += 1
+                    await _checkpoint()   # checkpoint per chapter so progress is visible
+                except JobCancelledError:
+                    raise
+                except Exception as e:
+                    ch_errors += 1
+                    errors[f"audio_chapter_{ch['index']}"] = str(e)
 
-        if "mindmap" in steps and mindmap_enabled and full_summary:
+            # Calculate status based on actual processing, not just chapter count
+            total_attempted = ch_processed + ch_errors
+            if ch_errors > 0 and ch_processed == 0:
+                step_status["audio_chapters"] = "failed"
+            elif ch_errors > 0:
+                step_status["audio_chapters"] = "partial"
+            elif ch_processed > 0:
+                step_status["audio_chapters"] = "done"
+            elif ch_skipped_no_summary > 0:
+                # All chapters skipped due to missing summaries
+                step_status["audio_chapters"] = "failed"
+                errors["audio_chapters"] = f"All {ch_skipped_no_summary} chapters skipped: no summaries available"
+            else:
+                step_status["audio_chapters"] = "skipped"
+            
+            _t = round(time.time() - started)
+            await _persist_step_result(job_id, "audio_chapters", step_status["audio_chapters"], duration_sec=_t)
+            await _checkpoint()
+
+        # ── mindmap ───────────────────────────────────────────────────────────
+        async def _do_mindmap() -> None:
+            nonlocal mindmap_url, mindmap_data, mindmap_path_saved
+            if "mindmap" not in steps or not mindmap_enabled or not full_summary:
+                return
             step_status["mindmap"] = "running"
             set_step("mindmap")
+            await _checkpoint()
             try:
                 if mindmap_format == "json":
                     mindmap_data = await generate_json_mindmap(
@@ -709,173 +912,271 @@ async def run_pipeline(
                     mindmap_url = upload_file(svg_path, key, CONTENT_TYPES[".svg"])
                     mindmap_path_saved = svg_path
                 step_status["mindmap"] = "done"
+            except JobCancelledError:
+                raise
             except Exception as e:
                 errors["mindmap"] = str(e)
                 step_status["mindmap"] = "failed"
+            _t = round(time.time() - started)
+            await _persist_step_result(job_id, "mindmap", step_status["mindmap"], output_url=mindmap_url, duration_sec=_t)
             await _checkpoint()
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STEP: mindmap_chapters  (one mindmap per chapter)
-        # ─────────────────────────────────────────────────────────────────────
-        # index → {"url": str, "data": dict | None, "format": "mermaid" | "json"}
-        chapter_mindmap: dict[int, dict] = {}
-
-        if "mindmap_chapters" in steps and mindmap_enabled and chapter_results:
+        # ── mindmap_chapters ──────────────────────────────────────────────────
+        async def _do_mindmap_chapters() -> None:
+            nonlocal chapter_mindmap, chapter_results
+            if "mindmap_chapters" not in steps or not mindmap_enabled or not chapter_results:
+                return
             step_status["mindmap_chapters"] = "running"
             set_step("mindmap_chapters")
+            await _checkpoint()
             ch_errors = 0
-            for ch in chapter_results:
-                if not ch.get("summary"):
-                    continue
-                try:
-                    idx       = ch["index"]
-                    ch_title  = ch.get("title") or f"Chapter {idx}"
-                    ch_text   = ch["summary"]
+            ch_skipped_no_summary = 0
 
-                    if mindmap_format == "json":
-                        data = await generate_json_mindmap(
-                            ch_title, ch_text, req.language, model=model_mindmap
-                        )
-                        json_path = os.path.join(tmp, f"ch{idx}_mindmap.json")
-                        with open(json_path, "w", encoding="utf-8") as f:
-                            json_module.dump(data, f, ensure_ascii=False)
-                        key = f"books/{req.book_id}/chapters/ch_{idx:02d}_mindmap.json"
-                        url = upload_file(json_path, key, CONTENT_TYPES[".json"])
-                        chapter_mindmap[idx] = {"url": url, "data": data, "format": "json"}
-                    else:
-                        mermaid = await generate_mermaid_code(
-                            ch_title, ch_text, req.language, model=model_mindmap
-                        )
-                        svg_path = os.path.join(tmp, f"ch{idx}_mindmap.svg")
-                        await render_mermaid_svg(mermaid, svg_path)
-                        key = f"books/{req.book_id}/chapters/ch_{idx:02d}_mindmap.svg"
-                        url = upload_file(svg_path, key, CONTENT_TYPES[".svg"])
-                        chapter_mindmap[idx] = {"url": url, "data": None, "format": "mermaid"}
-                except Exception as e:
-                    ch_errors += 1
-                    errors[f"mindmap_chapter_{ch['index']}"] = str(e)
+            mm_conc = max(1, int(cfg.get("MINDMAP_CONCURRENCY", "4")))
+            mm_sem  = asyncio.Semaphore(mm_conc)
 
-            # Status reflects how many chapter mindmaps actually got generated
-            attempted = sum(1 for c in chapter_results if c.get("summary"))
-            step_status["mindmap_chapters"] = (
-                "failed"  if ch_errors == attempted and attempted > 0 else
-                "partial" if ch_errors > 0 else
-                "done"    if attempted > 0 else
-                "skipped"
+            async def _chapter_mindmap(ch: dict) -> tuple[int, dict | None, str | None]:
+                idx      = ch["index"]
+                ch_title = ch.get("title") or f"Chapter {idx}"
+                ch_text  = ch["summary"]
+                async with mm_sem:
+                    try:
+                        if mindmap_format == "json":
+                            data = await generate_json_mindmap(
+                                ch_title, ch_text, req.language, model=model_mindmap
+                            )
+                            json_path = os.path.join(tmp, f"ch{idx}_mindmap.json")
+                            with open(json_path, "w", encoding="utf-8") as f:
+                                json_module.dump(data, f, ensure_ascii=False)
+                            key = f"books/{req.book_id}/chapters/ch_{idx:02d}_mindmap.json"
+                            url = upload_file(json_path, key, CONTENT_TYPES[".json"])
+                            return idx, {"url": url, "data": data, "format": "json"}, None
+                        else:
+                            mermaid = await generate_mermaid_code(
+                                ch_title, ch_text, req.language, model=model_mindmap
+                            )
+                            svg_path = os.path.join(tmp, f"ch{idx}_mindmap.svg")
+                            await render_mermaid_svg(mermaid, svg_path)
+                            key = f"books/{req.book_id}/chapters/ch_{idx:02d}_mindmap.svg"
+                            url = upload_file(svg_path, key, CONTENT_TYPES[".svg"])
+                            return idx, {"url": url, "data": None, "format": "mermaid"}, None
+                    except Exception as e:
+                        return idx, None, str(e)
+
+            # Count chapters that will be skipped
+            chapters_with_summary = [ch for ch in chapter_results if ch.get("summary")]
+            ch_skipped_no_summary = len(chapter_results) - len(chapters_with_summary)
+            
+            if ch_skipped_no_summary > 0:
+                log.warning("%d chapters skipped for mindmap: no summaries available", ch_skipped_no_summary)
+
+            mm_results = await asyncio.gather(
+                *[_chapter_mindmap(ch) for ch in chapters_with_summary]
             )
-            await _checkpoint()
+            
+            # Update chapter_results with mindmap URLs for dashboard display
+            ch_processed = 0
+            for idx, result, err in mm_results:
+                if result is not None:
+                    chapter_mindmap[idx] = result
+                    ch_processed += 1
+                    # Find the chapter and add mindmap URL
+                    for ch in chapter_results:
+                        if ch["index"] == idx:
+                            ch["mindmap_url"] = result.get("url")
+                            ch["mindmap_format"] = result.get("format")
+                            if result.get("data"):
+                                ch["mindmap_data"] = result.get("data")
+                            break
+                if err is not None:
+                    ch_errors += 1
+                    errors[f"mindmap_chapter_{idx}"] = err
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STEP: inject_epub  (fetch source EPUB, inject summary + cover, upload)
-        # ─────────────────────────────────────────────────────────────────────
-        epub_url: str | None = None
-        epub_enabled = cfg.get("PIPELINE_STEP_INJECT_EPUB", "true") == "true"
-        base_url     = cfg.get("BOOK_FILES_BASE_URL") or settings.BOOK_FILES_BASE_URL
-
-        if "inject_epub" in steps and epub_enabled and full_summary:
-            step_status["inject_epub"] = "running"
-            set_step("inject_epub")
-            if not base_url:
-                errors["inject_epub"] = (
-                    "BOOK_FILES_BASE_URL is not configured — set it in Admin → "
-                    "Providers → EPUB Source to enable inject_epub."
-                )
-                step_status["inject_epub"] = "skipped"
+            # Calculate status based on actual processing
+            if ch_errors > 0 and ch_processed == 0:
+                step_status["mindmap_chapters"] = "failed"
+            elif ch_errors > 0:
+                step_status["mindmap_chapters"] = "partial"
+            elif ch_processed > 0:
+                step_status["mindmap_chapters"] = "done"
+            elif ch_skipped_no_summary > 0:
+                step_status["mindmap_chapters"] = "failed"
+                errors["mindmap_chapters"] = f"All {ch_skipped_no_summary} chapters skipped: no summaries available"
             else:
-                try:
-                    src_path = os.path.join(tmp, "source.epub")
-                    out_path = os.path.join(tmp, "enriched.epub")
-
-                    await fetch_epub(req.book_id, req.language, src_path)
-                    await inject_summary_into_epub(
-                        src_path, out_path,
-                        title        = req.title or req.book_id,
-                        author       = req.author or "",
-                        summary_text = full_summary,
-                        language     = req.language,
-                        cover_path   = (
-                            cover_path_saved
-                            if cover_url and os.path.exists(cover_path_saved)
-                            else None
-                        ),
-                    )
-                    key = f"books/{req.book_id}/enriched_{req.language}.epub"
-                    epub_url = upload_file(out_path, key, CONTENT_TYPES[".epub"])
-                    step_status["inject_epub"] = "done"
-                except EpubNotAvailableError as e:
-                    # 404 on the source EPUB — degrade to skipped, not failed.
-                    # This avoids painting the whole job red just because the
-                    # client's catalog hasn't got an EPUB for this book_id yet.
-                    errors["inject_epub"] = str(e)
-                    step_status["inject_epub"] = "skipped"
-                except EpubError as e:
-                    errors["inject_epub"] = str(e)
-                    step_status["inject_epub"] = "failed"
-                except Exception as e:
-                    errors["inject_epub"] = str(e)
-                    step_status["inject_epub"] = "failed"
+                step_status["mindmap_chapters"] = "skipped"
+            
+            _t = round(time.time() - started)
+            await _persist_step_result(job_id, "mindmap_chapters", step_status["mindmap_chapters"], duration_sec=_t)
             await _checkpoint()
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STEP: video  (slideshow video with optional TTS narration + subtitles)
-        # ─────────────────────────────────────────────────────────────────────
-        # Soft requirement: a full_summary so we have chapter cards + subtitles.
-        # If audio_full succeeded → video uses it as the narration track and the
-        # video duration matches the audio length.
-        # If audio_full was skipped/disabled → video runs as a SILENT slideshow
-        # at a fixed duration (useful for local testing without TTS keys).
-        video_url:  str | None = None
-        video_meta: dict | None = None
-        video_enabled  = cfg.get("PIPELINE_STEP_VIDEO", "true") == "true"
-        video_provider = cfg.get("VIDEO_PROVIDER") or settings.VIDEO_PROVIDER
+        # ── Run Phase 2 in parallel ───────────────────────────────────────────
+        phase2_coros = [
+            _do_cover(),
+            _do_audio_full(),
+            _do_audio_chapters(),
+            _do_mindmap(),
+            _do_mindmap_chapters(),
+        ]
+        phase2_results = await asyncio.gather(*phase2_coros, return_exceptions=True)
+        # Re-raise cancellation; other exceptions are already recorded per-step
+        for r in phase2_results:
+            if isinstance(r, JobCancelledError):
+                raise r
+            if isinstance(r, Exception):
+                import logging as _log
+                _log.getLogger(__name__).warning("Phase-2 step raised unexpected: %s", r)
 
-        if "video" in steps and video_enabled and full_summary:
+        # ═════════════════════════════════════════════════════════════════════
+        # PHASE 3 — PARALLEL: alt_text · video
+        # alt_text needs cover; video needs audio_full + summary + cover + mindmap
+        # ═════════════════════════════════════════════════════════════════════
+
+        # ── alt_text ──────────────────────────────────────────────────────────
+        async def _do_alt_text() -> None:
+            nonlocal alt_text
+            if (
+                "alt_text" not in steps or not alttext_enabled
+                or not cover_url or not os.path.exists(cover_path_saved)
+            ):
+                return
+            step_status["alt_text"] = "running"
+            set_step("alt_text")
+            await _checkpoint()
+            try:
+                alt_text = await generate_alt_text(cover_path_saved, req.title or req.book_id, req.language)
+                step_status["alt_text"] = "done"
+            except JobCancelledError:
+                raise
+            except Exception as e:
+                errors["alt_text"] = str(e)
+                step_status["alt_text"] = "failed"
+            _t = round(time.time() - started)
+            await _persist_step_result(job_id, "alt_text", step_status["alt_text"], duration_sec=_t)
+            await _checkpoint()
+
+        # ── video ─────────────────────────────────────────────────────────────
+        async def _do_video() -> None:
+            nonlocal video_url, video_meta
+            if "video" not in steps or not video_enabled or not full_summary:
+                return
             step_status["video"] = "running"
             set_step("video")
+            await _checkpoint()
             try:
-                video_out = os.path.join(tmp, "video.mp4")
-
-                # Cover & mindmap are visual bonuses — use them when present.
-                use_cover  = (
-                    cover_path_saved
-                    if cover_url and os.path.exists(cover_path_saved)
-                    else None
-                )
-                use_mindmap = (
-                    mindmap_path_saved
-                    if mindmap_path_saved and os.path.exists(mindmap_path_saved)
-                    else None
-                )
+                video_out   = os.path.join(tmp, "video.mp4")
+                use_cover   = cover_path_saved if cover_url and os.path.exists(cover_path_saved) else None
+                use_mindmap = mindmap_path_saved if mindmap_path_saved and os.path.exists(mindmap_path_saved) else None
 
                 video_meta = await generate_book_video(
                     title         = req.title or req.book_id,
                     author        = req.author or "",
                     summary_text  = full_summary,
                     language      = req.language,
-                    audio_path    = full_audio_path,   # None → silent slideshow
+                    audio_path    = full_audio_path,
                     cover_path    = use_cover,
                     mindmap_path  = use_mindmap,
                     chapters      = chapter_results,
                     output_path   = video_out,
                     provider_name = video_provider,
                 )
-
                 key = f"books/{req.book_id}/video_{req.language}.mp4"
                 video_url = upload_file(video_out, key, CONTENT_TYPES[".mp4"])
                 step_status["video"] = "done"
             except VideoError as e:
                 errors["video"] = str(e)
                 step_status["video"] = "failed"
+            except JobCancelledError:
+                raise
             except Exception as e:
                 errors["video"] = str(e)
                 step_status["video"] = "failed"
+            _t = round(time.time() - started)
+            await _persist_step_result(job_id, "video", step_status["video"], output_url=video_url, duration_sec=_t)
             await _checkpoint()
 
-    # ── Attach audio URLs to chapter results ─────────────────────────────────
+        # ── inject_epub ── PHASE 4: runs LAST so it has ALL assets ────────────
+        async def _do_inject_epub() -> None:
+            nonlocal epub_url
+            if "inject_epub" not in steps or not epub_enabled or not full_summary:
+                return
+            step_status["inject_epub"] = "running"
+            set_step("inject_epub")
+            await _checkpoint()
+            try:
+                # Try to fetch source EPUB from CDN; fall back to creating from scratch
+                src_path: str | None = None
+                if base_url:
+                    try:
+                        _src = os.path.join(tmp, "source.epub")
+                        await fetch_epub(req.book_id, req.language, _src)
+                        src_path = _src
+                        log.info("inject_epub: using source EPUB from CDN")
+                    except EpubNotAvailableError as e:
+                        log.info("inject_epub: source EPUB not available (%s) — creating from scratch", e)
+                        src_path = None
+                else:
+                    log.info("inject_epub: no BOOK_FILES_BASE_URL — creating EPUB from scratch")
+
+                out_path = os.path.join(tmp, f"{req.book_id}_{req.language}.epub")
+                await inject_summary_into_epub(
+                    src_path,
+                    out_path,
+                    title            = req.title or req.book_id,
+                    author           = req.author or "",
+                    summary_text     = full_summary,
+                    language         = req.language,
+                    cover_path       = (
+                        cover_path_saved
+                        if cover_url and os.path.exists(cover_path_saved)
+                        else None
+                    ),
+                    chapters         = chapter_results,
+                    chapter_audio    = chapter_audio,
+                    chapter_mindmap  = chapter_mindmap,
+                    audio_url        = (full_audio or {}).get("url"),
+                    mindmap_url      = mindmap_url,
+                )
+                # Storage key uses the clean filename: books/{id}/{id}_{lang}.epub
+                key = f"books/{req.book_id}/{req.book_id}_{req.language}.epub"
+                epub_url = upload_file(out_path, key, CONTENT_TYPES[".epub"])
+                step_status["inject_epub"] = "done"
+            except JobCancelledError:
+                raise
+            except (EpubError, Exception) as e:
+                errors["inject_epub"] = str(e)
+                step_status["inject_epub"] = "failed"
+            _t = round(time.time() - started)
+            await _persist_step_result(job_id, "inject_epub", step_status["inject_epub"], output_url=epub_url, duration_sec=_t)
+            await _checkpoint()
+
+        # ═════════════════════════════════════════════════════════════════════
+        # PHASE 3 — PARALLEL: alt_text · video
+        # (inject_epub runs AFTER Phase 3 completes, so it has all assets)
+        # ═════════════════════════════════════════════════════════════════════
+        phase3_results = await asyncio.gather(
+            _do_alt_text(),
+            _do_video(),
+            return_exceptions=True,
+        )
+        for r in phase3_results:
+            if isinstance(r, JobCancelledError):
+                raise r
+        
+        # ═════════════════════════════════════════════════════════════════════
+        # PHASE 4 — inject_epub (runs LAST, after all other steps complete)
+        # This ensures the EPUB includes all generated assets:
+        # - cover image
+        # - full audio
+        # - chapter audio
+        # - chapter mindmaps
+        # - alt_text
+        # ═════════════════════════════════════════════════════════════════════
+        await _do_inject_epub()
+
+    # ── Attach audio + mindmap URLs to chapter results ────────────────────────
     lang = req.language
     for ch in chapter_results:
         ch[f"audio_{lang}"] = chapter_audio.get(ch["index"])
-        # Attach per-chapter mindmap if generated
         cm = chapter_mindmap.get(ch["index"])
         if cm:
             ch["mindmap_url"]    = cm["url"]
@@ -883,18 +1184,40 @@ async def run_pipeline(
             if cm["data"] is not None:
                 ch["mindmap_data"] = cm["data"]
 
-    # ── Determine overall status ──────────────────────────────────────────────
+    # ── Overall status ────────────────────────────────────────────────────────
     active = {s for s in steps if s in ALL_STEPS}
     failed = sum(1 for s in active if step_status.get(s) == "failed")
     status = "done" if failed == 0 else ("failed" if failed == len(active) else "partial")
 
     elapsed = round(time.time() - started, 1)
+    cost    = await _compute_job_cost(job_id)
+
+    summary_key = f"{req.options.length}_{req.language}"
+
+    files = {
+        "cover":      cover_url,
+        "audio_full": (full_audio or {}).get("url"),
+        "mindmap":    mindmap_url,
+        "epub":       epub_url,
+        "video":      video_url,
+        "chapters": [
+            {
+                "index":       ch["index"],
+                "title":       ch.get("title"),
+                "audio_url":   chapter_audio.get(ch["index"]),
+                "mindmap_url": (chapter_mindmap.get(ch["index"]) or {}).get("url"),
+            }
+            for ch in chapter_results
+        ],
+    }
 
     return {
         "book_id":         req.book_id,
         "status":          status,
         "generated_at":    datetime.now(timezone.utc).isoformat(),
         "processing_time": _fmt_duration(elapsed),
+        "cost":            cost,
+        "files":           files,
         "steps":           step_status,
         "metadata": {
             "title":          req.title,
@@ -915,17 +1238,13 @@ async def run_pipeline(
                 "language":   req.language,
             }
         } if full_summary else {},
-        "audio": {
-            f"full_{lang}": full_audio,
-        } if full_audio else {},
+        "audio": {f"full_{lang}": full_audio} if full_audio else {},
         "mindmap": (
             {"url": mindmap_url, "data": mindmap_data} if mindmap_data else
             {"url": mindmap_url} if mindmap_url else
             None
         ),
-        "epub": (
-            {f"enriched_{lang}": {"url": epub_url}} if epub_url else None
-        ),
+        "epub": ({f"enriched_{lang}": {"url": epub_url}} if epub_url else None),
         "video": (
             {
                 f"summary_{lang}": {

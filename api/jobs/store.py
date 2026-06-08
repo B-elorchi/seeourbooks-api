@@ -6,7 +6,16 @@ import uuid
 
 from api.services.db import find, insert, update
 
-MAX_RETRIES = 3
+MAX_RETRIES = 5  # 5 retries for better reliability
+
+# In-memory set of job IDs requested to cancel.
+# Checked by the orchestrator after every checkpoint (between steps).
+_cancelled_jobs: set[str] = set()
+
+
+def is_cancelled(job_id: str) -> bool:
+    """Return True if a cancel has been requested for this job."""
+    return job_id in _cancelled_jobs
 
 
 async def create_job(book_id: str, input_data: dict) -> str:
@@ -35,6 +44,12 @@ async def set_done(job_id: str, result: dict) -> None:
 
 async def set_failed(job_id: str, error: str) -> None:
     await update("pipeline_jobs", {"id": job_id}, {"status": "failed", "error_msg": error})
+
+
+async def set_cancelled(job_id: str) -> None:
+    """Mark job as cancelled in DB and in the in-memory set the orchestrator checks."""
+    _cancelled_jobs.add(job_id)
+    await update("pipeline_jobs", {"id": job_id}, {"status": "cancelled", "error_msg": "Cancelled by admin"})
 
 
 async def set_partial(job_id: str, result: dict) -> None:

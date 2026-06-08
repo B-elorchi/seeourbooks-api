@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     MODEL_HAIKU:  str = "claude-haiku-4-5-20251001"
     MODEL_SONNET: str = "claude-sonnet-4-6"
     MODEL_OPUS:   str = "claude-opus-4-7"
+    # Per-chunk summary model (Pass 1). Defaults to OpenRouter GPT-4.1-mini for cost efficiency.
+    # Supports OpenRouter prefix (e.g., "openai/gpt-4.1-mini") or native Anthropic models.
+    MODEL_CHUNK:  str = "openai/gpt-4.1-mini"
 
     # ── OpenRouter (OpenAI-compatible, supports both Claude + GPT models) ─────
     # Use OpenRouter model names with a vendor prefix, e.g.:

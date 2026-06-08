@@ -5,12 +5,12 @@ import json
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from api.jobs.store import (
-    create_job, set_running, set_done, set_failed, set_partial,
+    create_job, set_running, set_done, set_failed, set_partial, set_cancelled,
     get_job, get_output, list_jobs,
     can_retry, increment_retry,
 )
 from api.models.requests import PipelineReq
-from api.services.pipeline.orchestrator import run_pipeline
+from api.services.pipeline.orchestrator import run_pipeline, JobCancelledError
 
 router = APIRouter(prefix="/pipeline")
 
@@ -22,8 +22,15 @@ _BACKOFF = [5, 10, 20]
 
 def _failed_steps(result: dict | str | None) -> list[str]:
     """
-    Extract the names of steps that failed from a previous result dict.
-    Returns empty list if no result or no failures (→ retry everything).
+    Extract the names of steps that need to be (re)run from a previous result.
+
+    Includes:
+      - "failed"  — step ran but errored
+      - "running" — step was in progress when the server was killed (restart recovery)
+      - "pending" — step was queued but never started (also lost on restart)
+
+    Returns empty list when result is missing or all steps are done/skipped
+    (→ retry everything from scratch).
     """
     if not result:
         return []
@@ -33,7 +40,7 @@ def _failed_steps(result: dict | str | None) -> list[str]:
         except Exception:
             return []
     steps = result.get("steps") or {}
-    return [s for s, status in steps.items() if status == "failed"]
+    return [s for s, status in steps.items() if status in ("failed", "running", "pending")]
 
 
 def _merge_results(old: dict | str | None, new: dict) -> dict:
@@ -62,6 +69,13 @@ def _merge_results(old: dict | str | None, new: dict) -> dict:
     merged = copy.deepcopy(old)
 
     # ── Steps ──────────────────────────────────────────────────────────────────
+    # Drop stale "running"/"pending" statuses that were left in the checkpoint
+    # when the server restarted mid-job — they'll be replaced by the retry result.
+    old_step_map = merged.get("steps") or {}
+    for step, status in list(old_step_map.items()):
+        if status in ("running", "pending"):
+            old_step_map[step] = "failed"   # treat as failed so retry covers them
+
     new_steps = new.get("steps") or {}
     for step, status in new_steps.items():
         if status != "skipped":                     # skipped = wasn't attempted
@@ -78,15 +92,25 @@ def _merge_results(old: dict | str | None, new: dict) -> dict:
     # ── Audio dict e.g. {"full_en": {...}} ───────────────────────────────────
     merged["audio"] = {**(merged.get("audio") or {}), **(new.get("audio") or {})}
 
-    # ── Scalar assets — prefer new if present ────────────────────────────────
-    if new.get("mindmap"):
-        merged["mindmap"] = new["mindmap"]
+    # ── Scalar assets — prefer new if present, keep old otherwise ───────────
+    for key in ("mindmap", "epub", "video"):
+        if new.get(key):
+            merged[key] = new[key]
     if new.get("quick_summary"):
         merged["quick_summary"] = new["quick_summary"]
     if new.get("chapters"):
         merged["chapters"] = new["chapters"]
     if new.get("processing_time"):
         merged["processing_time"] = new["processing_time"]
+
+    # ── files index — deep-merge so per-step URLs are preserved ──────────────
+    old_files = merged.get("files") or {}
+    new_files  = new.get("files") or {}
+    merged_files = {**old_files, **{k: v for k, v in new_files.items() if v is not None}}
+    # chapters list: prefer new if non-empty
+    if new_files.get("chapters"):
+        merged_files["chapters"] = new_files["chapters"]
+    merged["files"] = merged_files
 
     # ── Errors — remove resolved, keep unretried, add new ────────────────────
     old_errors   = old.get("errors") or {}
@@ -194,7 +218,7 @@ async def _run_job(
 
     await set_running(job_id)
     try:
-        result = await run_pipeline(req, job_id=job_id)
+        result = await run_pipeline(req, job_id=job_id, previous_result=previous_result)
 
         # Merge new outputs with the previous partial result (if any)
         if previous_result:
@@ -207,6 +231,9 @@ async def _run_job(
         else:
             error_msg = str(result.get("errors") or "pipeline returned failed status")
             await _handle_failure(job_id, req, error_msg, result)
+    except JobCancelledError:
+        # Cancellation is intentional — don't retry, don't log as error.
+        await set_cancelled(job_id)
     except Exception as e:
         await _handle_failure(job_id, req, str(e), previous_result)
 
@@ -243,6 +270,22 @@ async def pipeline_status(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
     return job
+
+
+@router.post("/jobs/{job_id}/cancel", status_code=200)
+async def cancel_job(job_id: str):
+    """
+    Request cancellation of a running job.
+    The orchestrator checks this flag after every step and stops at the next
+    safe boundary (between steps — not mid-LLM-call).
+    """
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job["status"] not in ("running", "queued"):
+        return {"ok": True, "message": f"Job already in terminal state: {job['status']}"}
+    await set_cancelled(job_id)
+    return {"ok": True, "job_id": job_id, "message": "Cancellation requested — job will stop at the next step boundary"}
 
 
 @router.get("/output/{book_id}")

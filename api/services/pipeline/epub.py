@@ -1,32 +1,19 @@
 """
-EPUB enrichment — fetches an existing book EPUB and injects the AI-generated
-summary as a new front-matter chapter (and optionally replaces the cover).
+EPUB enrichment — injects AI-generated content into an existing book EPUB,
+OR creates a fresh EPUB from scratch when no source is available.
 
-URL pattern for the source EPUB (configured via BOOK_FILES_BASE_URL):
-    {base}/books/english/{book_id}.epub      ← language == "en"
-    {base}/books/arabic/{book_id}.epub       ← language == "ar"
+New structure (in reading order):
+  1. Cover image
+  2. Front-matter page  — full summary text + full audio + mind-map link
+  3. Original book chapters (from source EPUB spine), each followed by:
+       └── Chapter-insights page — chapter summary + chapter audio + chapter mindmap
 
-Public surface
-──────────────
-    fetch_epub(book_id, language, output_path)
-    inject_summary_into_epub(epub_path, output_path, *, title, author,
-                              summary_text, language, cover_path=None)
-    EpubError                — raised on any unrecoverable EPUB issue.
-    EpubNotAvailableError    — source EPUB URL not configured or 404.
+When building from scratch (no source EPUB):
+  1. Cover page
+  2. Front-matter page
+  3. One chapter-insights page per chapter (no original text available)
 
-The HTML templates are ported from the reference `epub_auto_injector.py`
-script — RTL-aware Arabic layout with Amiri/Traditional Arabic fallback, LTR
-English layout with Georgia.
-
-Design notes
-────────────
-- ebooklib is synchronous.  Heavy work runs in `loop.run_in_executor` so the
-  pipeline event loop stays responsive.
-- HTML body content is escaped via `html.escape` and split on blank-line
-  paragraph boundaries — no raw HTML from the summarizer ever reaches the
-  rendered chapter.
-- The summary chapter is prepended to the spine + ToC so the reader sees it
-  before chapter 1.
+Output filename is always  {book_id}_{language}.epub
 """
 from __future__ import annotations
 
@@ -44,7 +31,7 @@ from api.config.settings import settings
 log = logging.getLogger(__name__)
 
 
-# ── Errors ───────────────────────────────────────────────────────────────────
+# ── Errors ────────────────────────────────────────────────────────────────────
 
 class EpubError(Exception):
     """Generic EPUB read/write/inject failure."""
@@ -54,96 +41,131 @@ class EpubNotAvailableError(EpubError):
     """The source EPUB cannot be located (no base URL or 404)."""
 
 
-# ── Templates ────────────────────────────────────────────────────────────────
-
-_AR_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ar" lang="ar" dir="rtl">
-<head>
-  <meta charset="utf-8"/>
-  <title>ملخص الكتاب</title>
-  <style>
-    body {{
-      font-family: 'Amiri', 'Traditional Arabic', Arial, sans-serif;
-      direction: rtl; text-align: right;
-      line-height: 2.0; margin: 2em;
-      color: #1a1a1a; background: #fafaf8;
-    }}
-    h1 {{ font-size: 1.6em; color: #2c3e50;
-          border-bottom: 2px solid #e67e22;
-          padding-bottom: 0.4em; margin-bottom: 0.6em; }}
-    .meta  {{ color: #7f8c8d; font-size: 0.9em; margin-bottom: 1.4em; }}
-    .text  {{ font-size: 1.05em; text-align: justify; }}
-    .badge {{ background: #e67e22; color: white;
-              padding: 0.2em 0.8em; border-radius: 4px;
-              font-size: 0.8em; margin-bottom: 1em;
-              display: inline-block; }}
-    footer {{ text-align: center; color: #aaa;
-              font-size: 0.8em; margin-top: 2em; }}
-  </style>
-</head>
-<body>
-  <span class="badge">ملخص</span>
-  <h1>{title}</h1>
-  <p class="meta">المؤلف: {author}</p>
-  <div class="text">{body}</div>
-  <footer>SeeOurBook.com — مكتبتك الرقمية</footer>
-</body>
-</html>"""
-
-_EN_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en" dir="ltr">
-<head>
-  <meta charset="utf-8"/>
-  <title>Book Summary</title>
-  <style>
-    body {{
-      font-family: Georgia, 'Times New Roman', serif;
-      direction: ltr; text-align: left;
-      line-height: 1.8; margin: 2em;
-      color: #1a1a1a; background: #fafaf8;
-    }}
-    h1 {{ font-size: 1.6em; color: #2c3e50;
-          border-bottom: 2px solid #2980b9;
-          padding-bottom: 0.4em; margin-bottom: 0.6em; }}
-    .meta  {{ color: #7f8c8d; font-size: 0.9em; margin-bottom: 1.4em; }}
-    .text  {{ font-size: 1.05em; text-align: justify; }}
-    .badge {{ background: #2980b9; color: white;
-              padding: 0.2em 0.8em; border-radius: 4px;
-              font-size: 0.8em; margin-bottom: 1em;
-              display: inline-block; }}
-    footer {{ text-align: center; color: #aaa;
-              font-size: 0.8em; margin-top: 2em; }}
-  </style>
-</head>
-<body>
-  <span class="badge">Summary</span>
-  <h1>{title}</h1>
-  <p class="meta">Author: {author}</p>
-  <div class="text">{body}</div>
-  <footer>SeeOurBook.com — Your Digital Library</footer>
-</body>
-</html>"""
-
+# ── HTML helpers ──────────────────────────────────────────────────────────────
 
 def _paragraphs_html(text: str) -> str:
-    """Convert plain text → safely-escaped <p>...</p> blocks."""
     if not text:
-        return "  <p></p>"
+        return "<p>—</p>"
     paras = [p.strip() for p in text.split("\n\n") if p.strip()]
     if not paras:
         paras = [text.strip()]
-    out: list[str] = []
-    for p in paras:
-        # Single-line breaks inside a paragraph become <br/>.
-        # Escape first to prevent HTML injection from the summarizer.
-        safe = escape(p).replace("\n", "<br/>")
-        out.append(f"  <p>{safe}</p>")
-    return "\n".join(out)
+    return "\n".join(
+        f'<p>{escape(p).replace(chr(10), "<br/>")}</p>'
+        for p in paras
+    )
 
 
-# ── URL resolution ───────────────────────────────────────────────────────────
+def _base_styles(accent: str, font: str, is_arabic: bool) -> str:
+    align = "right" if is_arabic else "left"
+    return f"""
+    body {{
+      font-family: {font};
+      direction: {'rtl' if is_arabic else 'ltr'};
+      text-align: {align};
+      line-height: 1.9;
+      margin: 2em 2.5em;
+      color: #1a1a1a;
+      background: #fafaf8;
+    }}
+    h1 {{
+      font-size: 1.55em; color: #2c3e50;
+      border-bottom: 3px solid {accent};
+      padding-bottom: 0.3em; margin-bottom: 0.6em;
+    }}
+    h2 {{
+      font-size: 1.15em; color: #34495e;
+      margin-top: 1.6em; margin-bottom: 0.4em;
+    }}
+    .meta {{ color: #7f8c8d; font-size: 0.88em; margin-bottom: 1.5em; }}
+    .badge {{
+      display: inline-block;
+      background: {accent}; color: white;
+      padding: 0.2em 0.9em; border-radius: 5px;
+      font-size: 0.8em; margin-bottom: 1em;
+    }}
+    .summary-text {{ font-size: 1.02em; text-align: justify; }}
+    .asset-box {{
+      border: 1px solid #ddd; border-radius: 8px;
+      padding: 1em 1.2em; margin: 1.2em 0;
+      background: #f5f5f0;
+    }}
+    .asset-box h3 {{
+      font-size: 0.95em; color: #555;
+      margin: 0 0 0.5em 0; text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }}
+    .asset-link {{
+      display: block;
+      color: {accent};
+      text-decoration: underline;
+      word-break: break-all;
+      font-size: 0.93em;
+      margin: 0.3em 0;
+    }}
+    .chapter-insights {{
+      border-top: 2px solid {accent};
+      margin-top: 2em; padding-top: 1em;
+    }}
+    .insight-label {{
+      font-size: 0.75em; text-transform: uppercase;
+      letter-spacing: 0.08em; color: #999;
+      margin-bottom: 0.8em;
+    }}
+    footer {{
+      text-align: center; color: #bbb;
+      font-size: 0.78em; margin-top: 2.5em;
+      border-top: 1px solid #eee; padding-top: 0.8em;
+    }}
+    """
+
+
+def _xhtml_page(
+    uid: str,
+    title: str,
+    body_html: str,
+    language: str,
+    author: str = "",
+    accent: str = "",
+    font: str = "",
+    show_header: bool = True,
+) -> str:
+    """Render a complete XHTML page ready for ebooklib."""
+    is_arabic = (language or "en").lower() == "ar"
+    lang_attr = "ar" if is_arabic else "en"
+    dir_attr  = 'dir="rtl"' if is_arabic else 'dir="ltr"'
+    _accent   = accent or ("#e67e22" if is_arabic else "#2980b9")
+    _font     = font   or (
+        "Amiri, 'Traditional Arabic', Arial, sans-serif"
+        if is_arabic else
+        "Georgia, 'Times New Roman', serif"
+    )
+    author_label = "المؤلف" if is_arabic else "Author"
+    footer_text  = "مكتبتك الرقمية" if is_arabic else "Your Digital Library"
+
+    header_html = (
+        f'<h1>{escape(title)}</h1>'
+        f'<p class="meta">{author_label}: {escape(author)}</p>'
+        if show_header and title else ""
+    )
+
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xml:lang="{lang_attr}" lang="{lang_attr}" {dir_attr}>
+<head>
+  <meta charset="utf-8"/>
+  <title>{escape(title)}</title>
+  <style>{_base_styles(_accent, _font, is_arabic)}</style>
+</head>
+<body>
+  {header_html}
+  {body_html}
+  <footer>SeeOurBook — {footer_text}</footer>
+</body>
+</html>"""
+
+
+# ── URL resolution ────────────────────────────────────────────────────────────
 
 def _epub_source_url(book_id: str, language: str) -> str:
     base_cfg = (settings.BOOK_FILES_BASE_URL or "").strip().rstrip("/")
@@ -156,54 +178,21 @@ def _epub_source_url(book_id: str, language: str) -> str:
     return f"{base_cfg}/books/{folder}/{quote(book_id, safe='')}.epub"
 
 
-# ── Public: fetch source EPUB ────────────────────────────────────────────────
+# ── Public: fetch source EPUB ─────────────────────────────────────────────────
 
 async def fetch_epub(book_id: str, language: str, output_path: str) -> str:
-    """
-    Download the source EPUB for (book_id, language) to `output_path`.
-
-    Raises:
-        EpubNotAvailableError — base URL unset or remote returns 404.
-        EpubError             — any other download failure.
-    """
     url = _epub_source_url(book_id, language)
     log.info("Fetching EPUB from %s", url)
-
     try:
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             r = await client.get(url)
-    except httpx.ConnectError as exc:
-        # DNS resolution failure, refused connection, etc. — treat the same
-        # way as a 404: the EPUB simply isn't available at the configured
-        # URL.  Pipeline degrades to "skipped" instead of "failed" so the
-        # rest of the job still succeeds.
-        raise EpubNotAvailableError(
-            f"EPUB host unreachable for {url} ({exc}). "
-            "Either BOOK_FILES_BASE_URL is misconfigured or the host is down. "
-            "Set BOOK_FILES_BASE_URL='' in Admin → Providers → EPUB Source to "
-            "disable this step entirely."
-        ) from exc
-    except httpx.TimeoutException as exc:
-        # Slow upstream — also degradable; user can retry later.
-        raise EpubNotAvailableError(
-            f"EPUB host timed out fetching {url}: {exc}"
-        ) from exc
-    except httpx.RequestError as exc:
-        raise EpubNotAvailableError(
-            f"EPUB request error for {url}: {exc}"
-        ) from exc
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError) as exc:
+        raise EpubNotAvailableError(f"EPUB host unreachable for {url}: {exc}") from exc
 
     if r.status_code == 404:
-        raise EpubNotAvailableError(
-            f"source EPUB not found at {url} (404)"
-        )
+        raise EpubNotAvailableError(f"source EPUB not found at {url} (404)")
     if r.status_code != 200:
-        # 5xx / 403 etc. — treat as transient unavailability, don't paint the
-        # whole job red.  Admins can re-run later or update BOOK_FILES_BASE_URL.
-        raise EpubNotAvailableError(
-            f"EPUB host returned {r.status_code} for {url}"
-        )
-
+        raise EpubNotAvailableError(f"EPUB host returned {r.status_code} for {url}")
     if not r.content or len(r.content) < 100:
         raise EpubNotAvailableError(f"empty response body from {url}")
 
@@ -212,10 +201,9 @@ async def fetch_epub(book_id: str, language: str, output_path: str) -> str:
     return output_path
 
 
-# ── Synchronous ebooklib worker (runs in executor) ───────────────────────────
+# ── Image media-type detection ────────────────────────────────────────────────
 
 def _detect_image_media_type(data: bytes, ext_hint: str) -> str:
-    """Detect actual image media type from magic bytes, fallback to ext hint."""
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if data.startswith(b"\xff\xd8\xff"):
@@ -230,8 +218,157 @@ def _detect_image_media_type(data: bytes, ext_hint: str) -> str:
     return "image/jpeg"
 
 
+# ── Page builders ─────────────────────────────────────────────────────────────
+
+def _build_front_matter(
+    epub_mod,
+    *,
+    slug: str,
+    title: str,
+    author: str,
+    summary_text: str,
+    language: str,
+    audio_url: str | None,
+    mindmap_url: str | None,
+) -> object:
+    """
+    Front-matter page: full summary + full audio link + mindmap link.
+    This appears immediately after the cover in the reading order.
+    """
+    is_arabic   = (language or "en").lower() == "ar"
+    page_title  = "ملخص الكتاب" if is_arabic else "Book Summary"
+    badge_text  = "ملخص" if is_arabic else "Summary"
+
+    # ── Summary section ───────────────────────────────────────────────────────
+    body_parts = [
+        f'<p class="badge">{escape(badge_text)}</p>',
+        f'<div class="summary-text">{_paragraphs_html(summary_text)}</div>',
+    ]
+
+    # ── Full audio ────────────────────────────────────────────────────────────
+    if audio_url:
+        audio_label  = "الصوت الكامل" if is_arabic else "Full Audio"
+        dl_label     = "تحميل" if is_arabic else "Download MP3"
+        body_parts.append(
+            f'<div class="asset-box">'
+            f'<h3>🔊 {audio_label}</h3>'
+            f'<a class="asset-link" href="{escape(audio_url)}">{escape(audio_url)}</a>'
+            f'<p style="font-size:0.85em;color:#777;margin-top:0.4em">'
+            f'<a href="{escape(audio_url)}">{dl_label} ↗</a></p>'
+            f'</div>'
+        )
+
+    # ── Mind map ──────────────────────────────────────────────────────────────
+    if mindmap_url:
+        mm_label = "خريطة الذهن" if is_arabic else "Mind Map"
+        body_parts.append(
+            f'<div class="asset-box">'
+            f'<h3>🗺 {mm_label}</h3>'
+            f'<a class="asset-link" href="{escape(mindmap_url)}">{escape(mindmap_url)}</a>'
+            f'</div>'
+        )
+
+    html = _xhtml_page(
+        uid=f"{slug}_front",
+        title=title,
+        author=author,
+        body_html="\n".join(body_parts),
+        language=language,
+    )
+    item = epub_mod.EpubHtml(
+        uid       = f"{slug}_front_{language}",
+        title     = page_title,
+        file_name = f"seeourbook_front_{language}.xhtml",
+        lang      = language,
+    )
+    item.content = html.encode("utf-8")
+    return item
+
+
+def _build_chapter_insights(
+    epub_mod,
+    *,
+    slug: str,
+    ch: dict,
+    language: str,
+    chapter_audio: dict[int, str],
+    chapter_mindmap: dict[int, dict],
+) -> object | None:
+    """
+    Per-chapter insights page: chapter summary + audio + mindmap.
+    Inserted into the spine AFTER the original chapter page.
+    Returns None if the chapter has no summary.
+    """
+    ch_summary = (ch.get("summary") or "").strip()
+    if not ch_summary:
+        return None
+
+    idx       = ch.get("index", 0)
+    ch_title  = ch.get("title") or f"Chapter {idx}"
+    is_arabic = (language or "en").lower() == "ar"
+
+    insights_label = "تحليل الفصل" if is_arabic else "Chapter Insights"
+    sum_label      = "ملخص" if is_arabic else "Summary"
+    audio_label    = "صوت الفصل" if is_arabic else "Chapter Audio"
+    mm_label       = "خريطة ذهنية" if is_arabic else "Chapter Mind Map"
+
+    body_parts = [
+        f'<div class="chapter-insights">',
+        f'<p class="insight-label">✦ {insights_label} — {escape(ch_title)}</p>',
+
+        # Summary
+        f'<div class="asset-box">',
+        f'<h3>📝 {sum_label}</h3>',
+        f'<div class="summary-text">{_paragraphs_html(ch_summary)}</div>',
+        f'</div>',
+    ]
+
+    # Chapter audio
+    audio_url = chapter_audio.get(idx)
+    if audio_url:
+        body_parts += [
+            f'<div class="asset-box">',
+            f'<h3>🎧 {audio_label}</h3>',
+            f'<a class="asset-link" href="{escape(audio_url)}">{escape(audio_url)}</a>',
+            f'</div>',
+        ]
+
+    # Chapter mindmap
+    cm = chapter_mindmap.get(idx)
+    mm_url = cm.get("url") if cm else None
+    if mm_url:
+        body_parts += [
+            f'<div class="asset-box">',
+            f'<h3>🗺 {mm_label}</h3>',
+            f'<a class="asset-link" href="{escape(mm_url)}">{escape(mm_url)}</a>',
+            f'</div>',
+        ]
+
+    body_parts.append('</div>')  # close .chapter-insights
+
+    safe_slug = f"{slug}_ch{idx}"
+    html = _xhtml_page(
+        uid      = safe_slug,
+        title    = f"{insights_label}: {ch_title}",
+        author   = "",
+        body_html= "\n".join(body_parts),
+        language = language,
+        show_header = False,
+    )
+    item = epub_mod.EpubHtml(
+        uid       = f"{safe_slug}_{language}",
+        title     = f"{insights_label}: {ch_title}",
+        file_name = f"seeourbook_ch{idx:03d}_{language}.xhtml",
+        lang      = language,
+    )
+    item.content = html.encode("utf-8")
+    return item
+
+
+# ── Synchronous ebooklib worker ───────────────────────────────────────────────
+
 def _inject_sync(
-    epub_path: str,
+    epub_path: str | None,
     output_path: str,
     *,
     title: str,
@@ -239,100 +376,216 @@ def _inject_sync(
     summary_text: str,
     language: str,
     cover_path: str | None,
+    chapters: list[dict] | None,
+    chapter_audio: dict[int, str] | None,
+    chapter_mindmap: dict[int, dict] | None,
+    audio_url: str | None,
+    mindmap_url: str | None,
 ) -> None:
     try:
-        from ebooklib import epub  # local import keeps cold start fast
+        from ebooklib import epub
     except ImportError as exc:
-        raise EpubError(
-            "EbookLib is not installed — run `pip install EbookLib`"
-        ) from exc
+        raise EpubError("EbookLib is not installed — run `pip install EbookLib`") from exc
 
-    try:
-        book = epub.read_epub(epub_path)
-    except Exception as exc:
-        raise EpubError(f"could not parse source EPUB: {exc}") from exc
+    chapters        = chapters        or []
+    chapter_audio   = chapter_audio   or {}
+    chapter_mindmap = chapter_mindmap or {}
 
-    # Fall back to EPUB metadata when caller didn't supply title/author
+    # ── Load or create the EPUB book ─────────────────────────────────────────
+    from_scratch = True
+    if epub_path and Path(epub_path).is_file() and Path(epub_path).stat().st_size > 100:
+        try:
+            book = epub.read_epub(epub_path)
+            from_scratch = False
+            log.info("Loaded source EPUB: %s", epub_path)
+        except Exception as exc:
+            log.warning("Could not parse source EPUB (%s) — creating from scratch", exc)
+            book = epub.EpubBook()
+    else:
+        book = epub.EpubBook()
+
+    if from_scratch:
+        log.info("Building EPUB from scratch for %r / %s", title, language)
+        book.set_identifier(f"seeourbook_{title}_{language}")
+        book.set_language(language or "en")
+        book.add_item(epub.EpubNcx())
+        book.add_item(epub.EpubNav())
+        book.spine = ["nav"]
+
+    # Fill in metadata
     if not title:
-        meta = book.get_metadata("DC", "title")
+        meta  = book.get_metadata("DC", "title")
         title = meta[0][0] if meta else "Untitled"
     if not author:
-        meta = book.get_metadata("DC", "creator")
+        meta   = book.get_metadata("DC", "creator")
         author = meta[0][0] if meta else "Unknown"
+    book.set_title(title)
+    book.add_author(author)
 
-    # ── Cover replacement (optional) ─────────────────────────────────────────
+    slug = f"{title}_{language}".replace(" ", "_")[:40]
+
+    # ── 1. Cover ──────────────────────────────────────────────────────────────
     if cover_path and Path(cover_path).is_file():
         try:
-            data = Path(cover_path).read_bytes()
+            data  = Path(cover_path).read_bytes()
             media = _detect_image_media_type(data, Path(cover_path).suffix)
-            ext = "jpg" if media == "image/jpeg" else media.split("/", 1)[1]
+            ext   = "jpg" if media == "image/jpeg" else media.split("/", 1)[1]
             book.set_cover(f"cover.{ext}", data)
-            log.info("EPUB cover replaced (%s, %d bytes)", media, len(data))
+            log.info("Cover set (%s, %d bytes)", media, len(data))
         except Exception as exc:
-            # Non-fatal — keep going with the original cover.
-            log.warning("cover replacement failed (%s) — keeping original", exc)
+            log.warning("Cover set failed (%s) — continuing", exc)
 
-    # ── Summary chapter ──────────────────────────────────────────────────────
-    is_arabic = (language or "en").lower() == "ar"
-    template  = _AR_TEMPLATE if is_arabic else _EN_TEMPLATE
-    chapter_title = "ملخص الكتاب" if is_arabic else "Book Summary"
-
-    html = template.format(
-        title  = escape(title),
-        author = escape(author),
-        body   = _paragraphs_html(summary_text),
+    # ── 2. Front-matter page ──────────────────────────────────────────────────
+    front_item = _build_front_matter(
+        epub,
+        slug=slug, title=title, author=author,
+        summary_text=summary_text, language=language,
+        audio_url=audio_url, mindmap_url=mindmap_url,
     )
+    book.add_item(front_item)
 
-    slug = Path(epub_path).stem
-    file_name = f"summary_{(language or 'en').lower()}.xhtml"
-    item = epub.EpubHtml(
-        uid       = f"{slug}_summary_{(language or 'en').lower()}",
-        title     = chapter_title,
-        file_name = file_name,
-        lang      = (language or "en").lower(),
-    )
-    item.content = html.encode("utf-8")
-    book.add_item(item)
+    # ── 3. Per-chapter insights pages ─────────────────────────────────────────
+    # Build a map: chapter index → insights item
+    insight_items: dict[int, object] = {}
+    for ch in chapters:
+        item = _build_chapter_insights(
+            epub,
+            slug=slug, ch=ch, language=language,
+            chapter_audio=chapter_audio,
+            chapter_mindmap=chapter_mindmap,
+        )
+        if item:
+            book.add_item(item)
+            insight_items[ch.get("index", 0)] = item
 
-    # Replace any earlier injection of the same filename, then prepend
-    existing_spine = [
+    # ── Rebuild spine ─────────────────────────────────────────────────────────
+    # Strategy:
+    #   • Remove any previously injected seeourbook pages from the spine
+    #   • Put front-matter first (after "nav")
+    #   • For existing EPUBs: interleave insight pages after each original chapter
+    #   • For from-scratch EPUBs: list front + insights in chapter order
+
+    injected_fnames = {front_item.file_name} | {
+        it.file_name for it in insight_items.values()
+    }
+
+    def _spine_fname(sp) -> str | None:
+        """Extract the filename from a spine entry regardless of its type."""
+        if isinstance(sp, str):
+            return sp
+        if isinstance(sp, tuple):
+            sp = sp[0]
+        return getattr(sp, "file_name", None)
+
+    # Clean old spine of injected pages
+    clean_spine = [
         sp for sp in book.spine
-        if not (isinstance(sp, tuple) and getattr(sp[0], "file_name", None) == file_name)
-        and not (hasattr(sp, "file_name") and sp.file_name == file_name)
+        if (_spine_fname(sp) or "") not in injected_fnames
+        and sp not in ("nav", "cover")
     ]
-    book.spine = [item] + existing_spine
 
-    # Prepend to the ToC
-    new_link = epub.Link(file_name, chapter_title, item.id)
-    old_toc  = list(book.toc) if book.toc else []
-    book.toc = (new_link, *old_toc)
+    if from_scratch or not clean_spine:
+        # From scratch: front-matter then chapters in order
+        new_spine: list = ["nav", front_item]
+        for ch in sorted(chapters, key=lambda c: c.get("index", 0)):
+            item = insight_items.get(ch.get("index", 0))
+            if item:
+                new_spine.append(item)
+        book.spine = new_spine
+    else:
+        # Existing EPUB: insert insights after every N-th original chapter
+        # We split the clean_spine into chapter-sized groups and interleave.
+        # Heuristic: treat each existing spine item as one book chapter,
+        # and pair it with insight_items by position.
+        new_spine = ["nav", front_item]
+        sorted_insights = [
+            insight_items[ch.get("index", 0)]
+            for ch in sorted(chapters, key=lambda c: c.get("index", 0))
+            if ch.get("index", 0) in insight_items
+        ]
+        n_orig = len(clean_spine)
+        n_ins  = len(sorted_insights)
 
-    # ── Write the enriched EPUB ──────────────────────────────────────────────
+        if n_orig == 0:
+            new_spine += sorted_insights
+        elif n_ins == 0:
+            new_spine += clean_spine
+        else:
+            # Distribute insights evenly across original chapters
+            # If counts match exactly, pair 1:1.
+            # Otherwise insert an insight page after every k original pages.
+            k = max(1, n_orig // max(n_ins, 1))
+            ins_idx = 0
+            for i, sp in enumerate(clean_spine):
+                new_spine.append(sp)
+                # After every k-th original chapter, append the next insight
+                if ins_idx < n_ins and (i + 1) % k == 0:
+                    new_spine.append(sorted_insights[ins_idx])
+                    ins_idx += 1
+            # Append any remaining insights at the end
+            while ins_idx < n_ins:
+                new_spine.append(sorted_insights[ins_idx])
+                ins_idx += 1
+
+        book.spine = new_spine
+
+    # ── Rebuild ToC ───────────────────────────────────────────────────────────
+    is_arabic  = (language or "en").lower() == "ar"
+    toc_items: list = []
+
+    # Front-matter first
+    toc_items.append(epub.Link(front_item.file_name, front_item.title, front_item.id))
+
+    # Old ToC entries (minus any previously injected ones)
+    old_toc = [
+        entry for entry in (list(book.toc) if book.toc else [])
+        if hasattr(entry, "href") and not any(
+            entry.href.startswith(fn) for fn in injected_fnames
+        )
+    ]
+    toc_items += old_toc
+
+    # Chapter insights
+    insights_section_title = "تحليل الفصول" if is_arabic else "Chapter Insights"
+    if insight_items:
+        toc_items.append(epub.Section(insights_section_title, [
+            epub.Link(it.file_name, it.title, it.id)
+            for it in sorted(insight_items.values(), key=lambda x: x.file_name)
+        ]))
+
+    book.toc = tuple(toc_items)
+
+    # ── Write ─────────────────────────────────────────────────────────────────
     try:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         epub.write_epub(output_path, book)
+        size = Path(output_path).stat().st_size
+        log.info("Enriched EPUB written: %s (%d bytes)", output_path, size)
     except Exception as exc:
         raise EpubError(f"could not write enriched EPUB: {exc}") from exc
 
 
-# ── Public: async injection ──────────────────────────────────────────────────
+# ── Public async wrapper ──────────────────────────────────────────────────────
 
 async def inject_summary_into_epub(
-    epub_path:    str,
-    output_path:  str,
+    epub_path:       str | None,
+    output_path:     str,
     *,
-    title:        str,
-    author:       str,
-    summary_text: str,
-    language:     str,
-    cover_path:   str | None = None,
+    title:           str,
+    author:          str,
+    summary_text:    str,
+    language:        str,
+    cover_path:      str | None = None,
+    chapters:        list[dict] | None = None,
+    chapter_audio:   dict[int, str] | None = None,
+    chapter_mindmap: dict[int, dict] | None = None,
+    audio_url:       str | None = None,
+    mindmap_url:     str | None = None,
 ) -> str:
     """
-    Inject the summary (+ optional cover) into `epub_path`, write to
-    `output_path`.  Returns the output path.
-
-    Heavy work runs in the default executor so the pipeline event loop
-    stays responsive — ebooklib has no async API.
+    Inject AI content into `epub_path` (or create from scratch if None/missing).
+    Writes the enriched EPUB to `output_path` and returns the path.
+    Heavy ebooklib work runs in the executor to keep the event loop free.
     """
     loop = asyncio.get_running_loop()
     fn = functools.partial(
@@ -340,6 +593,9 @@ async def inject_summary_into_epub(
         epub_path, output_path,
         title=title, author=author, summary_text=summary_text,
         language=language, cover_path=cover_path,
+        chapters=chapters, chapter_audio=chapter_audio,
+        chapter_mindmap=chapter_mindmap,
+        audio_url=audio_url, mindmap_url=mindmap_url,
     )
     await loop.run_in_executor(None, fn)
     return output_path
