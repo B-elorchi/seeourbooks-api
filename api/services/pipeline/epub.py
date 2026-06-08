@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import re
 from html import escape
 from pathlib import Path
 from urllib.parse import quote
@@ -27,6 +28,40 @@ from urllib.parse import quote
 import httpx
 
 from api.config.settings import settings
+
+
+# ── Chapter-number parsing (for interleaving insights after the right chapter) ─
+
+_ROMAN_VALUES = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+
+
+def _roman_to_int(s: str) -> int | None:
+    s = s.lower().strip()
+    if not s or any(ch not in _ROMAN_VALUES for ch in s):
+        return None
+    total, prev = 0, 0
+    for ch in reversed(s):
+        val = _ROMAN_VALUES[ch]
+        total += -val if val < prev else val
+        prev = max(prev, val)
+    return total or None
+
+
+def _parse_chapter_num(title: str | None) -> int | None:
+    """Extract a chapter number from a title like 'CHAPTER XII. ...' or 'Chapter 7'."""
+    if not title:
+        return None
+    t = title.strip()
+    # "Chapter 12" / "Chapter XII"
+    m = re.search(r"chapter\s+([ivxlcdm]+|\d+)", t, re.IGNORECASE)
+    if m:
+        tok = m.group(1)
+        return int(tok) if tok.isdigit() else _roman_to_int(tok)
+    # Leading "12." or "12 "
+    m = re.match(r"\s*(\d+)[\.\s]", t)
+    if m:
+        return int(m.group(1))
+    return None
 
 log = logging.getLogger(__name__)
 
@@ -390,6 +425,16 @@ def _inject_sync(
     chapters        = chapters        or []
     chapter_audio   = chapter_audio   or {}
     chapter_mindmap = chapter_mindmap or {}
+    
+    # Debug logging
+    log.info("EPUB injection starting for %r", title)
+    log.info("  - summary length: %d chars", len(summary_text or ""))
+    log.info("  - cover: %s", cover_path if cover_path and Path(cover_path).is_file() else "None")
+    log.info("  - audio_url: %s", audio_url or "None")
+    log.info("  - mindmap_url: %s", mindmap_url or "None")
+    log.info("  - chapters: %d", len(chapters))
+    log.info("  - chapter_audio keys: %s", list(chapter_audio.keys()))
+    log.info("  - chapter_mindmap keys: %s", list(chapter_mindmap.keys()))
 
     # ── Load or create the EPUB book ─────────────────────────────────────────
     from_scratch = True
@@ -436,6 +481,7 @@ def _inject_sync(
             log.warning("Cover set failed (%s) — continuing", exc)
 
     # ── 2. Front-matter page ──────────────────────────────────────────────────
+    log.info("Building front matter page...")
     front_item = _build_front_matter(
         epub,
         slug=slug, title=title, author=author,
@@ -443,11 +489,16 @@ def _inject_sync(
         audio_url=audio_url, mindmap_url=mindmap_url,
     )
     book.add_item(front_item)
+    log.info("Front matter page added: %s", front_item.file_name)
 
     # ── 3. Per-chapter insights pages ─────────────────────────────────────────
     # Build a map: chapter index → insights item
+    log.info("Building chapter insight pages...")
     insight_items: dict[int, object] = {}
     for ch in chapters:
+        ch_index = ch.get("index", 0)
+        ch_summary = (ch.get("summary") or "").strip()
+        log.info("  Chapter %d: title=%r, has_summary=%s", ch_index, ch.get("title"), bool(ch_summary))
         item = _build_chapter_insights(
             epub,
             slug=slug, ch=ch, language=language,
@@ -456,104 +507,135 @@ def _inject_sync(
         )
         if item:
             book.add_item(item)
-            insight_items[ch.get("index", 0)] = item
+            insight_items[ch_index] = item
+            log.info("    -> insight page added: %s", item.file_name)
+        else:
+            log.info("    -> no insight page (no summary)")
+    log.info("Total insight pages: %d", len(insight_items))
 
     # ── Rebuild spine ─────────────────────────────────────────────────────────
-    # Strategy:
-    #   • Remove any previously injected seeourbook pages from the spine
-    #   • Put front-matter first (after "nav")
-    #   • For existing EPUBs: interleave insight pages after each original chapter
-    #   • For from-scratch EPUBs: list front + insights in chapter order
-
+    # Goal:
+    #   nav → front-matter → [orig chapter, its insight, orig chapter, its insight…]
+    # We normalise the original spine (which after read_epub is a list of
+    # (idref, linear) tuples) into resolved item objects, drop nav/cover and any
+    # previously-injected pages, then interleave each insight right AFTER the
+    # original chapter whose number matches the insight's chapter index.
+    is_arabic       = (language or "en").lower() == "ar"
     injected_fnames = {front_item.file_name} | {
         it.file_name for it in insight_items.values()
     }
 
-    def _spine_fname(sp) -> str | None:
-        """Extract the filename from a spine entry regardless of its type."""
-        if isinstance(sp, str):
-            return sp
-        if isinstance(sp, tuple):
-            sp = sp[0]
-        return getattr(sp, "file_name", None)
+    def _resolve_spine_entry(sp):
+        """Return (item_or_idref, fname). Resolves idref strings to item objects."""
+        idref = sp[0] if isinstance(sp, tuple) else sp
+        if isinstance(idref, str):
+            item = book.get_item_with_id(idref)
+            if item is not None:
+                return item, getattr(item, "file_name", None)
+            return idref, idref          # unresolved special (e.g. "nav")
+        # already an item object
+        return idref, getattr(idref, "file_name", None)
 
-    # Clean old spine of injected pages
-    clean_spine = [
-        sp for sp in book.spine
-        if (_spine_fname(sp) or "") not in injected_fnames
-        and sp not in ("nav", "cover")
+    # Build a map: file_name → chapter number, from the original ToC titles.
+    fname_to_num: dict[str, int] = {}
+    def _walk_toc(entries):
+        for e in entries or []:
+            if isinstance(e, tuple):                 # (Section, [children])
+                _walk_toc(e[1])
+            else:
+                href  = getattr(e, "href", "") or ""
+                fname = href.split("#", 1)[0]
+                num   = _parse_chapter_num(getattr(e, "title", ""))
+                if fname and num is not None:
+                    fname_to_num.setdefault(fname, num)
+    _walk_toc(list(book.toc) if book.toc else [])
+
+    # Normalise original spine → ordered list of resolved content items
+    try:
+        from ebooklib.epub import EpubNav, EpubNcx
+    except Exception:  # pragma: no cover
+        EpubNav = EpubNcx = ()  # type: ignore
+
+    orig_items: list = []
+    for sp in book.spine:
+        idref = sp[0] if isinstance(sp, tuple) else sp
+        # Skip nav/cover by their special idref before resolving
+        if isinstance(idref, str) and idref.lower() in ("nav", "cover"):
+            continue
+        item, fname = _resolve_spine_entry(sp)
+        # Skip nav/cover documents and anything we injected
+        if fname in (None, "nav", "cover", "nav.xhtml"):
+            continue
+        if EpubNav and isinstance(item, (EpubNav, EpubNcx)):
+            continue
+        if (fname or "") in injected_fnames:
+            continue
+        orig_items.append((item, fname))
+
+    # insights sorted by chapter index
+    sorted_chs = sorted(chapters, key=lambda c: c.get("index", 0))
+    insights_in_order = [
+        (ch.get("index", 0), insight_items[ch.get("index", 0)])
+        for ch in sorted_chs
+        if ch.get("index", 0) in insight_items
     ]
+    insight_by_num = {idx: it for idx, it in insights_in_order}
 
-    if from_scratch or not clean_spine:
-        # From scratch: front-matter then chapters in order
-        new_spine: list = ["nav", front_item]
-        for ch in sorted(chapters, key=lambda c: c.get("index", 0)):
-            item = insight_items.get(ch.get("index", 0))
-            if item:
-                new_spine.append(item)
-        book.spine = new_spine
+    new_spine: list = ["nav", front_item]
+    used_nums: set[int] = set()
+
+    if orig_items:
+        # Interleave: append each original chapter, then its matching insight
+        for item, fname in orig_items:
+            new_spine.append(item)
+            num = fname_to_num.get(fname or "")
+            if num is not None and num in insight_by_num and num not in used_nums:
+                new_spine.append(insight_by_num[num])
+                used_nums.add(num)
+        # Any insights we couldn't match → append at the end in order
+        for idx, it in insights_in_order:
+            if idx not in used_nums:
+                new_spine.append(it)
     else:
-        # Existing EPUB: insert insights after every N-th original chapter
-        # We split the clean_spine into chapter-sized groups and interleave.
-        # Heuristic: treat each existing spine item as one book chapter,
-        # and pair it with insight_items by position.
-        new_spine = ["nav", front_item]
-        sorted_insights = [
-            insight_items[ch.get("index", 0)]
-            for ch in sorted(chapters, key=lambda c: c.get("index", 0))
-            if ch.get("index", 0) in insight_items
-        ]
-        n_orig = len(clean_spine)
-        n_ins  = len(sorted_insights)
+        # From scratch (no original content): front then all insights in order
+        for idx, it in insights_in_order:
+            new_spine.append(it)
 
-        if n_orig == 0:
-            new_spine += sorted_insights
-        elif n_ins == 0:
-            new_spine += clean_spine
-        else:
-            # Distribute insights evenly across original chapters
-            # If counts match exactly, pair 1:1.
-            # Otherwise insert an insight page after every k original pages.
-            k = max(1, n_orig // max(n_ins, 1))
-            ins_idx = 0
-            for i, sp in enumerate(clean_spine):
-                new_spine.append(sp)
-                # After every k-th original chapter, append the next insight
-                if ins_idx < n_ins and (i + 1) % k == 0:
-                    new_spine.append(sorted_insights[ins_idx])
-                    ins_idx += 1
-            # Append any remaining insights at the end
-            while ins_idx < n_ins:
-                new_spine.append(sorted_insights[ins_idx])
-                ins_idx += 1
-
-        book.spine = new_spine
+    book.spine = new_spine
+    log.info("EPUB spine rebuilt with %d items", len(new_spine))
 
     # ── Rebuild ToC ───────────────────────────────────────────────────────────
-    is_arabic  = (language or "en").lower() == "ar"
-    toc_items: list = []
-
-    # Front-matter first
-    toc_items.append(epub.Link(front_item.file_name, front_item.title, front_item.id))
-
-    # Old ToC entries (minus any previously injected ones)
-    old_toc = [
-        entry for entry in (list(book.toc) if book.toc else [])
-        if hasattr(entry, "href") and not any(
-            entry.href.startswith(fn) for fn in injected_fnames
-        )
+    toc_items: list = [
+        epub.Link(front_item.file_name, front_item.title, front_item.id)
     ]
-    toc_items += old_toc
 
-    # Chapter insights
-    insights_section_title = "تحليل الفصول" if is_arabic else "Chapter Insights"
+    # Keep the original ToC structure (minus any previously-injected pages)
+    def _clean_toc(entries):
+        out = []
+        for e in entries or []:
+            if isinstance(e, tuple):
+                sec, kids = e
+                out.append((sec, _clean_toc(kids)))
+            elif hasattr(e, "href") and e.href.split("#", 1)[0] not in injected_fnames:
+                out.append(e)
+        return out
+    toc_items += _clean_toc(list(book.toc) if book.toc else [])
+
+    # Chapter insights section (also navigable as a group).
+    # Nested ToC sections must be a (Section, [children]) tuple — NOT a bare
+    # Section (whose 2nd ctor arg is an href, not a child list).
     if insight_items:
-        toc_items.append(epub.Section(insights_section_title, [
-            epub.Link(it.file_name, it.title, it.id)
-            for it in sorted(insight_items.values(), key=lambda x: x.file_name)
-        ]))
+        insights_section_title = "تحليل الفصول" if is_arabic else "Chapter Insights"
+        toc_items.append((
+            epub.Section(insights_section_title),
+            [
+                epub.Link(it.file_name, it.title, it.id)
+                for _, it in insights_in_order
+            ],
+        ))
 
     book.toc = tuple(toc_items)
+    log.info("EPUB ToC rebuilt with %d items", len(toc_items))
 
     # ── Write ─────────────────────────────────────────────────────────────────
     try:

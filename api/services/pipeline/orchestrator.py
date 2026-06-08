@@ -53,7 +53,7 @@ class JobCancelledError(Exception):
     pass
 
 
-def _resolve_steps(requested: list[str] | None) -> set[str]:
+def _resolve_steps(requested: list[str] | None, previous_result: dict | None = None) -> set[str]:
     """Return the full set of steps to run, including auto-added dependencies."""
     # If requested is None or empty list, run all steps
     # If requested has specific steps, run only those (plus dependencies)
@@ -61,14 +61,25 @@ def _resolve_steps(requested: list[str] | None) -> set[str]:
     if requested is None or len(requested) == 0:
         return set(ALL_STEPS)
     steps = set(requested)
-    # Enforce dependencies
+    
+    # Check if we have summary data from previous result
+    has_summary = False
+    if previous_result:
+        _prev = previous_result if isinstance(previous_result, dict) else {}
+        _psums = _prev.get("summaries") or {}
+        if _psums:
+            _first_sum = next(iter(_psums.values()), {})
+            has_summary = bool(_first_sum.get("text"))
+    
+    # Enforce dependencies (skip if data already available from previous result)
     if "audio_full" in steps or "audio_chapters" in steps:
         steps.add("summarize")
     if "mindmap" in steps or "mindmap_chapters" in steps:
         steps.add("summarize")
     if "alt_text" in steps:
         steps.add("cover")
-    if "inject_epub" in steps:
+    if "inject_epub" in steps and not has_summary:
+        # Only require summarize if we don't have summary data from previous result
         steps.add("summarize")
     if "video" in steps:
         steps.add("summarize")
@@ -399,7 +410,18 @@ async def run_pipeline(
 
     started = time.time()
     cfg     = await get_all_config()
-    steps   = _resolve_steps(req.steps)
+    
+    # Parse previous_result for dependency resolution
+    _prev_parsed = None
+    if previous_result:
+        _prev_parsed = previous_result if isinstance(previous_result, dict) else {}
+        if isinstance(previous_result, str):
+            try:
+                _prev_parsed = json_module.loads(previous_result)
+            except Exception:
+                _prev_parsed = {}
+    
+    steps   = _resolve_steps(req.steps, _prev_parsed)
     log.info("Job %s: req.steps=%s, resolved_steps=%s", job_id, req.steps, steps)
     errors: dict[str, str]   = {}
     step_status: dict[str, str] = {s: "skipped" for s in ALL_STEPS}
@@ -450,6 +472,7 @@ async def run_pipeline(
             _first_sum = next(iter(_psums.values()), {})
             full_summary  = _first_sum.get("text", "")
             quick_summary = _prev.get("quick_summary", "")
+            log.info("Loaded summary from previous result: %s chars", len(full_summary) if full_summary else 0)
 
         # Chapter audio & mindmaps
         for _fc in _pfiles.get("chapters") or []:
@@ -468,6 +491,7 @@ async def run_pipeline(
         # Chapter results (summaries)
         if not chapter_results and _prev.get("chapters"):
             chapter_results = [dict(ch) for ch in _prev["chapters"]]
+            log.info("Loaded %d chapters from previous result", len(chapter_results))
 
     # ── Live checkpoint ───────────────────────────────────────────────────────
     async def _checkpoint() -> None:
@@ -1097,7 +1121,11 @@ async def run_pipeline(
         # ── inject_epub ── PHASE 4: runs LAST so it has ALL assets ────────────
         async def _do_inject_epub() -> None:
             nonlocal epub_url
+            log.info("_do_inject_epub called: inject_epub in steps=%s, epub_enabled=%s, has_full_summary=%s", 
+                     "inject_epub" in steps, epub_enabled, bool(full_summary))
             if "inject_epub" not in steps or not epub_enabled or not full_summary:
+                log.info("_do_inject_epub skipped: steps=%s, epub_enabled=%s, full_summary=%s", 
+                         steps, epub_enabled, bool(full_summary))
                 return
             step_status["inject_epub"] = "running"
             set_step("inject_epub")
@@ -1118,6 +1146,17 @@ async def run_pipeline(
                     log.info("inject_epub: no BOOK_FILES_BASE_URL — creating EPUB from scratch")
 
                 out_path = os.path.join(tmp, f"{req.book_id}_{req.language}.epub")
+                
+                # Debug logging for EPUB injection
+                log.info("Injecting EPUB for book %s", req.book_id)
+                log.info("  - chapter_results count: %d", len(chapter_results))
+                log.info("  - chapter_results with summaries: %d", sum(1 for ch in chapter_results if ch.get("summary")))
+                log.info("  - chapter_audio keys: %s", list(chapter_audio.keys()))
+                log.info("  - chapter_mindmap keys: %s", list(chapter_mindmap.keys()))
+                log.info("  - full_audio: %s", (full_audio or {}).get("url", "None"))
+                log.info("  - mindmap_url: %s", mindmap_url or "None")
+                log.info("  - cover_path: %s", cover_path_saved if cover_url else "None")
+                
                 await inject_summary_into_epub(
                     src_path,
                     out_path,
