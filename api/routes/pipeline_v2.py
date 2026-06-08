@@ -46,7 +46,7 @@ from pydantic import BaseModel
 from api.jobs.store import create_job, set_failed, set_cancelled, is_cancelled
 from api.models.requests import PipelineReq, PipelineOptions, VALID_STEPS
 from api.routes.pipeline import _run_job, JobCancelledError
-from api.services.db import find, insert, upsert
+from api.services.db import find, insert, upsert, update
 from api.services.config.runtime import get_config_value
 
 log = logging.getLogger(__name__)
@@ -143,6 +143,27 @@ async def _ingest_then_run(
     ensure the book row exists, then hand off to the normal pipeline runner.
     Any ingest error is written to the job so the client can see it.
     """
+    # Flip the job to "running" right away with an "ingest" marker so the UI
+    # doesn't show it stuck in "queued" during the (potentially long) download +
+    # text-extraction + chunk-insert phase that happens before _run_job starts.
+    try:
+        await update(
+            "pipeline_jobs",
+            {"id": job_id},
+            {
+                "status": "running",
+                "result": {
+                    "book_id":      book_id,
+                    "status":       "running",
+                    "current_step": "ingest",
+                    "running_steps": ["ingest"],
+                    "steps":        {},
+                },
+            },
+        )
+    except Exception as exc:
+        log.debug("v2: could not set ingest-running status for %s: %s", job_id, exc)
+
     try:
         ingest_status, _chunks, _meta, final_row = await _ensure_chunks(
             book_id, bid, book_row, req.language

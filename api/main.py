@@ -21,50 +21,59 @@ async def lifespan(app: FastAPI):
 
 async def _recover_stuck_jobs() -> None:
     """
-    On startup, handle jobs that were left in 'running' state from a previous
-    server instance. 
-    
-    - If job has retries remaining: mark as 'queued' to auto-retry
-    - If job has no retries left: mark as 'failed' with cancellation message
-    
-    The job's partial result is preserved so successful steps don't need to re-run.
+    On startup, recover jobs orphaned by a previous server instance.
+
+    Both 'running' and 'queued' jobs are lost on restart because their
+    background task lived only in the old process's event loop. We RE-DISPATCH
+    them as fresh asyncio tasks here so they actually resume — simply flipping
+    the DB status to 'queued' is not enough (nothing polls the queue).
+
+    The job's partial result is passed back as previous_result, so the
+    merge-aware retry skips steps that already finished.
     """
+    import asyncio
     import logging
     from api.services.db import find, update
     from api.jobs.store import can_retry
+    from api.routes.pipeline import _run_job          # local import avoids cycle
+    from api.models.requests import PipelineReq
     log = logging.getLogger(__name__)
+
     try:
-        stuck = await find("pipeline_jobs", filters={"status": "running"}, limit=100)
-        if stuck:
-            log.warning("Recovering %d stuck 'running' job(s) from previous server instance", len(stuck))
-            for job in stuck:
-                try:
-                    job_id = job["id"]
-                    if can_retry(job):
-                        # Job can retry - put it back in queue
-                        # The retry logic will use the partial result to skip successful steps
-                        await update(
-                            "pipeline_jobs",
-                            filters={"id": job_id},
-                            data={
-                                "status": "queued", 
-                                "error_msg": "Server restarted — will retry automatically"
-                            },
-                        )
-                        log.info("Job %s queued for auto-retry (retry_count=%s)", job_id, job.get("retry_count", 0))
-                    else:
-                        # No retries left - mark as failed/cancelled
-                        await update(
-                            "pipeline_jobs",
-                            filters={"id": job_id},
-                            data={
-                                "status": "failed", 
-                                "error_msg": "Server restarted while job was running — max retries exceeded"
-                            },
-                        )
-                        log.warning("Job %s marked as failed (max retries exceeded)", job_id)
-                except Exception as exc:
-                    log.error("Could not recover job %s: %s", job["id"], exc)
+        stuck = []
+        for status in ("running", "queued"):
+            try:
+                stuck += await find("pipeline_jobs", filters={"status": status}, limit=100)
+            except Exception as exc:
+                log.warning("Could not query '%s' jobs on startup: %s", status, exc)
+
+        if not stuck:
+            return
+
+        log.warning("Recovering %d orphaned job(s) from previous server instance", len(stuck))
+        for job in stuck:
+            job_id = job["id"]
+            try:
+                if not can_retry(job):
+                    await update(
+                        "pipeline_jobs",
+                        filters={"id": job_id},
+                        data={
+                            "status": "failed",
+                            "error_msg": "Server restarted — max retries exceeded",
+                        },
+                    )
+                    log.warning("Job %s marked failed (max retries exceeded)", job_id)
+                    continue
+
+                req = PipelineReq.model_validate(job.get("input") or {})
+                # Re-dispatch: resumes from the stored partial result.
+                asyncio.create_task(
+                    _run_job(job_id, req, job.get("result"), False)
+                )
+                log.info("Re-dispatched job %s (was %s)", job_id, job.get("status"))
+            except Exception as exc:
+                log.error("Could not recover job %s: %s", job_id, exc)
     except Exception as exc:
         log.warning("Could not check for stuck jobs on startup: %s", exc)
 
