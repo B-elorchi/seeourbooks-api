@@ -229,24 +229,36 @@ async def _dispatch_tts(
             )
         await _cartesia(text, voice, language, cfg, output_path)
     elif provider == "gemini":
-        if not settings.OPENROUTER_API_KEY:
+        if not (settings.GEMINI_API_KEY or settings.OPENROUTER_API_KEY):
             raise ValueError(
-                "OPENROUTER_API_KEY is not set. Gemini TTS routes through OpenRouter — "
-                "add OPENROUTER_API_KEY to your .env file. Get one at https://openrouter.ai/keys."
+                "GEMINI_API_KEY (or OPENROUTER_API_KEY as fallback) is not set. "
+                "Gemini TTS uses the native Google API — get a key at https://aistudio.google.com/app/apikey"
             )
         gemini_model = cfg.get("GEMINI_TTS_MODEL") or settings.GEMINI_TTS_MODEL
         await _gemini(text, voice, language, gemini_model, output_path)
     elif provider == "openrouter":
-        if not settings.OPENROUTER_API_KEY:
-            raise ValueError(
-                "OPENROUTER_API_KEY is not set. OpenRouter TTS requires it — "
-                "add OPENROUTER_API_KEY to your .env file. Get one at https://openrouter.ai/keys."
-            )
         or_model = cfg.get("OPENROUTER_TTS_MODEL") or settings.OPENROUTER_TTS_MODEL
         or_voice = cfg.get("OPENROUTER_TTS_VOICE") or settings.OPENROUTER_TTS_VOICE
-        # Use the admin voice if set, otherwise fall back to the default OpenRouter voice
-        chosen_voice = voice or or_voice
-        await _gemini(text, chosen_voice, language, or_model, output_path)
+
+        # If the configured model is a Gemini TTS model, route through native
+        # Google API instead of OpenRouter. OpenRouter doesn't list Gemini TTS
+        # models in their catalog, but the native Gemini API supports them.
+        if "gemini" in or_model.lower() and "tts" in or_model.lower():
+            if not (settings.GEMINI_API_KEY or settings.OPENROUTER_API_KEY):
+                raise ValueError(
+                    "GEMINI_API_KEY (or OPENROUTER_API_KEY as fallback) is not set. "
+                    "Gemini TTS uses the native Google API — get a key at https://aistudio.google.com/app/apikey"
+                )
+            await _gemini(text, or_voice, language, or_model, output_path)
+        else:
+            if not settings.OPENROUTER_API_KEY:
+                raise ValueError(
+                    "OPENROUTER_API_KEY is not set. OpenRouter TTS requires it — "
+                    "add OPENROUTER_API_KEY to your .env file. Get one at https://openrouter.ai/keys."
+                )
+            # Always use the OpenRouter-specific voice setting — ignore the generic
+            # TTS_VOICE_* which may hold a Cartesia/ElevenLabs UUID incompatible with OpenRouter.
+            await _openrouter_tts(text, or_voice, language, or_model, output_path)
     else:
         raise ValueError(f"Unknown TTS provider: {provider!r}")
 
@@ -375,24 +387,109 @@ async def _cartesia(text: str, voice: str, language: str, cfg: dict, output_path
 
 async def _gemini(text: str, voice: str, language: str, model: str, output_path: str) -> None:
     """
-    Google Gemini Flash 2.5 TTS via OpenRouter.
+    Google Gemini TTS via the native Gemini API (generativelanguage.googleapis.com).
 
-    Uses the OpenAI-compatible chat/completions endpoint with audio modality.
+    Uses the Gemini 2.5 Flash native speech-generation endpoint.
     Gemini natively supports Arabic + 30+ other languages.
 
     Voices: Kore, Charon, Puck, Fenrir, Aoede, Leda, Orus, Zephyr (and more).
     See https://ai.google.dev/gemini-api/docs/speech-generation for the full list.
 
-    The model parameter should be a Gemini TTS-capable variant, e.g.
-    'google/gemini-2.5-flash-preview-tts' (default).
+    Requires GEMINI_API_KEY to be set. Falls back to OPENROUTER_API_KEY if
+    GEMINI_API_KEY is not available (for backward compatibility).
     """
     chosen_voice = voice or "Kore"   # Kore is the default Gemini voice
 
+    # Use GEMINI_API_KEY if available, otherwise fall back to OPENROUTER_API_KEY
+    api_key = settings.GEMINI_API_KEY or settings.OPENROUTER_API_KEY
+    if not api_key:
+        raise ValueError(
+            "GEMINI_API_KEY (or OPENROUTER_API_KEY as fallback) is not set. "
+            "Get a Gemini API key at https://aistudio.google.com/app/apikey"
+        )
+
+    # Normalize model name — strip 'google/' prefix if present
+    gemini_model = model.split("/", 1)[1] if "/" in model else model
+
     payload = {
-        "model":    model,
+        "contents": [
+            {
+                "parts": [
+                    {"text": text},
+                ]
+            }
+        ],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {
+                        "voiceName": chosen_voice,
+                    }
+                }
+            },
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=180) as client:
+        r = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent",
+            headers={"Content-Type": "application/json"},
+            params={"key": api_key},
+            json=payload,
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"Gemini TTS returned {r.status_code}: {r.text[:500]} "
+                f"(model={gemini_model}, voice={chosen_voice}, language={language})"
+            )
+        data = r.json()
+
+    # Extract base64-encoded audio from Gemini native response shape:
+    #   candidates[0].content.parts[0].inlineData.data
+    audio_b64: str | None = None
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        for part in parts:
+            inline_data = part.get("inlineData")
+            if inline_data and inline_data.get("mimeType", "").startswith("audio/"):
+                audio_b64 = inline_data.get("data")
+                break
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            f"Gemini TTS returned an unexpected response shape: {data!r}"
+        ) from exc
+
+    if not audio_b64:
+        raise RuntimeError(
+            "Gemini TTS response did not contain audio data. "
+            f"Make sure {gemini_model!r} supports audio output. "
+            f"Response excerpt: {str(data)[:400]}"
+        )
+
+    with open(output_path, "wb") as f:
+        f.write(base64.b64decode(audio_b64))
+
+
+async def _openrouter_tts(text: str, voice: str, language: str, model: str, output_path: str) -> None:
+    """
+    TTS via OpenRouter using OpenAI-compatible audio models.
+
+    Supported models on OpenRouter with audio output:
+      - openai/gpt-audio
+      - openai/gpt-audio-mini
+
+    These models use the standard chat/completions endpoint with modalities.
+    Voices are model-specific; for OpenAI audio models use: alloy, echo, fable,
+    onyx, nova, shimmer.
+    """
+    chosen_voice = voice or "alloy"
+
+    payload = {
+        "model": model,
         "messages": [{"role": "user", "content": text}],
-        "modalities": ["audio"],
-        "audio":    {"voice": chosen_voice, "format": "mp3"},
+        "modalities": ["audio", "text"],
+        "audio": {"voice": chosen_voice, "format": "mp3"},
     }
 
     async with httpx.AsyncClient(timeout=180) as client:
@@ -408,19 +505,18 @@ async def _gemini(text: str, voice: str, language: str, model: str, output_path:
         )
         if r.status_code >= 400:
             raise RuntimeError(
-                f"Gemini TTS via OpenRouter returned {r.status_code}: {r.text[:500]} "
+                f"OpenRouter TTS returned {r.status_code}: {r.text[:500]} "
                 f"(model={model}, voice={chosen_voice}, language={language})"
             )
         data = r.json()
 
-    # Extract base64-encoded audio. Standard OpenAI-compatible shape:
+    # Extract base64-encoded audio from OpenAI-compatible response shape:
     #   choices[0].message.audio.data
     audio_b64: str | None = None
     try:
         msg = data["choices"][0]["message"]
         audio_b64 = msg.get("audio", {}).get("data")
         if not audio_b64:
-            # Fallback: some providers return audio inside content blocks
             content = msg.get("content")
             if isinstance(content, list):
                 for block in content:
@@ -430,12 +526,12 @@ async def _gemini(text: str, voice: str, language: str, model: str, output_path:
                             break
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(
-            f"Gemini TTS returned an unexpected response shape: {data!r}"
+            f"OpenRouter TTS returned an unexpected response shape: {data!r}"
         ) from exc
 
     if not audio_b64:
         raise RuntimeError(
-            "Gemini TTS response did not contain audio data. "
+            "OpenRouter TTS response did not contain audio data. "
             f"Make sure {model!r} supports audio output on OpenRouter. "
             f"Response excerpt: {str(data)[:400]}"
         )

@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # Setting any MODEL_* to an OpenRouter name automatically routes via OpenRouter.
     OPENROUTER_API_KEY: str = ""
 
+    # Native Gemini API key (for TTS, image generation, etc.)
+    # Get one at https://aistudio.google.com/app/apikey
+    # Falls back to OPENROUTER_API_KEY if not set.
+    GEMINI_API_KEY: str = ""
+
     # ── Text files ────────────────────────────────────────────────────────────
     TEXT_DIR: Path = Path("/path/to/text/files")
 
@@ -70,13 +75,16 @@ class Settings(BaseSettings):
     # See https://docs.cartesia.ai/build-with-cartesia/models for current snapshots.
     CARTESIA_MODEL:        str = "sonic-3.5-2026-05-04"
 
-    # Gemini TTS via OpenRouter — supports Arabic + 30+ languages natively.
+    # Gemini TTS via native Google API — supports Arabic + 30+ languages natively.
     # Set TTS_PROVIDER_AR='gemini' to use. Voice defaults to 'Kore'.
-    GEMINI_TTS_MODEL:      str = "google/gemini-2.5-flash-preview-tts"
+    # Requires GEMINI_API_KEY (or falls back to OPENROUTER_API_KEY).
+    # Model names: gemini-2.5-flash-preview-tts, gemini-3.1-flash-tts-preview
+    GEMINI_TTS_MODEL:      str = "gemini-2.5-flash-preview-tts"
 
     # OpenRouter TTS — any TTS-capable model on OpenRouter.
-    # Popular models: google/gemini-2.5-flash-preview-tts, google/gemini-2.5-pro-preview-tts
-    OPENROUTER_TTS_MODEL:  str = "google/gemini-2.5-flash-preview-tts"
+    # NOTE: OpenRouter does NOT support Gemini TTS. Use OpenAI audio models instead:
+    #   openai/gpt-audio, openai/gpt-audio-mini
+    OPENROUTER_TTS_MODEL:  str = "openai/gpt-audio-mini"
     # Default voice for OpenRouter TTS (provider-specific).
     # Gemini voices: Kore, Charon, Puck, Fenrir, Aoede, Leda, Orus, Zephyr
     OPENROUTER_TTS_VOICE:  str = "Kore"
