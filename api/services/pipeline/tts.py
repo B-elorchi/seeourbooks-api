@@ -235,7 +235,10 @@ async def _dispatch_tts(
                 "Gemini TTS uses the native Google API — get a key at https://aistudio.google.com/app/apikey"
             )
         gemini_model = cfg.get("GEMINI_TTS_MODEL") or settings.GEMINI_TTS_MODEL
-        await _gemini(text, voice, language, gemini_model, output_path)
+        gemini_voice = cfg.get("GEMINI_TTS_VOICE") or settings.GEMINI_TTS_VOICE
+        # Always use the Gemini-specific voice — ignore the generic TTS_VOICE_*
+        # which may hold a Cartesia/ElevenLabs UUID incompatible with Gemini.
+        await _gemini(text, gemini_voice, language, gemini_model, output_path)
     elif provider == "openrouter":
         or_model = cfg.get("OPENROUTER_TTS_MODEL") or settings.OPENROUTER_TTS_MODEL
         or_voice = cfg.get("OPENROUTER_TTS_VOICE") or settings.OPENROUTER_TTS_VOICE

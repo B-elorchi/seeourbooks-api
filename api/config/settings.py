@@ -80,6 +80,7 @@ class Settings(BaseSettings):
     # Requires GEMINI_API_KEY (or falls back to OPENROUTER_API_KEY).
     # Model names: gemini-2.5-flash-preview-tts, gemini-3.1-flash-tts-preview
     GEMINI_TTS_MODEL:      str = "gemini-2.5-flash-preview-tts"
+    GEMINI_TTS_VOICE:      str = "Kore"
 
     # OpenRouter TTS — any TTS-capable model on OpenRouter.
     # NOTE: OpenRouter does NOT support Gemini TTS. Use OpenAI audio models instead:
