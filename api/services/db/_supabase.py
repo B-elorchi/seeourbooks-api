@@ -3,8 +3,15 @@ Supabase REST backend for the unified DB interface.
 Translates find/insert/upsert/update into Supabase PostgREST HTTP calls.
 """
 from typing import Any
+from urllib.parse import quote
 import httpx
 from api.config.settings import settings
+
+
+def _enc(val: Any) -> str:
+    """URL-encode a filter value so characters like '+' ':' in ISO timestamps
+    aren't mangled by the server (PostgREST decodes a raw '+' as a space)."""
+    return quote(str(val), safe="")
 
 _HEADERS: dict = {}
 _BASE: str = ""
@@ -30,12 +37,12 @@ def _build_path(table: str, filters: dict | None, select: str, order: str | None
             if isinstance(val, tuple) and val[0] in ("in", "gte", "lte", "gt", "lt", "neq"):
                 op, raw = val[0], val[1]
                 if op == "in":
-                    joined = ",".join(str(v) for v in raw)
+                    joined = ",".join(_enc(v) for v in raw)
                     parts.append(f"{col}=in.({joined})")
                 else:
-                    parts.append(f"{col}={op}.{raw}")
+                    parts.append(f"{col}={op}.{_enc(raw)}")
             else:
-                parts.append(f"{col}=eq.{val}")
+                parts.append(f"{col}=eq.{_enc(val)}")
 
     if order:
         # Accept "col DESC" or "col ASC" — convert to Supabase "col.desc"
@@ -136,7 +143,7 @@ async def upsert(table: str, data: dict, conflict: str) -> dict:
 async def update(table: str, filters: dict, data: dict) -> None:
     _init()
     data = _strip_nul(data)
-    parts = [f"{col}=eq.{val}" for col, val in filters.items()]
+    parts = [f"{col}=eq.{_enc(val)}" for col, val in filters.items()]
     path = f"{table}?{'&'.join(parts)}"
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.patch(f"{_BASE}/{path}", headers=_HEADERS, json=data)
@@ -145,7 +152,7 @@ async def update(table: str, filters: dict, data: dict) -> None:
 
 async def delete(table: str, filters: dict) -> None:
     _init()
-    parts = [f"{col}=eq.{val}" for col, val in filters.items()]
+    parts = [f"{col}=eq.{_enc(val)}" for col, val in filters.items()]
     path = f"{table}?{'&'.join(parts)}"
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.delete(f"{_BASE}/{path}", headers=_HEADERS)
