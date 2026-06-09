@@ -240,28 +240,16 @@ async def _dispatch_tts(
         # which may hold a Cartesia/ElevenLabs UUID incompatible with Gemini.
         await _gemini(text, gemini_voice, language, gemini_model, output_path)
     elif provider == "openrouter":
+        if not settings.OPENROUTER_API_KEY:
+            raise ValueError(
+                "OPENROUTER_API_KEY is not set. OpenRouter TTS requires it — "
+                "add OPENROUTER_API_KEY to your .env file. Get one at https://openrouter.ai/keys."
+            )
         or_model = cfg.get("OPENROUTER_TTS_MODEL") or settings.OPENROUTER_TTS_MODEL
         or_voice = cfg.get("OPENROUTER_TTS_VOICE") or settings.OPENROUTER_TTS_VOICE
-
-        # If the configured model is a Gemini TTS model, route through native
-        # Google API instead of OpenRouter. OpenRouter doesn't list Gemini TTS
-        # models in their catalog, but the native Gemini API supports them.
-        if "gemini" in or_model.lower() and "tts" in or_model.lower():
-            if not (settings.GEMINI_API_KEY or settings.OPENROUTER_API_KEY):
-                raise ValueError(
-                    "GEMINI_API_KEY (or OPENROUTER_API_KEY as fallback) is not set. "
-                    "Gemini TTS uses the native Google API — get a key at https://aistudio.google.com/app/apikey"
-                )
-            await _gemini(text, or_voice, language, or_model, output_path)
-        else:
-            if not settings.OPENROUTER_API_KEY:
-                raise ValueError(
-                    "OPENROUTER_API_KEY is not set. OpenRouter TTS requires it — "
-                    "add OPENROUTER_API_KEY to your .env file. Get one at https://openrouter.ai/keys."
-                )
-            # Always use the OpenRouter-specific voice setting — ignore the generic
-            # TTS_VOICE_* which may hold a Cartesia/ElevenLabs UUID incompatible with OpenRouter.
-            await _openrouter_tts(text, or_voice, language, or_model, output_path)
+        # Always use the OpenRouter-specific voice setting — ignore the generic
+        # TTS_VOICE_* which may hold a Cartesia/ElevenLabs UUID incompatible with OpenRouter.
+        await _openrouter_tts(text, or_voice, language, or_model, output_path)
     else:
         raise ValueError(f"Unknown TTS provider: {provider!r}")
 
@@ -474,70 +462,61 @@ async def _gemini(text: str, voice: str, language: str, model: str, output_path:
         f.write(base64.b64decode(audio_b64))
 
 
+# Valid OpenAI audio voices for gpt-audio / gpt-audio-mini
+_OPENAI_AUDIO_VOICES: set[str] = {
+    "alloy", "echo", "fable", "onyx", "nova", "shimmer",
+    "coral", "verse", "ballad", "ash", "sage", "marin", "cedar",
+}
+
+
 async def _openrouter_tts(text: str, voice: str, language: str, model: str, output_path: str) -> None:
     """
-    TTS via OpenRouter using OpenAI-compatible audio models.
+    TTS via OpenRouter's dedicated speech endpoint (OpenAI-compatible):
 
-    Supported models on OpenRouter with audio output:
-      - openai/gpt-audio
-      - openai/gpt-audio-mini
+        POST https://openrouter.ai/api/v1/audio/speech
+        { "model": ..., "input": ..., "voice": ... }
 
-    These models use the standard chat/completions endpoint with modalities.
-    Voices are model-specific; for OpenAI audio models use: alloy, echo, fable,
-    onyx, nova, shimmer.
+    The response body is the raw audio file (mp3) — NOT JSON. This endpoint
+    supports both OpenAI audio models (openai/gpt-audio…) AND Google Gemini TTS
+    models (google/gemini-*-tts-*) with OpenAI voice names like "alloy".
+
+    NOTE: the chat/completions endpoint with modalities=["audio","text"] does
+    NOT work for these models — it returns "No endpoints found that support the
+    requested output modalities", which is why we use /audio/speech here.
     """
     chosen_voice = voice or "alloy"
 
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": text}],
-        "modalities": ["audio", "text"],
-        "audio": {"voice": chosen_voice, "format": "mp3"},
+        "input": text,
+        "voice": chosen_voice,
     }
 
     async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://openrouter.ai/api/v1/audio/speech",
             headers={
-                "Authorization":  f"Bearer {settings.OPENROUTER_API_KEY}",
-                "Content-Type":   "application/json",
-                "HTTP-Referer":   "https://seeourbook.com",
-                "X-Title":        "SeeOurBook Summarizer",
+                "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+                "Content-Type":  "application/json",
+                "HTTP-Referer":  "https://seeourbook.com",
+                "X-Title":       "SeeOurBook Summarizer",
             },
             json=payload,
         )
-        if r.status_code >= 400:
-            raise RuntimeError(
-                f"OpenRouter TTS returned {r.status_code}: {r.text[:500]} "
-                f"(model={model}, voice={chosen_voice}, language={language})"
-            )
-        data = r.json()
 
-    # Extract base64-encoded audio from OpenAI-compatible response shape:
-    #   choices[0].message.audio.data
-    audio_b64: str | None = None
-    try:
-        msg = data["choices"][0]["message"]
-        audio_b64 = msg.get("audio", {}).get("data")
-        if not audio_b64:
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "audio":
-                        audio_b64 = block.get("data") or block.get("audio", {}).get("data")
-                        if audio_b64:
-                            break
-    except (KeyError, IndexError, TypeError) as exc:
+    if r.status_code >= 400:
         raise RuntimeError(
-            f"OpenRouter TTS returned an unexpected response shape: {data!r}"
-        ) from exc
+            f"OpenRouter TTS returned {r.status_code}: {r.text[:500]} "
+            f"(model={model}, voice={chosen_voice}, language={language})"
+        )
 
-    if not audio_b64:
+    content = r.content
+    if not content or len(content) < 100:
+        # Some errors come back 200 with a tiny JSON body — surface it clearly.
         raise RuntimeError(
-            "OpenRouter TTS response did not contain audio data. "
-            f"Make sure {model!r} supports audio output on OpenRouter. "
-            f"Response excerpt: {str(data)[:400]}"
+            f"OpenRouter TTS returned no audio (model={model}, voice={chosen_voice}, "
+            f"language={language}). Body: {content[:300]!r}"
         )
 
     with open(output_path, "wb") as f:
-        f.write(base64.b64decode(audio_b64))
+        f.write(content)

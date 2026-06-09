@@ -12,6 +12,7 @@ Admin routes:
 """
 import io
 import logging
+import os
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -897,6 +898,70 @@ async def admin_retry_job(job_id: str, background_tasks: BackgroundTasks) -> dic
         "retrying_steps": failed or "all",   # "all" when there's no prior result
         "status_url":    f"/api/pipeline/status/{job_id}",
     }
+
+
+# ── TTS voice preview ─────────────────────────────────────────────────────────
+
+class TTSPreviewRequest(BaseModel):
+    text:     str = "Hello, this is a voice preview."
+    provider: str = "openrouter"   # openrouter | gemini | cartesia | elevenlabs | deepgram
+    model:    str = ""             # provider-specific model
+    voice:    str = "alloy"        # provider-specific voice
+    language: str = "en"
+
+
+@router.post("/tts-preview")
+async def tts_preview(body: TTSPreviewRequest) -> dict:
+    """
+    Generate a short TTS sample and return the audio as base64.
+    Used by the admin panel for live voice preview.
+    """
+    import tempfile
+    import base64
+    from api.services.pipeline.tts import synthesize
+
+    # Short preview text — if user sent a long one, truncate
+    preview_text = body.text[:500] if body.text else "Hello, this is a voice preview."
+
+    cfg: dict = {}
+    lang = body.language.upper()
+    cfg[f"TTS_PROVIDER_{lang}"] = body.provider
+    if body.model:
+        if body.provider == "gemini":
+            cfg["GEMINI_TTS_MODEL"] = body.model
+        elif body.provider == "openrouter":
+            cfg["OPENROUTER_TTS_MODEL"] = body.model
+    if body.voice:
+        if body.provider == "gemini":
+            cfg["GEMINI_TTS_VOICE"] = body.voice
+        elif body.provider == "openrouter":
+            cfg["OPENROUTER_TTS_VOICE"] = body.voice
+        else:
+            cfg[f"TTS_VOICE_{lang}"] = body.voice
+
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        await synthesize(preview_text, body.language, tmp_path, cfg=cfg)
+        with open(tmp_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode()
+        return {
+            "ok": True,
+            "provider": body.provider,
+            "voice": body.voice,
+            "language": body.language,
+            "audio_base64": audio_b64,
+            "mime_type": "audio/mpeg",
+        }
+    except Exception as exc:
+        log.warning("TTS preview failed: %s", exc)
+        raise HTTPException(400, f"TTS preview failed: {exc}") from exc
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 # ── OpenRouter live model list (cached proxy) ────────────────────────────────

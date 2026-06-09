@@ -86,9 +86,9 @@ class Settings(BaseSettings):
     # NOTE: OpenRouter does NOT support Gemini TTS. Use OpenAI audio models instead:
     #   openai/gpt-audio, openai/gpt-audio-mini
     OPENROUTER_TTS_MODEL:  str = "openai/gpt-audio-mini"
-    # Default voice for OpenRouter TTS (provider-specific).
-    # Gemini voices: Kore, Charon, Puck, Fenrir, Aoede, Leda, Orus, Zephyr
-    OPENROUTER_TTS_VOICE:  str = "Kore"
+    # Default voice for OpenRouter TTS (OpenAI audio voices).
+    # Supported: alloy, echo, fable, onyx, nova, shimmer, coral, verse, ballad, ash, sage, marin, cedar
+    OPENROUTER_TTS_VOICE:  str = "alloy"
 
     # ── Alt text — per language ───────────────────────────────────────────────
     ALTTEXT_PROVIDER_EN:  str = "claude"     # claude | openai

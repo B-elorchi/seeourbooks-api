@@ -62,7 +62,9 @@ def _resolve_steps(requested: list[str] | None, previous_result: dict | None = N
         return set(ALL_STEPS)
     steps = set(requested)
     
-    # Check if we have summary data from previous result
+    # Check if we already have summary data from a previous run. If so, the
+    # 'summarize' dependency is satisfied and we must NOT re-add (and thus
+    # regenerate) it — the existing summary is reused from previous_result.
     has_summary = False
     if previous_result:
         _prev = previous_result if isinstance(previous_result, dict) else {}
@@ -70,19 +72,16 @@ def _resolve_steps(requested: list[str] | None, previous_result: dict | None = N
         if _psums:
             _first_sum = next(iter(_psums.values()), {})
             has_summary = bool(_first_sum.get("text"))
-    
-    # Enforce dependencies (skip if data already available from previous result)
-    if "audio_full" in steps or "audio_chapters" in steps:
-        steps.add("summarize")
-    if "mindmap" in steps or "mindmap_chapters" in steps:
-        steps.add("summarize")
+
+    # Enforce dependencies. Only auto-add 'summarize' when we don't already
+    # have a usable summary from the previous result.
+    if not has_summary:
+        if {"audio_full", "audio_chapters", "mindmap", "mindmap_chapters",
+            "inject_epub", "video"} & steps:
+            steps.add("summarize")
     if "alt_text" in steps:
         steps.add("cover")
-    if "inject_epub" in steps and not has_summary:
-        # Only require summarize if we don't have summary data from previous result
-        steps.add("summarize")
     if "video" in steps:
-        steps.add("summarize")
         steps.add("audio_full")
     return steps
 
