@@ -70,6 +70,8 @@ async def increment_retry(job_id: str) -> int:
     """
     job = await get_job(job_id)
     new_count = (job.get("retry_count") or 0) + 1
+    # Clear cancelled flag on auto-retry (edge case: job was cancelled then recovered)
+    _cancelled_jobs.discard(job_id)
     await update(
         "pipeline_jobs",
         {"id": job_id},
@@ -87,6 +89,9 @@ async def reset_for_manual_retry(job_id: str) -> None:
     existing result as previous_result so _run_job can merge the retry
     outputs into it (only failed steps are re-run).
     """
+    # CRITICAL: Remove from the in-memory cancelled set so the job can actually run.
+    # Without this, a previously-cancelled job would be immediately cancelled again.
+    _cancelled_jobs.discard(job_id)
     await update(
         "pipeline_jobs",
         {"id": job_id},

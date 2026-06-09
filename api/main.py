@@ -34,7 +34,7 @@ async def _recover_stuck_jobs() -> None:
     import asyncio
     import logging
     from api.services.db import find, update
-    from api.jobs.store import can_retry
+    from api.jobs.store import can_retry, _cancelled_jobs
     from api.routes.pipeline import _run_job          # local import avoids cycle
     from api.models.requests import PipelineReq
     log = logging.getLogger(__name__)
@@ -54,6 +54,9 @@ async def _recover_stuck_jobs() -> None:
         for job in stuck:
             job_id = job["id"]
             try:
+                # Clear any stale cancelled flag so the job can actually run
+                _cancelled_jobs.discard(job_id)
+
                 if not can_retry(job):
                     await update(
                         "pipeline_jobs",

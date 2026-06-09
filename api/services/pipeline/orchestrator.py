@@ -1147,6 +1147,22 @@ async def run_pipeline(
 
                 out_path = os.path.join(tmp, f"{req.book_id}_{req.language}.epub")
                 
+                # Download cover from CDN if we have a URL but no local file
+                _cover_for_epub = None
+                if cover_url and not os.path.exists(cover_path_saved):
+                    try:
+                        import httpx
+                        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                            r = await client.get(cover_url)
+                            if r.status_code == 200 and r.content:
+                                Path(cover_path_saved).write_bytes(r.content)
+                                log.info("Downloaded cover from CDN for EPUB injection")
+                    except Exception as e:
+                        log.warning("Could not download cover for EPUB: %s", e)
+                
+                if cover_url and os.path.exists(cover_path_saved):
+                    _cover_for_epub = cover_path_saved
+                
                 # Debug logging for EPUB injection
                 log.info("Injecting EPUB for book %s", req.book_id)
                 log.info("  - chapter_results count: %d", len(chapter_results))
@@ -1155,7 +1171,7 @@ async def run_pipeline(
                 log.info("  - chapter_mindmap keys: %s", list(chapter_mindmap.keys()))
                 log.info("  - full_audio: %s", (full_audio or {}).get("url", "None"))
                 log.info("  - mindmap_url: %s", mindmap_url or "None")
-                log.info("  - cover_path: %s", cover_path_saved if cover_url else "None")
+                log.info("  - cover_path: %s", _cover_for_epub or "None")
                 
                 await inject_summary_into_epub(
                     src_path,
@@ -1164,11 +1180,7 @@ async def run_pipeline(
                     author           = req.author or "",
                     summary_text     = full_summary,
                     language         = req.language,
-                    cover_path       = (
-                        cover_path_saved
-                        if cover_url and os.path.exists(cover_path_saved)
-                        else None
-                    ),
+                    cover_path       = _cover_for_epub,
                     chapters         = chapter_results,
                     chapter_audio    = chapter_audio,
                     chapter_mindmap  = chapter_mindmap,

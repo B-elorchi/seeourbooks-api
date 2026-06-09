@@ -470,13 +470,39 @@ def _inject_sync(
     slug = f"{title}_{language}".replace(" ", "_")[:40]
 
     # ── 1. Cover ──────────────────────────────────────────────────────────────
+    # IMPORTANT: use create_page=False. ebooklib's default create_page=True adds
+    # an empty cover XHTML whose body can't be parsed during nav generation,
+    # which crashes write_epub with "Document is empty". We embed the image +
+    # cover metadata (for the reader thumbnail) and build our own cover PAGE
+    # below so the cover is also visible as the first page.
+    cover_page_item = None
     if cover_path and Path(cover_path).is_file():
         try:
-            data  = Path(cover_path).read_bytes()
-            media = _detect_image_media_type(data, Path(cover_path).suffix)
-            ext   = "jpg" if media == "image/jpeg" else media.split("/", 1)[1]
-            book.set_cover(f"cover.{ext}", data)
-            log.info("Cover set (%s, %d bytes)", media, len(data))
+            data       = Path(cover_path).read_bytes()
+            media      = _detect_image_media_type(data, Path(cover_path).suffix)
+            ext        = "jpg" if media == "image/jpeg" else media.split("/", 1)[1]
+            cover_name = f"cover.{ext}"
+            book.set_cover(cover_name, data, create_page=False)
+
+            # A valid cover page that displays the image full-bleed.
+            cover_html = (
+                "<?xml version='1.0' encoding='utf-8'?>\n"
+                "<!DOCTYPE html>\n"
+                '<html xmlns="http://www.w3.org/1999/xhtml"><head>'
+                '<meta charset="utf-8"/><title>Cover</title>'
+                "<style>body{margin:0;padding:0;text-align:center;}"
+                "img{max-width:100%;max-height:100vh;}</style></head>"
+                f'<body><img src="{cover_name}" alt="Cover"/></body></html>'
+            )
+            cover_page_item = epub.EpubHtml(
+                uid       = "seeourbook_cover",
+                title     = "Cover",
+                file_name = "seeourbook_cover.xhtml",
+                lang      = language or "en",
+            )
+            cover_page_item.content = cover_html.encode("utf-8")
+            book.add_item(cover_page_item)
+            log.info("Cover set (%s, %d bytes) + cover page added", media, len(data))
         except Exception as exc:
             log.warning("Cover set failed (%s) — continuing", exc)
 
@@ -515,15 +541,19 @@ def _inject_sync(
 
     # ── Rebuild spine ─────────────────────────────────────────────────────────
     # Goal:
-    #   nav → front-matter → [orig chapter, its insight, orig chapter, its insight…]
-    # We normalise the original spine (which after read_epub is a list of
-    # (idref, linear) tuples) into resolved item objects, drop nav/cover and any
-    # previously-injected pages, then interleave each insight right AFTER the
-    # original chapter whose number matches the insight's chapter index.
+    #   [cover] → nav → front-matter → [orig chapter, its insight, orig chapter, its insight…]
+    #
+    # Matching strategy:
+    #   1. Build a map from original spine item → chapter number using ToC titles
+    #   2. Walk the original spine in order; after each item whose chapter number
+    #      matches an insight index, insert that insight
+    #   3. Any unmatched insights are appended at the end
     is_arabic       = (language or "en").lower() == "ar"
     injected_fnames = {front_item.file_name} | {
         it.file_name for it in insight_items.values()
     }
+    if cover_page_item is not None:
+        injected_fnames.add(cover_page_item.file_name)
 
     def _resolve_spine_entry(sp):
         """Return (item_or_idref, fname). Resolves idref strings to item objects."""
@@ -535,20 +565,6 @@ def _inject_sync(
             return idref, idref          # unresolved special (e.g. "nav")
         # already an item object
         return idref, getattr(idref, "file_name", None)
-
-    # Build a map: file_name → chapter number, from the original ToC titles.
-    fname_to_num: dict[str, int] = {}
-    def _walk_toc(entries):
-        for e in entries or []:
-            if isinstance(e, tuple):                 # (Section, [children])
-                _walk_toc(e[1])
-            else:
-                href  = getattr(e, "href", "") or ""
-                fname = href.split("#", 1)[0]
-                num   = _parse_chapter_num(getattr(e, "title", ""))
-                if fname and num is not None:
-                    fname_to_num.setdefault(fname, num)
-    _walk_toc(list(book.toc) if book.toc else [])
 
     # Normalise original spine → ordered list of resolved content items
     try:
@@ -572,6 +588,8 @@ def _inject_sync(
             continue
         orig_items.append((item, fname))
 
+    log.info("Original spine items (after filtering): %d", len(orig_items))
+
     # insights sorted by chapter index
     sorted_chs = sorted(chapters, key=lambda c: c.get("index", 0))
     insights_in_order = [
@@ -579,23 +597,82 @@ def _inject_sync(
         for ch in sorted_chs
         if ch.get("index", 0) in insight_items
     ]
-    insight_by_num = {idx: it for idx, it in insights_in_order}
+    insight_by_index = {idx: it for idx, it in insights_in_order}
 
-    new_spine: list = ["nav", front_item]
-    used_nums: set[int] = set()
+    # Build a map: file_name → chapter number, from the original ToC titles.
+    # We store BOTH the raw fname and fname+.xhtml to handle ebooklib's
+    # idref vs file_name mismatch.
+    fname_to_num: dict[str, int] = {}
+    def _walk_toc(entries):
+        for e in entries or []:
+            if isinstance(e, tuple):                 # (Section, [children])
+                _walk_toc(e[1])
+            else:
+                href  = getattr(e, "href", "") or ""
+                fname = href.split("#", 1)[0]
+                num   = _parse_chapter_num(getattr(e, "title", ""))
+                if fname and num is not None:
+                    fname_to_num.setdefault(fname, num)
+                    # Also store without .xhtml extension for idref matching
+                    if fname.endswith('.xhtml'):
+                        fname_to_num.setdefault(fname[:-6], num)
+                    elif fname.endswith('.html'):
+                        fname_to_num.setdefault(fname[:-5], num)
+    _walk_toc(list(book.toc) if book.toc else [])
+    log.info("ToC chapter number map: %s", fname_to_num)
+
+    # Identify which spine items are "chapter-like" (have a chapter number in ToC).
+    # We match insights to chapters by RELATIVE ORDER: the 1st chapter-like item
+    # gets the 1st insight, the 2nd chapter-like item gets the 2nd insight, etc.
+    # This works regardless of whether chapter numbers are 0-based or 1-based.
+    chapter_like_items: list[tuple[object, str, int]] = []   # (item, fname, position)
+    non_chapter_items: list[tuple[object, str]] = []         # (item, fname)
+    for pos, (item, fname) in enumerate(orig_items):
+        if fname_to_num.get(fname or "") is not None:
+            chapter_like_items.append((item, fname, pos))
+        else:
+            non_chapter_items.append((item, fname))
+    
+    log.info("Chapter-like spine items: %d, non-chapter items: %d", 
+             len(chapter_like_items), len(non_chapter_items))
+
+    # Map: relative chapter position (0,1,2…) → insight index
+    # insights_in_order is already sorted by chapter index
+    insight_for_ch_pos: dict[int, tuple[int, object]] = {}
+    for ch_pos, (idx, it) in enumerate(insights_in_order):
+        insight_for_ch_pos[ch_pos] = (idx, it)
+
+    # Cover page first (if we built one), then nav, then the summary front matter.
+    new_spine: list = []
+    if cover_page_item is not None:
+        new_spine.append(cover_page_item)
+    new_spine += ["nav", front_item]
+    used_indices: set[int] = set()
 
     if orig_items:
-        # Interleave: append each original chapter, then its matching insight
+        # Rebuild spine: non-chapter items first (in order), then interleave
+        # chapter items with their insights.
+        # Actually, we need to preserve original order, so we walk orig_items
+        # and insert insights right after chapter-like items.
+        ch_pos = 0
         for item, fname in orig_items:
             new_spine.append(item)
-            num = fname_to_num.get(fname or "")
-            if num is not None and num in insight_by_num and num not in used_nums:
-                new_spine.append(insight_by_num[num])
-                used_nums.add(num)
+            is_chapter = fname_to_num.get(fname or "") is not None
+            if is_chapter:
+                if ch_pos in insight_for_ch_pos:
+                    idx, it = insight_for_ch_pos[ch_pos]
+                    if idx not in used_indices:
+                        new_spine.append(it)
+                        used_indices.add(idx)
+                        log.info("  Interleaved insight for chapter pos %d (index %d) after %s", 
+                                 ch_pos, idx, fname)
+                ch_pos += 1
+        
         # Any insights we couldn't match → append at the end in order
         for idx, it in insights_in_order:
-            if idx not in used_nums:
+            if idx not in used_indices:
                 new_spine.append(it)
+                log.info("  Appended unmatched insight for chapter index %d at end", idx)
     else:
         # From scratch (no original content): front then all insights in order
         for idx, it in insights_in_order:
