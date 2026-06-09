@@ -91,6 +91,13 @@ _TEXT_RATES: dict[str, tuple[float, float]] = {
     "gpt-4.1":      (2.00,  8.00),
     "o3-mini":      (1.10,  4.40),
     "o1-mini":      (1.10,  4.40),
+    # DeepSeek
+    "deepseek-chat":       (0.14, 0.28),
+    "deepseek-reasoner":   (0.55, 2.19),
+    # Embeddings (priced per 1M input tokens, output is free)
+    "text-embedding-3-small":  (0.02, 0.0),
+    "text-embedding-3-large":  (0.13, 0.0),
+    "text-embedding-ada-002":  (0.10, 0.0),
 }
 
 # TTS: USD per 1000 characters

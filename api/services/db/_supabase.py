@@ -141,3 +141,12 @@ async def update(table: str, filters: dict, data: dict) -> None:
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.patch(f"{_BASE}/{path}", headers=_HEADERS, json=data)
         _raise_with_body(r, "UPDATE", table)
+
+
+async def delete(table: str, filters: dict) -> None:
+    _init()
+    parts = [f"{col}=eq.{val}" for col, val in filters.items()]
+    path = f"{table}?{'&'.join(parts)}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.delete(f"{_BASE}/{path}", headers=_HEADERS)
+        _raise_with_body(r, "DELETE", table)

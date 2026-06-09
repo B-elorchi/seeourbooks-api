@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from api.auth import require_admin
 from api.services.config.runtime import get_all_config, set_config_key
 from api.services.db import find, insert, upsert
-from api.jobs.store import get_job, reset_for_manual_retry
+from api.jobs.store import get_job, reset_for_manual_retry, delete_job
 from api.models.requests import PipelineReq
 
 log = logging.getLogger(__name__)
@@ -839,6 +839,16 @@ async def admin_rerun_steps(
         "rerun_steps": steps_to_run,
         "status_url":  f"/api/pipeline/status/{job_id}",
     }
+
+
+@router.delete("/jobs/{job_id}", status_code=200)
+async def admin_delete_job(job_id: str) -> dict:
+    """Permanently delete a pipeline job and its step results."""
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
+    await delete_job(job_id)
+    return {"ok": True, "job_id": job_id, "message": "Job deleted"}
 
 
 @router.post("/jobs/{job_id}/retry", status_code=202)

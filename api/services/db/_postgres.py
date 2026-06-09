@@ -202,3 +202,17 @@ async def update(table: str, filters: dict, data: dict) -> None:
 
     async with _pool_or_raise().acquire() as conn:
         await conn.execute(sql, *values)
+
+
+async def delete(table: str, filters: dict) -> None:
+    where_parts: list[str] = []
+    values:      list[Any] = []
+
+    for i, (col, val) in enumerate(filters.items()):
+        where_parts.append(f"{col} = ${i + 1}")
+        values.append(val)
+
+    sql = f"DELETE FROM {table} WHERE {' AND '.join(where_parts)}"
+
+    async with _pool_or_raise().acquire() as conn:
+        await conn.execute(sql, *values)

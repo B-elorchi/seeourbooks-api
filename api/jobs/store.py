@@ -4,7 +4,7 @@ All functions use the unified db interface: find / insert / upsert / update.
 """
 import uuid
 
-from api.services.db import find, insert, update
+from api.services.db import find, insert, update, delete
 
 MAX_RETRIES = 5  # 5 retries for better reliability
 
@@ -138,3 +138,10 @@ async def get_output(book_id: str) -> dict | None:
 
 async def list_jobs(limit: int = 50) -> list[dict]:
     return await find("pipeline_jobs", order="created_at DESC", limit=limit)
+
+
+async def delete_job(job_id: str) -> None:
+    """Permanently delete a job and its step results."""
+    _cancelled_jobs.discard(job_id)
+    await delete("pipeline_step_results", {"job_id": job_id})
+    await delete("pipeline_jobs", {"id": job_id})
