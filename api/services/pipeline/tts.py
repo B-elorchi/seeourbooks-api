@@ -220,7 +220,7 @@ async def _dispatch_tts(
                 "ELEVENLABS_API_KEY is not set. Add it to your .env file "
                 "or switch TTS provider in the Admin panel."
             )
-        await _elevenlabs(text, language, output_path)
+        await _elevenlabs(text, language, cfg, output_path)
     elif provider == "cartesia":
         if not settings.CARTESIA_API_KEY:
             raise ValueError(
@@ -296,13 +296,19 @@ async def _deepgram(text: str, voice: str, output_path: str) -> None:
             raise  # Re-raise on last attempt
 
 
-async def _elevenlabs(text: str, language: str, output_path: str) -> None:
-    voice_id = settings.ELEVENLABS_VOICE_EN if language == "en" else settings.ELEVENLABS_VOICE_AR
+async def _elevenlabs(text: str, language: str, cfg: dict, output_path: str) -> None:
+    # Prefer the admin runtime config (set in the dashboard), fall back to .env.
+    if language == "en":
+        voice_id = cfg.get("ELEVENLABS_VOICE_EN") or settings.ELEVENLABS_VOICE_EN
+    else:
+        voice_id = cfg.get("ELEVENLABS_VOICE_AR") or settings.ELEVENLABS_VOICE_AR
     if not voice_id:
         raise ValueError(
             f"ELEVENLABS_VOICE_{'EN' if language == 'en' else 'AR'} is not set. "
-            "Add it to your .env file — find voice IDs at https://elevenlabs.io/voice-library"
+            "Set it in Admin → Providers → Text-to-Speech, or add it to your .env "
+            "file. Find voice IDs at https://elevenlabs.io/voice-library"
         )
+    model_id = cfg.get("ELEVENLABS_MODEL") or "eleven_multilingual_v2"
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
@@ -312,7 +318,7 @@ async def _elevenlabs(text: str, language: str, output_path: str) -> None:
             },
             json={
                 "text": text,
-                "model_id": "eleven_multilingual_v2",   # supports Arabic natively
+                "model_id": model_id,   # eleven_multilingual_v2 supports Arabic
                 "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
             },
         )

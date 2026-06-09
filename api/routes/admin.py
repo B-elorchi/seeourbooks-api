@@ -996,6 +996,59 @@ async def _fetch_openrouter_models_raw() -> list[dict]:
     return models
 
 
+_EL_VOICES_CACHE: dict = {}   # {"t": ts, "data": [...]}
+
+
+@router.get("/elevenlabs-voices")
+async def elevenlabs_voices() -> dict:
+    """
+    Live ElevenLabs voice list for the admin TTS dropdowns.
+
+    Returns each voice's id, name, category, and labels (language / accent /
+    gender / description) so the UI can group EN vs AR. Cached for 1 hour.
+    """
+    import time as _time
+    import httpx as _httpx
+    from api.config.settings import settings as _settings
+
+    if not _settings.ELEVENLABS_API_KEY:
+        raise HTTPException(400, "ELEVENLABS_API_KEY is not set on the server.")
+
+    now = _time.time()
+    cached = _EL_VOICES_CACHE.get("data")
+    if cached and (now - _EL_VOICES_CACHE.get("t", 0)) < 3600:
+        return {"count": len(cached), "voices": cached}
+
+    try:
+        async with _httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                "https://api.elevenlabs.io/v1/voices",
+                headers={"xi-api-key": _settings.ELEVENLABS_API_KEY},
+            )
+            r.raise_for_status()
+            data = r.json()
+    except Exception as exc:
+        raise HTTPException(502, f"ElevenLabs voices fetch failed: {exc}") from exc
+
+    voices = []
+    for v in data.get("voices", []):
+        labels = v.get("labels") or {}
+        voices.append({
+            "voice_id":    v.get("voice_id"),
+            "name":        v.get("name"),
+            "category":    v.get("category"),
+            "language":    labels.get("language") or "",
+            "accent":      labels.get("accent") or "",
+            "gender":      labels.get("gender") or "",
+            "description": labels.get("description") or labels.get("use_case") or "",
+        })
+    voices.sort(key=lambda x: (x.get("name") or "").lower())
+
+    _EL_VOICES_CACHE["t"] = now
+    _EL_VOICES_CACHE["data"] = voices
+    return {"count": len(voices), "voices": voices}
+
+
 @router.get("/openrouter-models")
 async def openrouter_models(modality: str = "all") -> dict:
     """
