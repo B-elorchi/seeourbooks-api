@@ -47,9 +47,19 @@ async def set_failed(job_id: str, error: str) -> None:
 
 
 async def set_cancelled(job_id: str) -> None:
-    """Mark job as cancelled in DB and in the in-memory set the orchestrator checks."""
+    """Mark job as cancelled in DB and in the in-memory set the orchestrator checks.
+    
+    CRITICAL: Preserves the existing 'result' field so that if the job had
+    checkpointed partial progress, a subsequent retry can resume from it.
+    """
     _cancelled_jobs.add(job_id)
-    await update("pipeline_jobs", {"id": job_id}, {"status": "cancelled", "error_msg": "Cancelled by admin"})
+    # Fetch existing result so we don't overwrite it with null
+    job = await get_job(job_id)
+    existing_result = job.get("result") if job else None
+    update_data: dict = {"status": "cancelled", "error_msg": "Cancelled by admin"}
+    if existing_result is not None:
+        update_data["result"] = existing_result
+    await update("pipeline_jobs", {"id": job_id}, update_data)
 
 
 async def set_partial(job_id: str, result: dict) -> None:
@@ -99,11 +109,21 @@ async def reset_for_manual_retry(job_id: str) -> None:
     )
 
 
-# ── Queries ───────────────────────────────────────────────────────────────────
+# ── Queries ─────────────────────────────────────────────────────────────────--
 
 async def get_job(job_id: str) -> dict | None:
     rows = await find("pipeline_jobs", filters={"id": job_id}, limit=1)
     return rows[0] if rows else None
+
+
+async def get_step_results(job_id: str) -> list[dict]:
+    """Return all persisted step results for a job (from pipeline_step_results table)."""
+    rows = await find(
+        "pipeline_step_results",
+        filters={"job_id": job_id},
+        select="step, status, output_url, error_msg, duration_sec",
+    )
+    return rows or []
 
 
 async def get_output(book_id: str) -> dict | None:

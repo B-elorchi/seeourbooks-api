@@ -54,10 +54,10 @@ class Settings(BaseSettings):
     MINDMAP_FORMAT:    str = "mermaid"
 
     # ── TTS — per language ────────────────────────────────────────────────────
-    TTS_PROVIDER_EN:   str = "deepgram"      # deepgram | elevenlabs | cartesia
-    TTS_PROVIDER_AR:   str = "cartesia"      # cartesia | elevenlabs — Deepgram Aura is English-only
+    TTS_PROVIDER_EN:   str = "deepgram"      # deepgram | elevenlabs | cartesia | openrouter | gemini
+    TTS_PROVIDER_AR:   str = "cartesia"      # cartesia | elevenlabs | openrouter | gemini — Deepgram Aura is English-only
     TTS_VOICE_EN:      str = "aura-asteria-en"
-    TTS_VOICE_AR:      str = ""              # set in admin: Cartesia voice UUID or ElevenLabs voice ID
+    TTS_VOICE_AR:      str = ""              # set in admin: voice ID for chosen provider
 
     ELEVENLABS_API_KEY:    str = ""
     ELEVENLABS_VOICE_EN:   str = ""
@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     # Gemini TTS via OpenRouter — supports Arabic + 30+ languages natively.
     # Set TTS_PROVIDER_AR='gemini' to use. Voice defaults to 'Kore'.
     GEMINI_TTS_MODEL:      str = "google/gemini-2.5-flash-preview-tts"
+
+    # OpenRouter TTS — any TTS-capable model on OpenRouter.
+    # Popular models: google/gemini-2.5-flash-preview-tts, google/gemini-2.5-pro-preview-tts
+    OPENROUTER_TTS_MODEL:  str = "google/gemini-2.5-flash-preview-tts"
+    # Default voice for OpenRouter TTS (provider-specific).
+    # Gemini voices: Kore, Charon, Puck, Fenrir, Aoede, Leda, Orus, Zephyr
+    OPENROUTER_TTS_VOICE:  str = "Kore"
 
     # ── Alt text — per language ───────────────────────────────────────────────
     ALTTEXT_PROVIDER_EN:  str = "claude"     # claude | openai

@@ -42,7 +42,7 @@ from api.services.pipeline.epub import (
 )
 from api.services.pipeline.video import generate_book_video, VideoError
 from api.services.pipeline.storage import upload_file, CONTENT_TYPES
-from api.jobs.store import is_cancelled
+from api.jobs.store import is_cancelled, get_step_results
 from api.services.db import insert as db_insert
 
 # Single source of truth lives in api/models/requests.py
@@ -493,6 +493,39 @@ async def run_pipeline(
             chapter_results = [dict(ch) for ch in _prev["chapters"]]
             log.info("Loaded %d chapters from previous result", len(chapter_results))
 
+    # ── Also load from pipeline_step_results table (more reliable than JSONB result) ──
+    if job_id:
+        try:
+            _step_rows = await get_step_results(job_id)
+            if _step_rows:
+                log.info("Loaded %d step results from pipeline_step_results table", len(_step_rows))
+                for row in _step_rows:
+                    _step_name = row.get("step")
+                    _step_status = row.get("status")
+                    _output_url = row.get("output_url")
+                    if not _step_name:
+                        continue
+                    # Only trust 'done' status from persisted step results
+                    if _step_status == "done":
+                        step_status[_step_name] = "done"
+                        # Restore output URLs for each step type
+                        if _step_name == "cover" and _output_url and not cover_url:
+                            cover_url = _output_url
+                        elif _step_name == "audio_full" and _output_url and not full_audio:
+                            full_audio = {"url": _output_url}
+                        elif _step_name == "mindmap" and _output_url and not mindmap_url:
+                            mindmap_url = _output_url
+                        elif _step_name == "inject_epub" and _output_url and not epub_url:
+                            epub_url = _output_url
+                        elif _step_name == "video" and _output_url and not video_url:
+                            video_url = _output_url
+                        elif _step_name == "alt_text" and _output_url and not alt_text:
+                            alt_text = _output_url
+                log.info("Restored step statuses from DB: %s", 
+                         {s: st for s, st in step_status.items() if st == "done"})
+        except Exception as exc:
+            log.debug("Could not load step results from DB: %s", exc)
+
     # ── Live checkpoint ───────────────────────────────────────────────────────
     async def _checkpoint() -> None:
         if not job_id:
@@ -657,7 +690,9 @@ async def run_pipeline(
                     full_summary = req.summary
                     sentences = [s.strip() for s in full_summary.replace(".\n", ". ").split(". ") if s.strip()]
                     quick_summary = ". ".join(sentences[:2]) + "." if sentences else full_summary[:200]
-                    # Load per-chapter summaries from DB so audio_chapters/mindmap_chapters can run
+                    
+                    # Try to load per-chapter summaries from DB first
+                    _db_loaded = False
                     if chapters and req.book_id and req.book_id.isdigit():
                         try:
                             chunk_rows = await find(
@@ -667,22 +702,61 @@ async def run_pipeline(
                                 order="chunk_index ASC",
                             )
                             chunk_sum_map = {r["chunk_index"]: r.get("summary") or "" for r in chunk_rows}
-                            chapter_results = [
-                                {
-                                    "index":         ch["index"],
-                                    "title":         ch["title"],
-                                    "summary":       chunk_sum_map.get(ch["index"], ""),
-                                    "read_time_min": max(1, len((chunk_sum_map.get(ch["index"]) or "").split()) // 200),
-                                }
-                                for ch in chapters
-                                if chunk_sum_map.get(ch["index"])
-                            ]
-                            log.info("Loaded %d chapter summaries from chunks for cached-summary job", len(chapter_results))
+                            if chunk_sum_map:
+                                chapter_results = [
+                                    {
+                                        "index":         ch["index"],
+                                        "title":         ch["title"],
+                                        "summary":       chunk_sum_map.get(ch["index"], ""),
+                                        "read_time_min": max(1, len((chunk_sum_map.get(ch["index"]) or "").split()) // 200),
+                                    }
+                                    for ch in chapters
+                                    if ch["index"] in chunk_sum_map
+                                ]
+                                log.info("Loaded %d chapter summaries from chunks for cached-summary job", len(chapter_results))
+                                _db_loaded = True
                         except Exception as exc:
                             log.debug("Could not load chunk summaries for cached summary: %s", exc)
-                            chapter_results = []
-                    else:
-                        chapter_results = []
+                    
+                    # If no DB summaries, generate them from chapter text
+                    if not _db_loaded and chapters:
+                        log.info("No DB chapter summaries found — generating from chapter text")
+                        haiku_conc = max(1, int(cfg.get("HAIKU_CONCURRENCY", "6")))
+                        sem = asyncio.Semaphore(haiku_conc)
+
+                        async def _summarize_chunk(ch: dict) -> dict:
+                            async with sem:
+                                chunk = {
+                                    "id":          f"{req.book_id}_ch{ch['index']}",
+                                    "chunk_index": ch["index"],
+                                    "content":     ch["text"],
+                                }
+                                try:
+                                    sums = await run_haiku_pass(
+                                        req.book_id, [chunk], req.language, model=model_chunk,
+                                    )
+                                except Exception as exc:
+                                    import logging as _log
+                                    _log.getLogger(__name__).warning(
+                                        "Haiku pass failed for chunk %s: %s", ch["index"], exc,
+                                    )
+                                    sums = []
+                                summary = sums[0] if sums else ""
+                                return {
+                                    "index":         ch["index"],
+                                    "title":         ch["title"],
+                                    "summary":       summary,
+                                    "read_time_min": max(1, len(summary.split()) // 200) if summary else 1,
+                                }
+
+                        chapter_results = list(await asyncio.gather(
+                            *[_summarize_chunk(ch) for ch in chapters]
+                        ))
+                        chapter_results.sort(key=lambda c: c["index"])
+                        log.info("Generated %d chapter summaries from text", len(chapter_results))
+                        # Save back to DB for future use
+                        await _persist_chunk_summaries(req.book_id, chapter_results)
+                    
                     step_status["summarize"] = "done"
                 else:
                     haiku_conc = max(1, int(cfg.get("HAIKU_CONCURRENCY", "6")))

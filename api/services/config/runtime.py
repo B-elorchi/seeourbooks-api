@@ -119,6 +119,8 @@ def _defaults() -> dict[str, str]:
         "TTS_VOICE_AR":                   settings.TTS_VOICE_AR,
         "CARTESIA_MODEL":                 settings.CARTESIA_MODEL,
         "GEMINI_TTS_MODEL":               settings.GEMINI_TTS_MODEL,
+        "OPENROUTER_TTS_MODEL":           settings.OPENROUTER_TTS_MODEL,
+        "OPENROUTER_TTS_VOICE":           settings.OPENROUTER_TTS_VOICE,
         "IMAGE_MODEL":                    settings.IMAGE_MODEL,
         "IMAGE_MODEL_EN":                 settings.IMAGE_MODEL_EN,
         "IMAGE_MODEL_AR":                 settings.IMAGE_MODEL_AR,

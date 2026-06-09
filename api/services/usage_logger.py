@@ -99,6 +99,7 @@ _TTS_RATES_PER_1K_CHARS: dict[str, float] = {
     "elevenlabs": 0.30,
     "cartesia":   0.065,
     "gemini":     0.05,
+    "openrouter": 0.05,   # Gemini TTS via OpenRouter — same as native Gemini
 }
 
 # Image generation: USD per image
@@ -107,10 +108,15 @@ _IMAGE_RATES_PER_CALL: dict[str, float] = {
     "gpt-image-1":                             0.04,
     "dall-e-2":                                0.02,
     "google/gemini-2.5-flash-image":           0.04,
+    "gemini-2.5-flash-image":                  0.04,   # bare model name (after _bare_model strip)
     "google/gemini-2.0-flash-exp:image":       0.04,
+    "gemini-2.0-flash-exp:image":              0.04,   # bare model name
     "black-forest-labs/flux-1.1-pro":          0.04,
+    "flux-1.1-pro":                            0.04,   # bare model name
     "black-forest-labs/flux-schnell":          0.003,
+    "flux-schnell":                            0.003,  # bare model name
     "stability-ai/stable-diffusion-3.5-large": 0.04,
+    "stable-diffusion-3.5-large":              0.04,   # bare model name
 }
 
 

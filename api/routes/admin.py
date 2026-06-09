@@ -850,7 +850,7 @@ async def admin_retry_job(job_id: str, background_tasks: BackgroundTasks) -> dic
     the previous partial output so successful steps are not wasted.
 
     - Resets retry_count to 0 so the job gets a full 3 fresh auto-retries.
-    - Works on any status (failed, partial).
+    - Works on any status (failed, partial, cancelled).
     """
     # Lazy imports — avoids circular dependency (admin ↔ pipeline)
     from api.routes.pipeline import _run_job, _failed_steps   # noqa: PLC0415

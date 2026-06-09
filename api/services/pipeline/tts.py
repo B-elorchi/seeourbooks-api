@@ -43,6 +43,7 @@ _PROVIDER_MAX_CHARS: dict[str, int] = {
     "elevenlabs": 2500,
     "cartesia":   2500,
     "gemini":     2500,
+    "openrouter": 2500,
 }
 _DEFAULT_MAX_CHARS = 1500
 
@@ -235,6 +236,17 @@ async def _dispatch_tts(
             )
         gemini_model = cfg.get("GEMINI_TTS_MODEL") or settings.GEMINI_TTS_MODEL
         await _gemini(text, voice, language, gemini_model, output_path)
+    elif provider == "openrouter":
+        if not settings.OPENROUTER_API_KEY:
+            raise ValueError(
+                "OPENROUTER_API_KEY is not set. OpenRouter TTS requires it — "
+                "add OPENROUTER_API_KEY to your .env file. Get one at https://openrouter.ai/keys."
+            )
+        or_model = cfg.get("OPENROUTER_TTS_MODEL") or settings.OPENROUTER_TTS_MODEL
+        or_voice = cfg.get("OPENROUTER_TTS_VOICE") or settings.OPENROUTER_TTS_VOICE
+        # Use the admin voice if set, otherwise fall back to the default OpenRouter voice
+        chosen_voice = voice or or_voice
+        await _gemini(text, chosen_voice, language, or_model, output_path)
     else:
         raise ValueError(f"Unknown TTS provider: {provider!r}")
 
