@@ -31,6 +31,8 @@ from api.services.usage_logger import set_step
 from api.services.summarizer.haiku import run_haiku_pass
 from api.services.summarizer.sonnet import run_sonnet_pass_sync
 from api.services.summarizer.review import run_review_pass
+from api.services.summarizer.quality import score_summary_coverage
+from api.services.summarizer.translate import translate_summary
 from api.services.pipeline.tts import synthesize
 from api.services.pipeline.cover import generate_cover
 from api.services.pipeline.mindmap import generate_mermaid_code, render_mermaid_svg, generate_json_mindmap
@@ -204,6 +206,33 @@ async def _persist_book_summary(
         log.debug("book_summaries insert failed for %s: %s", book_id, exc)
 
 
+async def _persist_book_details(book_id: str, fields: dict) -> None:
+    """
+    Best-effort write of computed book details to the `books` table.
+
+    Some columns may not exist in every deployment's schema, and PostgREST
+    rejects the WHOLE patch if any single column is unknown. So we try the full
+    batch first, then fall back to writing each field on its own — this way the
+    known columns still get saved even if one column name is wrong.
+    """
+    if not book_id.isdigit() or not fields:
+        return
+    clean = {k: v for k, v in fields.items() if v is not None}
+    if not clean:
+        return
+    bid = int(book_id)
+    try:
+        await update("books", filters={"book_id": bid}, data=clean)
+        return
+    except Exception:
+        pass  # fall back to per-field writes
+    for k, v in clean.items():
+        try:
+            await update("books", filters={"book_id": bid}, data={k: v})
+        except Exception as exc:
+            log.debug("books.%s update skipped for %s: %s", k, book_id, exc)
+
+
 async def _persist_chunk_summaries(
     book_id: str,
     chapter_results: list[dict],
@@ -254,22 +283,23 @@ async def _persist_audio(
     book_id: str,
     language: str,
     audio_url: str,
+    chunks: int | None = None,
 ) -> None:
-    """Upsert into the audio table."""
+    """Upsert into the audio table (en_url/ar_url + status + chapter chunk count)."""
     if not book_id.isdigit():
         return
     try:
         url_col    = "ar_url"    if language == "ar" else "en_url"
         status_col = "ar_status" if language == "ar" else "en_status"
-        await upsert(
-            "audio",
-            {
-                "book_id":   int(book_id),
-                url_col:     audio_url,
-                status_col:  "done",
-            },
-            conflict="book_id",
-        )
+        chunks_col = "ar_chunks" if language == "ar" else "en_chunks"
+        payload: dict = {"book_id": int(book_id)}
+        if audio_url:                       # don't overwrite an existing url with ""
+            payload[url_col]    = audio_url
+            payload[status_col] = "done"
+        if chunks is not None:
+            payload[chunks_col] = chunks
+        if len(payload) > 1:
+            await upsert("audio", payload, conflict="book_id")
     except Exception as exc:
         log.debug("audio upsert failed for %s: %s", book_id, exc)
 
@@ -441,6 +471,10 @@ async def run_pipeline(
     epub_url:        str | None = None
     video_url:       str | None = None
     video_meta:      dict | None = None
+    summary_qa:      dict | None = None   # {score, passed, threshold, missing, …}
+    translated_summary: str        = ""   # summary translated into the other language
+    translated_lang:    str        = ""   # "en" or "ar"
+    translated_audio:   dict | None = None  # audio of the translated summary
 
     # ── Pre-load previous result so live checkpoints always carry forward
     # assets from steps that aren't being re-run in this pass.
@@ -587,6 +621,7 @@ async def run_pipeline(
                     } if video_url else None
                 ),
                 "chapters": chapter_results,
+                "summary_qa": summary_qa,
                 "errors":   dict(errors),
             }
             await update(
@@ -673,6 +708,25 @@ async def run_pipeline(
     base_url         = cfg.get("BOOK_FILES_BASE_URL") or settings.BOOK_FILES_BASE_URL
     video_provider   = cfg.get("VIDEO_PROVIDER") or settings.VIDEO_PROVIDER
 
+    # Per-language summary length + chapter-summary length overrides (0 = use preset)
+    def _cfg_int(key: str) -> int:
+        try:
+            return int(cfg.get(key) or "0")
+        except (TypeError, ValueError):
+            return 0
+    _lang_up         = (req.language or "en").upper()
+    summary_max_words = _cfg_int(f"SUMMARY_MAX_WORDS_{_lang_up}")
+    chapter_max_words = _cfg_int("CHAPTER_SUMMARY_MAX_WORDS")
+    # Summary QA / coverage gating
+    qa_enabled       = cfg.get("SUMMARY_QA_ENABLED", "true") == "true"
+    qa_model         = cfg.get("SUMMARY_QA_MODEL") or "deepseek/deepseek-chat"
+    qa_threshold     = _cfg_int("SUMMARY_QA_THRESHOLD") or 70
+    # Cross-language translation + optional target-language audio
+    translate_enabled   = cfg.get("TRANSLATE_SUMMARY_ENABLED", "true") == "true"
+    translate_model     = cfg.get("TRANSLATE_MODEL") or model_sonnet
+    target_audio_enabled = cfg.get("TARGET_LANG_AUDIO_ENABLED", "false") == "true"
+    target_lang         = "en" if (req.language or "en") == "ar" else "ar"
+
     with tempfile.TemporaryDirectory() as tmp:
         cover_path_saved = os.path.join(tmp, "cover.jpg")
 
@@ -733,6 +787,7 @@ async def run_pipeline(
                                 try:
                                     sums = await run_haiku_pass(
                                         req.book_id, [chunk], req.language, model=model_chunk,
+                                        max_words=chapter_max_words or None,
                                     )
                                 except Exception as exc:
                                     import logging as _log
@@ -771,6 +826,7 @@ async def run_pipeline(
                             try:
                                 sums = await run_haiku_pass(
                                     req.book_id, [chunk], req.language, model=model_chunk,
+                                    max_words=chapter_max_words or None,
                                 )
                             except Exception as exc:
                                 import logging as _log
@@ -800,6 +856,7 @@ async def run_pipeline(
                             req.options.style,
                             req.language,
                             model_override=model_sonnet,
+                            max_words=summary_max_words or None,
                         )
                         full_summary = await run_review_pass(
                             full_summary,
@@ -807,6 +864,7 @@ async def run_pipeline(
                             req.options.style,
                             req.language,
                             model=model_haiku,
+                            max_words=summary_max_words or None,
                         )
                         sentences = [s.strip() for s in full_summary.replace(".\n", ". ").split(". ") if s.strip()]
                         quick_summary = ". ".join(sentences[:2]) + "." if sentences else full_summary[:200]
@@ -829,6 +887,63 @@ async def run_pipeline(
                     req.book_id, req.language, req.options.length, req.options.style,
                     full_summary, model_sonnet,
                 )
+                # Write real `books` columns: status + the book's total word count
+                # (sum of chapter source text). Only columns that exist in the
+                # schema are written.
+                _total_words = sum(len((c.get("text") or "").split()) for c in chapters)
+                await _persist_book_details(req.book_id, {
+                    "status":         "summarized",
+                    "totalwordcount": _total_words or None,
+                })
+            await _checkpoint()
+
+        # ═════════════════════════════════════════════════════════════════════
+        # SUMMARY QA — score how well the full summary covers the whole book.
+        # Gates audio generation: audio steps only run when score ≥ threshold.
+        # ═════════════════════════════════════════════════════════════════════
+        if qa_enabled and full_summary and chapter_results:
+            try:
+                _chap_notes = [c.get("summary", "") for c in chapter_results if c.get("summary")]
+                summary_qa = await score_summary_coverage(
+                    full_summary, _chap_notes, req.language,
+                    model=qa_model, threshold=qa_threshold,
+                )
+                summary_qa["threshold"] = qa_threshold
+                log.info(
+                    "Summary QA: score=%s passed=%s (threshold=%s) model=%s",
+                    summary_qa.get("score"), summary_qa.get("passed"),
+                    qa_threshold, qa_model,
+                )
+            except Exception as exc:
+                log.warning("Summary QA failed (%s) — allowing audio to proceed", exc)
+                summary_qa = {"score": -1, "passed": True, "threshold": qa_threshold,
+                              "reason": f"QA error: {exc}", "missing": []}
+            await _checkpoint()
+
+        # Audio is blocked only when QA ran and explicitly failed.
+        audio_blocked = bool(summary_qa and summary_qa.get("passed") is False)
+
+        # ═════════════════════════════════════════════════════════════════════
+        # TRANSLATION — always produce the summary in the OTHER language too.
+        # (Audio in the target language is handled inside audio_full when
+        #  TARGET_LANG_AUDIO_ENABLED is on.)
+        # ═════════════════════════════════════════════════════════════════════
+        if translate_enabled and full_summary and not audio_blocked:
+            try:
+                translated_summary = await translate_summary(
+                    full_summary, req.language, target_lang, model=translate_model,
+                )
+                if translated_summary:
+                    translated_lang = target_lang
+                    log.info("Translated summary %s→%s (%d words)",
+                             req.language, target_lang, len(translated_summary.split()))
+                    # Persist the translated summary to the books table.
+                    await _persist_book_summary(
+                        req.book_id, target_lang, req.options.length, req.options.style,
+                        translated_summary, translate_model,
+                    )
+            except Exception as exc:
+                log.warning("translation step failed: %s", exc)
             await _checkpoint()
 
         # ═════════════════════════════════════════════════════════════════════
@@ -872,8 +987,18 @@ async def run_pipeline(
 
         # ── audio_full ────────────────────────────────────────────────────────
         async def _do_audio_full() -> None:
-            nonlocal full_audio, full_audio_path
+            nonlocal full_audio, full_audio_path, translated_audio
             if "audio_full" not in steps or not tts_enabled or not full_summary:
+                return
+            if audio_blocked:
+                step_status["audio_full"] = "failed"
+                errors["audio_full"] = (
+                    f"Blocked: summary coverage {summary_qa.get('score')}% is below the "
+                    f"required {qa_threshold}%. Improve the summary, then retry."
+                )
+                await _persist_step_result(job_id, "audio_full", "failed",
+                                           error_msg=errors["audio_full"])
+                await _checkpoint()
                 return
             step_status["audio_full"] = "running"
             set_step("audio_full")
@@ -901,6 +1026,35 @@ async def run_pipeline(
                 }
                 full_audio_path = src
                 step_status["audio_full"] = "done"
+
+                # ── Target-language audio (optional) ──────────────────────────
+                # Generate audio of the translated summary in the OTHER language.
+                if target_audio_enabled and translated_summary:
+                    try:
+                        t_raw  = os.path.join(tmp, "audio_t_raw.mp3")
+                        t_proc = os.path.join(tmp, "audio_t.mp3")
+                        await synthesize(translated_summary, target_lang, t_raw, cfg)
+                        if audio_proc_enabled:
+                            loop = asyncio.get_event_loop()
+                            t_meta = await loop.run_in_executor(
+                                None, process_audio, t_raw, t_proc,
+                                req.title or req.book_id, req.author or "",
+                            )
+                            t_src = t_proc
+                        else:
+                            t_meta = {}
+                            t_src = t_raw
+                        t_key = f"books/{req.book_id}/audio_{target_lang}_{req.options.length}.mp3"
+                        t_url = upload_file(t_src, t_key, CONTENT_TYPES[".mp3"])
+                        translated_audio = {
+                            "url":      t_url,
+                            "duration": _fmt_audio_duration(t_meta.get("duration_seconds")),
+                            "size_mb":  t_meta.get("size_mb"),
+                        }
+                        await _persist_audio(req.book_id, target_lang, t_url)
+                        log.info("Target-language audio generated (%s)", target_lang)
+                    except Exception as exc:
+                        log.warning("target-language audio failed: %s", exc)
             except JobCancelledError:
                 raise
             except Exception as e:
@@ -917,6 +1071,16 @@ async def run_pipeline(
         async def _do_audio_chapters() -> None:
             nonlocal chapter_audio, chapter_results
             if "audio_chapters" not in steps or not tts_enabled or not chapter_results:
+                return
+            if audio_blocked:
+                step_status["audio_chapters"] = "failed"
+                errors["audio_chapters"] = (
+                    f"Blocked: summary coverage {summary_qa.get('score')}% is below the "
+                    f"required {qa_threshold}%. Improve the summary, then retry."
+                )
+                await _persist_step_result(job_id, "audio_chapters", "failed",
+                                           error_msg=errors["audio_chapters"])
+                await _checkpoint()
                 return
             step_status["audio_chapters"] = "running"
             set_step("audio_chapters")
@@ -979,6 +1143,11 @@ async def run_pipeline(
             
             _t = round(time.time() - started)
             await _persist_step_result(job_id, "audio_chapters", step_status["audio_chapters"], duration_sec=_t)
+            # Record the chapter-audio count on the audio table (en_chunks/ar_chunks).
+            if chapter_audio:
+                await _persist_audio(req.book_id, req.language,
+                                     (full_audio or {}).get("url") or "",
+                                     chunks=len(chapter_audio))
             await _checkpoint()
 
         # ── mindmap ───────────────────────────────────────────────────────────
@@ -1316,6 +1485,14 @@ async def run_pipeline(
     elapsed = round(time.time() - started, 1)
     cost    = await _compute_job_cost(job_id)
 
+    # ── Final status write-back to the books table ────────────────────────────
+    # Asset URLs live in their own tables (audio.en_url/ar_url, covers.coverurl);
+    # the books table only carries status flags. cover_status is set by
+    # _persist_cover; here we set the overall pipeline status.
+    await _persist_book_details(req.book_id, {
+        "status": "complete" if status == "done" else status,
+    })
+
     summary_key = f"{req.options.length}_{req.language}"
 
     files = {
@@ -1355,14 +1532,28 @@ async def run_pipeline(
         },
         "quick_summary": quick_summary,
         "summaries": {
-            summary_key: {
-                "text":       full_summary,
-                "word_count": len(full_summary.split()) if full_summary else 0,
-                "style":      req.options.style,
-                "language":   req.language,
-            }
-        } if full_summary else {},
-        "audio": {f"full_{lang}": full_audio} if full_audio else {},
+            **({
+                summary_key: {
+                    "text":       full_summary,
+                    "word_count": len(full_summary.split()) if full_summary else 0,
+                    "style":      req.options.style,
+                    "language":   req.language,
+                }
+            } if full_summary else {}),
+            **({
+                f"{req.options.length}_{translated_lang}": {
+                    "text":       translated_summary,
+                    "word_count": len(translated_summary.split()),
+                    "style":      req.options.style,
+                    "language":   translated_lang,
+                    "translated": True,
+                }
+            } if translated_summary and translated_lang else {}),
+        },
+        "audio": {
+            **({f"full_{lang}": full_audio} if full_audio else {}),
+            **({f"full_{translated_lang}": translated_audio} if translated_audio and translated_lang else {}),
+        },
         "mindmap": (
             {"url": mindmap_url, "data": mindmap_data} if mindmap_data else
             {"url": mindmap_url} if mindmap_url else
@@ -1383,5 +1574,6 @@ async def run_pipeline(
             } if video_url else None
         ),
         "chapters": chapter_results,
+        "summary_qa": summary_qa,
         "errors":   errors,
     }

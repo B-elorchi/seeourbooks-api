@@ -337,16 +337,21 @@ async def _cartesia(text: str, voice: str, language: str, cfg: dict, output_path
     """
     model = cfg.get("CARTESIA_MODEL") or settings.CARTESIA_MODEL
 
+    # Prefer the dedicated Cartesia voice id for this language, then fall back to
+    # the generic TTS_VOICE_* value passed in.
+    _vkey = f"CARTESIA_VOICE_{language.upper()}"
+    voice = cfg.get(_vkey) or voice
+
     # Guard: voice must be a UUID, not a model name.
     # "sonic-2024-10-19" is the MODEL id — passing it as a voice id returns 400.
     import re
     _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
-    if not _UUID_RE.match(voice):
+    if not _UUID_RE.match(voice or ""):
         raise ValueError(
-            f"Cartesia TTS_VOICE value '{voice}' is not a valid voice UUID. "
+            f"Cartesia voice value '{voice}' is not a valid voice UUID. "
             f"Voice IDs look like 'a0e99841-438c-4a64-b679-ae501e7d6091'. "
-            f"Find yours at https://play.cartesia.ai/voices, then update "
-            f"TTS_VOICE_AR in Admin → Providers → Text-to-Speech."
+            f"Find yours at https://play.cartesia.ai/voices, then set "
+            f"{_vkey} in Admin → Providers → Text-to-Speech."
         )
 
     payload = {

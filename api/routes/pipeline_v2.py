@@ -391,7 +391,13 @@ async def _ingest_book(
     if len(text) < 500:
         raise HTTPException(422, f"Extracted text too short ({len(text)} chars) — file may be corrupt.")
 
-    chunks = chunk_text(text, max_words=1500)
+    # Per-language chunk size (admin-configurable: CHUNK_WORDS_EN / CHUNK_WORDS_AR)
+    _chunk_key = "CHUNK_WORDS_AR" if language == "ar" else "CHUNK_WORDS_EN"
+    try:
+        _chunk_words = int(await get_config_value(_chunk_key, "1500") or "1500")
+    except (TypeError, ValueError):
+        _chunk_words = 1500
+    chunks = chunk_text(text, max_words=_chunk_words)
     if not chunks:
         raise HTTPException(422, "Chunking produced no segments.")
 

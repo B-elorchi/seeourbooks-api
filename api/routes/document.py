@@ -9,23 +9,40 @@ Document upload route:
       style:    narrative | bullets | academic  (default: narrative)
 
   Returns 202 with job_id immediately.
-  Extracts text, splits into chapters, runs the same pipeline as /api/pipeline/run.
+
+  Background flow (visible via /api/pipeline/status/{job_id}):
+    1. OCR        — if the PDF is scanned (no text layer), run ocrmypdf
+                    with Arabic+English tesseract models.
+    2. Extract    — PyMuPDF (great Arabic/RTL support) with pdfplumber
+                    fallback per page.
+    3. Metadata   — an AI model reads the first pages and returns the real
+                    book title + author (+ description/category), so the
+                    cover is generated with the correct names instead of
+                    the filename / "Unknown".
+    4. Chapters   — split on Chapter headings, else ~10-page parts.
+    5. Pipeline   — same engine as /api/pipeline/run (summary, cover,
+                    audio, mindmap, epub …).
 """
-import io
+import json as json_module
+import logging
 import os
 import re
 import tempfile
 import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form
 
 from api.jobs.store import create_job, set_running, set_done, set_failed, set_partial
 from api.models.requests import PipelineReq, PipelineOptions, Chapter
+from api.services.db import update as db_update
 from api.services.pipeline.orchestrator import run_pipeline
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/document", tags=["document"])
 
-MAX_FILE_SIZE = 50 * 1024 * 1024   # 50 MB
+MAX_FILE_SIZE = 80 * 1024 * 1024   # 80 MB
 
 
 @router.post("/upload", status_code=202)
@@ -37,7 +54,7 @@ async def document_upload(
     length:   str         = Form("10min"),
     style:    str         = Form("narrative"),
 ):
-    """Upload a PDF and start a pipeline job on its content."""
+    """Upload a PDF and start a pipeline job on its content. Returns 202 immediately."""
 
     # ── Validate ──────────────────────────────────────────────────────────────
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -46,54 +63,123 @@ async def document_upload(
     raw = await file.read()
     if len(raw) > MAX_FILE_SIZE:
         raise HTTPException(413, f"File too large — max {MAX_FILE_SIZE // 1024 // 1024} MB")
+    if len(raw) < 1000:
+        raise HTTPException(422, "File is too small to be a valid PDF")
 
-    # ── Extract text ──────────────────────────────────────────────────────────
-    try:
-        chapters = _extract_chapters(raw, file.filename)
-    except Exception as e:
-        raise HTTPException(422, f"Could not extract text from PDF: {e}")
+    # Persist the upload to a temp dir that survives this request — extraction
+    # and OCR run in the background so big/scanned PDFs don't block the upload.
+    workdir  = Path(tempfile.mkdtemp(prefix="sob_doc_"))
+    pdf_path = workdir / "original.pdf"
+    pdf_path.write_bytes(raw)
 
-    if not chapters:
-        raise HTTPException(422, "No text content found in PDF")
+    book_id        = f"pdf_{uuid.uuid4().hex[:8]}"
+    fallback_title = os.path.splitext(file.filename)[0].replace("_", " ").title()
+    steps_list     = [s.strip() for s in steps.split(",") if s.strip()]
 
-    # ── Build PipelineReq ────────────────────────────────────────────────────
-    book_id = f"pdf_{uuid.uuid4().hex[:8]}"
-    title   = os.path.splitext(file.filename)[0].replace("_", " ").title()
-    steps_list = [s.strip() for s in steps.split(",") if s.strip()]
-
-    req = PipelineReq(
+    # Create the job row first so the client gets an id to poll immediately.
+    placeholder_req = PipelineReq(
         book_id  = book_id,
-        title    = title,
+        title    = fallback_title,
         language = language,
-        chapters = chapters,
         steps    = steps_list,
         options  = PipelineOptions(length=length, style=style),
         source   = "pdf_upload",
     )
+    job_id = await create_job(book_id, placeholder_req.model_dump())
 
-    # ── Queue job ─────────────────────────────────────────────────────────────
-    job_id = await create_job(book_id, req.model_dump())
-
-    background_tasks.add_task(_run_job, job_id, req)
+    background_tasks.add_task(
+        _extract_then_run,
+        job_id, book_id, str(pdf_path), fallback_title,
+        language, steps_list, length, style,
+    )
 
     return {
         "job_id":      job_id,
         "book_id":     book_id,
         "status":      "queued",
-        "chapters":    len(chapters),
         "status_url":  f"/api/pipeline/status/{job_id}",
     }
 
 
 # ── Background runner ─────────────────────────────────────────────────────────
 
-async def _run_job(job_id: str, req: PipelineReq) -> None:
-    # Tag every usage log written during this job with the job_id.
-    from api.services.usage_logger import set_job_context  # noqa: PLC0415
+async def _extract_then_run(
+    job_id: str,
+    book_id: str,
+    pdf_path: str,
+    fallback_title: str,
+    language: str,
+    steps_list: list[str],
+    length: str,
+    style: str,
+) -> None:
+    from api.services.usage_logger import set_job_context, set_step  # noqa: PLC0415
     set_job_context(job_id)
 
-    await set_running(job_id)
+    async def _mark(step_name: str) -> None:
+        """Show extraction progress in the job row so the UI isn't stuck on 'queued'."""
+        try:
+            await db_update("pipeline_jobs", {"id": job_id}, {
+                "status": "running",
+                "result": {
+                    "book_id": book_id, "status": "running",
+                    "current_step": step_name, "running_steps": [step_name],
+                    "steps": {},
+                },
+            })
+        except Exception:
+            pass
+
     try:
+        # ── 1. OCR when the PDF has no text layer (scanned book) ─────────────
+        set_step("ocr")
+        await _mark("ocr")
+        source_path = await _ensure_text_layer(pdf_path)
+
+        # ── 2. Extract text — PyMuPDF (Arabic-aware) + pdfplumber fallback ───
+        set_step("extract")
+        await _mark("extract")
+        import asyncio
+        from api.services.documents.extract import extract_pages  # noqa: PLC0415
+        loop = asyncio.get_running_loop()
+        pages, total_pages = await loop.run_in_executor(None, extract_pages, source_path)
+        full_text = "\n\n".join(_sanitize(p["content"]) for p in pages)
+        if len(full_text.split()) < 100:
+            await set_failed(job_id, "Extracted text too short — the PDF may be empty or image-only and OCR failed.")
+            return
+
+        # ── 3. AI metadata: real title + author from the first pages ─────────
+        set_step("metadata")
+        await _mark("metadata")
+        meta = await _extract_metadata(full_text, fallback_title, language)
+        title  = meta.get("title")  or fallback_title
+        author = meta.get("author") or ""
+        log.info("doc job %s: metadata title=%r author=%r", job_id, title, author)
+
+        # ── 4. Split into chapters ────────────────────────────────────────────
+        chapters = _split_chapters(full_text)
+        if not chapters:
+            await set_failed(job_id, "No usable text content found in PDF")
+            return
+
+        # ── 5. Run the pipeline with the REAL metadata ────────────────────────
+        req = PipelineReq(
+            book_id  = book_id,
+            title    = title,
+            author   = author,
+            language = language,
+            chapters = chapters,
+            steps    = steps_list,
+            options  = PipelineOptions(length=length, style=style),
+            source   = "pdf_upload",
+        )
+        # Store the enriched input on the job so retries keep the metadata.
+        try:
+            await db_update("pipeline_jobs", {"id": job_id}, {"input": req.model_dump()})
+        except Exception:
+            pass
+
+        await set_running(job_id)
         result = await run_pipeline(req, job_id=job_id)
         if result["status"] == "done":
             await set_done(job_id, result)
@@ -102,78 +188,165 @@ async def _run_job(job_id: str, req: PipelineReq) -> None:
         else:
             await set_failed(job_id, str(result.get("errors", "unknown error")))
     except Exception as e:
+        log.exception("document job %s failed", job_id)
         await set_failed(job_id, str(e))
+    finally:
+        # Clean the temp dir (original + ocr pdf).
+        try:
+            import shutil
+            shutil.rmtree(Path(pdf_path).parent, ignore_errors=True)
+        except Exception:
+            pass
 
 
-# ── PDF text extraction ───────────────────────────────────────────────────────
-
-def _sanitize_pdf_text(text: str) -> str:
+async def _ensure_text_layer(pdf_path: str) -> str:
     """
-    Strip characters PostgreSQL can't store.
+    Return a path to a PDF that has extractable text.
 
-    PDFs often contain stray NUL bytes (\x00) from raw PDF stream content
-    that pypdf doesn't filter.  Postgres rejects \x00 in TEXT/JSONB columns
-    with `UntranslatableCharacterError: unsupported Unicode escape sequence`.
-    We also normalize a few other control chars that aren't worth keeping.
+    Scanned PDFs (no text layer) are run through ocrmypdf with Arabic+English
+    tesseract models. Born-digital PDFs are returned unchanged. If OCR tooling
+    is missing on the host, we proceed with the original file and let
+    extraction report the problem.
     """
+    from api.services.documents.ocr import needs_ocr, run_ocrmypdf  # noqa: PLC0415
+    from api.services.config.runtime import get_config_value        # noqa: PLC0415
+    from api.config.settings import settings                        # noqa: PLC0415
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    try:
+        needs = await loop.run_in_executor(None, needs_ocr, pdf_path)
+    except Exception as exc:
+        log.warning("needs_ocr check failed (%s) — proceeding without OCR", exc)
+        return pdf_path
+
+    if not needs:
+        return pdf_path
+
+    languages = (
+        await get_config_value("DOC_OCR_LANGUAGES", settings.DOC_OCR_LANGUAGES)
+        or "ara+eng"
+    )
+    ocr_path = str(Path(pdf_path).parent / "ocr.pdf")
+    log.info("Scanned PDF detected — running OCR (languages=%s)", languages)
+    try:
+        await run_ocrmypdf(pdf_path, ocr_path, languages=languages)
+        return ocr_path
+    except Exception as exc:
+        log.warning("OCR failed (%s) — falling back to original PDF", exc)
+        return pdf_path
+
+
+async def _extract_metadata(full_text: str, fallback_title: str, language: str) -> dict:
+    """
+    Ask a chat model to identify the book's real title + author from the
+    first pages (cover page, title page, copyright page usually appear there).
+    Best-effort: returns {} fields on any failure.
+    """
+    from api.services.ai_client import chat_complete                # noqa: PLC0415
+    from api.services.config.runtime import get_all_config          # noqa: PLC0415
+    from api.config.settings import settings                        # noqa: PLC0415
+
+    cfg   = await get_all_config()
+    model = cfg.get("MODEL_CHUNK") or cfg.get("MODEL_HAIKU") or settings.MODEL_HAIKU
+
+    sample = full_text[:6000]
+    prompt = (
+        "Below is the beginning of a book (extracted from a PDF — it may include "
+        "the cover page, title page, and copyright page).\n\n"
+        "Identify the book's REAL title and author. Also give a one-sentence "
+        "description and a category if you can.\n\n"
+        "Return ONLY valid JSON, no markdown:\n"
+        '{"title": "...", "author": "...", "description": "...", "category": "..."}\n'
+        "Rules:\n"
+        "- title/author must be exactly as printed in the book (keep the original "
+        "language — Arabic stays Arabic).\n"
+        '- If the author truly cannot be found, use "" (empty string) — never invent one.\n'
+        f"- If no clear title is found, use: {fallback_title!r}\n\n"
+        f"=== BOOK TEXT START ===\n{sample}"
+    )
+
+    try:
+        raw = await chat_complete(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+        )
+    except Exception as exc:
+        log.warning("metadata extraction call failed: %s", exc)
+        return {}
+
+    raw = (raw or "").strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+    try:
+        data = json_module.loads(raw)
+    except json_module.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start == -1 or end <= start:
+            return {}
+        try:
+            data = json_module.loads(raw[start:end + 1])
+        except json_module.JSONDecodeError:
+            return {}
+
+    return {
+        "title":       str(data.get("title") or "").strip(),
+        "author":      str(data.get("author") or "").strip(),
+        "description": str(data.get("description") or "").strip(),
+        "category":    str(data.get("category") or "").strip(),
+    }
+
+
+# ── Text helpers ──────────────────────────────────────────────────────────────
+
+def _sanitize(text: str) -> str:
+    """Strip NUL + C0 control chars Postgres rejects (keeps \\t \\n \\r)."""
     if not text:
         return ""
-    # Remove NULs and other C0 controls except tab/newline/CR
     return "".join(
         ch for ch in text
-        if ch == "\t" or ch == "\n" or ch == "\r" or ord(ch) >= 0x20
+        if ch in "\t\n\r" or ord(ch) >= 0x20
     )
 
 
-def _extract_chapters(raw: bytes, filename: str) -> list[Chapter]:
+_HEADING_RE = re.compile(
+    r"(?m)^(?:Chapter|CHAPTER|Chap\.?)\s+(\d+|[IVXLC]+)[^\n]*$|"
+    r"^(\d+)\.\s+[A-Z][^\n]{3,}$|"
+    r"^(?:الفصل|الباب|الجزء)\s+[^\n]{1,40}$"          # Arabic chapter headings
+)
+
+
+def _split_chapters(full_text: str) -> list[Chapter]:
     """
-    Extract chapters from a PDF.
-    Strategy:
-    1. Look for heading-like patterns (Chapter / CHAPTER / numbered headings).
-    2. If none found, group pages into ~10-page chunks.
+    Split extracted text into chapters.
+    1. Chapter-heading patterns (English + Arabic).
+    2. Fallback: ~3000-word parts.
     """
-    from pypdf import PdfReader
+    splits = list(_HEADING_RE.finditer(full_text))
 
-    reader = PdfReader(io.BytesIO(raw))
-    pages  = []
-    for page in reader.pages:
-        txt = page.extract_text() or ""
-        # Strip NUL + other control chars BEFORE the text touches Postgres
-        pages.append(_sanitize_pdf_text(txt).strip())
-
-    # Merge all text, note page boundaries
-    full_text = "\n".join(pages)
-
-    # Detect chapter headings
-    heading_re = re.compile(
-        r"(?m)^(?:Chapter|CHAPTER|Chap\.?)\s+(\d+|[IVXLC]+)[^\n]*$|"
-        r"^(\d+)\.\s+[A-Z][^\n]{3,}$"
-    )
-    splits = list(heading_re.finditer(full_text))
-
-    if splits:
+    if len(splits) >= 2:
         chapters: list[Chapter] = []
         for i, m in enumerate(splits):
-            start = m.start()
-            end   = splits[i + 1].start() if i + 1 < len(splits) else len(full_text)
+            start   = m.start()
+            end     = splits[i + 1].start() if i + 1 < len(splits) else len(full_text)
             heading = m.group(0).strip()
             body    = full_text[start + len(heading): end].strip()
-            if len(body.split()) > 30:   # skip near-empty chapters
-                chapters.append(Chapter(index=i + 1, title=heading, text=body))
+            if len(body.split()) > 30:
+                chapters.append(Chapter(index=len(chapters) + 1, title=heading, text=body))
         if chapters:
             return chapters
 
-    # Fallback: 10-page chunks
-    chunk_size = 10
+    # Fallback: fixed-size word chunks
+    words = full_text.split()
+    part_words = 3000
     chapters = []
-    for i in range(0, len(pages), chunk_size):
-        chunk_pages = pages[i: i + chunk_size]
-        body = "\n".join(chunk_pages).strip()
+    for i in range(0, len(words), part_words):
+        body = " ".join(words[i: i + part_words]).strip()
         if len(body.split()) > 30:
             idx = len(chapters) + 1
-            chapters.append(Chapter(
-                index = idx,
-                title = f"Part {idx}",
-                text  = body,
-            ))
+            chapters.append(Chapter(index=idx, title=f"Part {idx}", text=body))
     return chapters

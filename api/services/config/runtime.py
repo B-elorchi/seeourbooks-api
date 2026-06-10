@@ -113,11 +113,37 @@ def _defaults() -> dict[str, str]:
         # Concurrency knobs for the parallelised steps.
         "HAIKU_CONCURRENCY":             "6",
         "MINDMAP_CONCURRENCY":           "4",
+        # ── Chunking & summary length knobs (per language) ───────────────────
+        # Words per ingest chunk. Bigger = fewer chunks (cheaper, less granular).
+        "CHUNK_WORDS_EN":                str(settings.CHUNK_SIZE_WORDS),
+        "CHUNK_WORDS_AR":                str(settings.CHUNK_SIZE_WORDS),
+        # Max words for the FULL book summary. Default 4000 words per book.
+        # Set 0 to fall back to the length preset (3min=450 … 15min=2250).
+        "SUMMARY_MAX_WORDS_EN":          "4000",
+        "SUMMARY_MAX_WORDS_AR":          "4000",
+        # Max words for each per-chapter summary (Pass 1 / Haiku). 0 = default.
+        "CHAPTER_SUMMARY_MAX_WORDS":     "0",
+        # ── Summary quality / coverage check (gates audio generation) ────────
+        # An independent model scores how well the summary covers the whole
+        # book (0-100). audio_full / audio_chapters only run when the score
+        # meets SUMMARY_QA_THRESHOLD. Set ENABLED=false to skip the check.
+        "SUMMARY_QA_ENABLED":            "true",
+        "SUMMARY_QA_MODEL":              "deepseek/deepseek-chat",
+        "SUMMARY_QA_THRESHOLD":          "70",
+        # ── Cross-language translation ───────────────────────────────────────
+        # Always produce BOTH an English and Arabic summary. Translation is on
+        # by default (required); audio in the translated/target language is
+        # opt-in via TARGET_LANG_AUDIO_ENABLED.
+        "TRANSLATE_SUMMARY_ENABLED":     "true",
+        "TRANSLATE_MODEL":               settings.MODEL_SONNET,
+        "TARGET_LANG_AUDIO_ENABLED":     "false",
         "TTS_PROVIDER_EN":                settings.TTS_PROVIDER_EN,
         "TTS_VOICE_EN":                   settings.TTS_VOICE_EN,
         "TTS_PROVIDER_AR":                settings.TTS_PROVIDER_AR,
         "TTS_VOICE_AR":                   settings.TTS_VOICE_AR,
         "CARTESIA_MODEL":                 settings.CARTESIA_MODEL,
+        "CARTESIA_VOICE_EN":              "",
+        "CARTESIA_VOICE_AR":              "",
         "GEMINI_TTS_MODEL":               settings.GEMINI_TTS_MODEL,
         "OPENROUTER_TTS_MODEL":           settings.OPENROUTER_TTS_MODEL,
         "OPENROUTER_TTS_VOICE":           settings.OPENROUTER_TTS_VOICE,

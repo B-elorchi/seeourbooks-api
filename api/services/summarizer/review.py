@@ -14,13 +14,16 @@ async def run_review_pass(
     style:    str,
     language: str,
     model:    str | None = None,
+    max_words: int | None = None,
 ) -> str:
     """
     Quality-check the final summary and correct it if needed.
     Returns the (possibly corrected) summary text.
+
+    max_words — admin override (SUMMARY_MAX_WORDS_*). When None/0, uses preset.
     """
     model     = model or settings.MODEL_HAIKU
-    target    = SUMMARY_LENGTHS.get(length, 750)
+    target    = max_words if (max_words and max_words > 0) else SUMMARY_LENGTHS.get(length, 750)
     lang_name = "Arabic" if language == "ar" else "English"
     word_count = len(summary.split())
     low, high  = int(target * 0.85), int(target * 1.15)

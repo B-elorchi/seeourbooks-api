@@ -98,6 +98,8 @@ def _merge_results(old: dict | str | None, new: dict) -> dict:
             merged[key] = new[key]
     if new.get("quick_summary"):
         merged["quick_summary"] = new["quick_summary"]
+    if new.get("summary_qa"):
+        merged["summary_qa"] = new["summary_qa"]
     if new.get("chapters"):
         merged["chapters"] = new["chapters"]
     if new.get("processing_time"):
