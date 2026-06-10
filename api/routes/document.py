@@ -250,18 +250,23 @@ async def _extract_metadata(full_text: str, fallback_title: str, language: str) 
     cfg   = await get_all_config()
     model = cfg.get("MODEL_CHUNK") or cfg.get("MODEL_HAIKU") or settings.MODEL_HAIKU
 
-    sample = full_text[:6000]
+    sample = full_text[:8000]
     prompt = (
-        "Below is the beginning of a book (extracted from a PDF — it may include "
-        "the cover page, title page, and copyright page).\n\n"
-        "Identify the book's REAL title and author. Also give a one-sentence "
-        "description and a category if you can.\n\n"
+        "Below is the beginning of a book extracted from a PDF. It may include the "
+        "cover page, title page, and copyright page — but it may also contain "
+        "watermarks or stamps from PDF download websites (e.g. 'Noor-Book.Com', "
+        "'pdf-book.net', 'كتب pdf', etc.).\n\n"
+        "Your task: identify the book's REAL title and the real human author name. "
+        "Also give a one-sentence description and a category.\n\n"
         "Return ONLY valid JSON, no markdown:\n"
-        '{"title": "...", "author": "...", "description": "...", "category": "..."}\n'
+        '{"title": "...", "author": "...", "description": "...", "category": "..."}\n\n'
         "Rules:\n"
-        "- title/author must be exactly as printed in the book (keep the original "
-        "language — Arabic stays Arabic).\n"
-        '- If the author truly cannot be found, use "" (empty string) — never invent one.\n'
+        "- IGNORE any website names, URLs, or download-site watermarks — these are "
+        "NOT part of the title or author.\n"
+        "- title must be the actual book title (keep original language — Arabic stays Arabic).\n"
+        "- author must be the human author's full name as printed in the book "
+        "(Arabic authors stay in Arabic script).\n"
+        '- If the author truly cannot be found anywhere in the text, use "" — never invent one.\n'
         f"- If no clear title is found, use: {fallback_title!r}\n\n"
         f"=== BOOK TEXT START ===\n{sample}"
     )

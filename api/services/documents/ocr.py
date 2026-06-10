@@ -180,12 +180,11 @@ async def run_ocrmypdf(
         # ocrmypdf binary vanished mid-run (container hot-swap, PATH change)
         raise OCRMissingError("ocrmypdf binary disappeared mid-run") from exc
 
-    # ocrmypdf returns exit codes documented at
-    # https://ocrmypdf.readthedocs.io/en/latest/advanced.html#return-codes
-    #   0 = success
-    #   6 = already has text + --skip-text → input copied to output (still success)
-    #   anything else = failure
-    if proc.returncode in (0, 6):
+    # ocrmypdf return codes:
+    #   0  = success
+    #   6  = already has text + --skip-text → input copied to output (still success)
+    #   15 = some pages could not be OCR'd (partial success — output is still usable)
+    if proc.returncode in (0, 6, 15):
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise OCRFailure(
                 "ocrmypdf reported success but produced no output file",
