@@ -242,7 +242,26 @@ async def _generate_gemini_openrouter(model: str, prompt: str, output_path: str)
             headers=headers,
             json=payload,
         )
-        r.raise_for_status()
+        # Some models reject the `reasoning` control with a 400 — retry once
+        # without it rather than failing the whole cover step.
+        if r.status_code == 400 and "reasoning" in payload:
+            log.warning(
+                "cover: %s rejected request (400): %s — retrying without reasoning control",
+                model, r.text[:300],
+            )
+            payload.pop("reasoning", None)
+            r = await http.post(
+                f"{_OPENROUTER_BASE}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        if r.status_code >= 400:
+            # Surface OpenRouter's actual error body — the bare status code is
+            # useless for diagnosing why the request was rejected.
+            raise RuntimeError(
+                f"OpenRouter image request for {model} failed with HTTP "
+                f"{r.status_code}: {r.text[:500]}"
+            )
         body = r.json()
 
     try:
