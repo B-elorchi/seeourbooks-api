@@ -23,4 +23,5 @@ async def me(user: AuthUser = Depends(require_user)) -> dict:
         "email":    user.email,
         "role":     user.role,
         "is_admin": user.is_admin,
+        "app_role": user.app_role,
     }

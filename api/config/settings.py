@@ -204,6 +204,17 @@ class Settings(BaseSettings):
     # Leave empty to make every authenticated user an admin (single-tenant mode).
     ADMIN_EMAILS: str = ""
 
+    # ── API Key Auth ──────────────────────────────────────────────────────────
+    # When True, all /api/* routes (except /api/health, /api/auth/*) require a
+    # valid X-API-Key header.  Set False to disable for local dev.
+    API_KEY_AUTH_ENABLED: bool = False   # change to True in production .env
+
+    # ── Watermarks ────────────────────────────────────────────────────────────
+    # Text stamped on generated images (cover) and embedded in audio ID3 tags.
+    WATERMARK_TEXT: str = "SeeOurBook.com"
+    # Watermark corner for images: top-left | top-right | bottom-left | bottom-right
+    WATERMARK_POSITION: str = "bottom-right"
+
     model_config = SettingsConfigDict(
         # Looks for .env in api/ first, then in the project root (seeourbook-summarizer-api/)
         env_file=(

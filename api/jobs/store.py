@@ -18,19 +18,22 @@ def is_cancelled(job_id: str) -> bool:
     return job_id in _cancelled_jobs
 
 
-async def create_job(book_id: str, input_data: dict) -> str:
+async def create_job(book_id: str, input_data: dict, user_id: str | None = None) -> str:
     # Generate the UUID client-side because the `id` column on `pipeline_jobs`
     # is declared `TEXT PRIMARY KEY` with no DEFAULT — inserting without an
     # explicit id triggers a NOT NULL violation and PostgREST returns 400.
     job_id = uuid.uuid4().hex
-    row = await insert("pipeline_jobs", {
+    data: dict = {
         "id":          job_id,
         "book_id":     book_id,
         "status":      "queued",
         "input":       input_data,
         "retry_count": 0,
         "max_retries": MAX_RETRIES,
-    })
+    }
+    if user_id:
+        data["user_id"] = user_id
+    row = await insert("pipeline_jobs", data)
     return str(row.get("id") or job_id)
 
 

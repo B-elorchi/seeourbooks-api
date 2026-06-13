@@ -60,3 +60,9 @@ class DocumentNotFound(DocumentError):
     """No document row with the given id."""
     code = "document_not_found"
     http_status = 404
+
+
+class PageSaveError(DocumentError):
+    """One or more extracted pages could not be persisted to the database."""
+    code = "page_save_failed"
+    http_status = 500

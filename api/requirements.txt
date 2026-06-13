@@ -41,6 +41,9 @@ python-bidi==0.6.6
 # numpy is required by moviepy
 numpy==1.26.4
 
+# Audio ID3 tag writing (watermarks in MP3 files)
+mutagen==1.47.0
+
 # Supabase Auth JWT verification — both HS256 (legacy projects) and
 # ES256 / RS256 via JWKS (newer projects with asymmetric signing keys).
 # The [crypto] extra pulls in `cryptography` for asymmetric algorithms.

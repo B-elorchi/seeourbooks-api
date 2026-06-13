@@ -186,6 +186,11 @@ def _defaults() -> dict[str, str]:
         # Mindmap generation settings
         # Set to 0 or empty for unlimited tokens (no max_tokens limit sent to API)
         "MINDMAP_JSON_MAX_TOKENS":        "0",
+        # ── Security ─────────────────────────────────────────────────────────
+        "API_KEY_AUTH_ENABLED":           "false",
+        # ── Watermarks ────────────────────────────────────────────────────────
+        "WATERMARK_TEXT":                 settings.WATERMARK_TEXT,
+        "WATERMARK_POSITION":             settings.WATERMARK_POSITION,
     }
 
 

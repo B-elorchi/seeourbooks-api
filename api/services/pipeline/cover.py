@@ -61,13 +61,31 @@ async def _build_prompt(title: str, author: str, summary: str | None,
 
     template = await get_config_value("PROMPT_COVER", PROMPT_COVER_DEFAULT)
 
-    return template.format(
+    # Treat blank / placeholder author values as "no author known". We must
+    # NEVER stamp the literal word "Unknown" (or a placeholder) onto a cover.
+    clean_author = (author or "").strip()
+    if clean_author.lower() in ("", "unknown", "n/a", "anonymous", "غير معروف", "مجهول"):
+        clean_author = ""
+
+    prompt = template.format(
         title      = title or "Untitled",
-        author     = author or "Unknown",
+        author     = clean_author,
         details    = details,
         summary    = snippet,
         genre_hint = genre_hint,
     )
+
+    # When the author is unknown, override any author-rendering instructions in
+    # the template: produce a title-only cover rather than printing "Unknown".
+    if not clean_author:
+        prompt += (
+            "\n\nIMPORTANT — AUTHOR IS UNKNOWN:\n"
+            "- Do NOT render any author name, byline, placeholder, or the word "
+            "\"Unknown\" anywhere on the cover.\n"
+            "- Render ONLY the title as text. Leave the lower author area as "
+            "clean negative space / artwork with no text."
+        )
+    return prompt
 
 _OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
@@ -393,4 +411,9 @@ async def generate_cover(
         provider_tag = "openai"
 
     await log_image_usage(provider=provider_tag, model=model, count=1)
+
+    # Watermark the generated image
+    from api.services.pipeline.watermark import stamp_image  # noqa: PLC0415
+    stamp_image(output_path, cfg)
+
     return output_path

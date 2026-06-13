@@ -40,7 +40,7 @@ import zipfile
 from html.parser import HTMLParser
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel
 
 from api.jobs.store import create_job, set_failed, set_cancelled, is_cancelled
@@ -48,6 +48,7 @@ from api.models.requests import PipelineReq, PipelineOptions, VALID_STEPS
 from api.routes.pipeline import _run_job, JobCancelledError
 from api.services.db import find, insert, upsert, update
 from api.services.config.runtime import get_config_value
+from api.auth.apikey import get_api_key_user
 
 log = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ class V2PipelineReq(BaseModel):
 # ── Main endpoint ─────────────────────────────────────────────────────────────
 
 @router.post("/run", status_code=202)
-async def v2_pipeline_run(req: V2PipelineReq, background_tasks: BackgroundTasks) -> dict:
+async def v2_pipeline_run(req: V2PipelineReq, background_tasks: BackgroundTasks, request: Request) -> dict:
     """
     One-shot smart pipeline. Returns a job_id IMMEDIATELY (202).
 
@@ -112,8 +113,20 @@ async def v2_pipeline_run(req: V2PipelineReq, background_tasks: BackgroundTasks)
         options=req.options,
     )
 
+    # Attach user_id from API key if present
+    api_user = await get_api_key_user(request)
+    user_id = api_user.user_id if api_user else None
+
     # Create the job row now so the client gets an id to poll immediately.
-    job_id = await create_job(book_id, pipeline_req.model_dump())
+    job_id = await create_job(book_id, pipeline_req.model_dump(), user_id=user_id)
+
+    # Record user→book link (best-effort, non-blocking)
+    if user_id:
+        try:
+            from api.services.db import upsert as db_upsert  # noqa: PLC0415
+            await db_upsert("user_books", {"user_id": user_id, "book_id": book_id, "job_id": job_id})
+        except Exception:
+            pass
 
     # Do everything heavy in the background: ingest (if needed) → run pipeline.
     background_tasks.add_task(

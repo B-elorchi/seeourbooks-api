@@ -3,11 +3,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.routes import summarize, books, jobs, health, pipeline, pipeline_v2, admin, document, documents, auth
+from api.routes import users as users_router
+from api.routes import me as me_router
 from api.services.db import startup as db_startup, shutdown as db_shutdown
 from api.services.config.migrations import run_migrations
 from api.services.documents.errors import DocumentError
+from api.config.settings import settings
 
 
 @asynccontextmanager
@@ -87,8 +91,50 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-API-Key"],
+    expose_headers=["X-API-Key"],
 )
+
+
+# ── API Key enforcement middleware ────────────────────────────────────────────
+# Routes that don't require an API key (public / auth endpoints)
+_PUBLIC_PREFIXES = (
+    "/api/health",
+    "/api/auth/status",
+    "/docs",
+    "/openapi.json",
+    "/redoc",
+)
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        from api.services.config.runtime import get_config_value  # noqa: PLC0415
+        enabled = await get_config_value("API_KEY_AUTH_ENABLED", "false")
+        if enabled.lower() != "true":
+            return await call_next(request)
+
+        path = request.url.path
+        if any(path.startswith(p) for p in _PUBLIC_PREFIXES) or request.method == "OPTIONS":
+            return await call_next(request)
+
+        from api.auth.apikey import _extract_key, _hash, _lookup  # noqa: PLC0415
+        raw = _extract_key(request)
+        if not raw:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing API key — pass X-API-Key header"},
+            )
+        row = await _lookup(_hash(raw))
+        if not row:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or revoked API key"},
+            )
+        # Attach key info to request state for routes that want it
+        request.state.api_key_row = row
+        return await call_next(request)
+
+app.add_middleware(ApiKeyMiddleware)
 
 
 # Any DocumentError that escapes a route maps to the typed HTTP status it
@@ -103,13 +149,15 @@ async def _document_error_handler(_request: Request, exc: DocumentError) -> JSON
     return JSONResponse(status_code=exc.http_status, content=body)
 
 
-app.include_router(summarize.router, prefix="/api")
-app.include_router(books.router,     prefix="/api")
-app.include_router(jobs.router,      prefix="/api")
-app.include_router(health.router,    prefix="/api")
+app.include_router(summarize.router,   prefix="/api")
+app.include_router(books.router,       prefix="/api")
+app.include_router(jobs.router,        prefix="/api")
+app.include_router(health.router,      prefix="/api")
 app.include_router(pipeline.router,    prefix="/api")
 app.include_router(pipeline_v2.router, prefix="/api")
-app.include_router(admin.router,     prefix="/api")
-app.include_router(document.router,  prefix="/api")
-app.include_router(documents.router, prefix="/api")
-app.include_router(auth.router,      prefix="/api")
+app.include_router(admin.router,       prefix="/api")
+app.include_router(document.router,    prefix="/api")
+app.include_router(documents.router,   prefix="/api")
+app.include_router(auth.router,        prefix="/api")
+app.include_router(users_router.router, prefix="/api")
+app.include_router(me_router.router,    prefix="/api")

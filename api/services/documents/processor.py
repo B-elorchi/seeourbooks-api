@@ -159,6 +159,12 @@ async def _run_stages(doc: dict) -> None:
             document_id, resume,
         )
         current = resume
+        # Refresh the snapshot — `doc` was captured before this run started and
+        # may carry a stale (or missing) ocr_file_path.  Re-reading ensures the
+        # Stage-1 skip check below sees what's actually persisted in the DB.
+        refreshed = await repo.get_document(document_id)
+        if refreshed:
+            doc = refreshed
 
     # Move from 'uploaded' → 'processing' immediately so the client sees activity.
     # For RETRIES that already passed earlier stages we just clear the error
@@ -206,6 +212,11 @@ async def _run_stages(doc: dict) -> None:
         else:
             log.info("doc=%s: PDF already has text — skipping OCR", document_id)
             ocr_path = original_path
+            # Persist the source path as ocr_file_path even though we skipped
+            # OCR.  Without this, born-digital PDFs never record an
+            # ocr_file_path, so _detect_resume_point() can't tell that OCR
+            # finished and restarts the pipeline from zero on every retry.
+            await repo.update_document(document_id, {"ocr_file_path": original_path})
 
         await repo.set_status(document_id, "ocr_completed", progress=30)
         current = "ocr_completed"

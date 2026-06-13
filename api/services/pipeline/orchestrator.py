@@ -1017,6 +1017,8 @@ async def run_pipeline(
                 else:
                     meta = {}
                     src = raw
+                from api.services.pipeline.watermark import stamp_audio  # noqa: PLC0415
+                stamp_audio(src, cfg)
                 key = f"books/{req.book_id}/audio_{req.language}_{req.options.length}.mp3"
                 url = upload_file(src, key, CONTENT_TYPES[".mp3"])
                 full_audio = {
@@ -1044,6 +1046,8 @@ async def run_pipeline(
                         else:
                             t_meta = {}
                             t_src = t_raw
+                        from api.services.pipeline.watermark import stamp_audio as _stamp_audio  # noqa: PLC0415
+                        _stamp_audio(t_src, cfg)
                         t_key = f"books/{req.book_id}/audio_{target_lang}_{req.options.length}.mp3"
                         t_url = upload_file(t_src, t_key, CONTENT_TYPES[".mp3"])
                         translated_audio = {
@@ -1110,6 +1114,8 @@ async def run_pipeline(
                         src = ch_proc
                     else:
                         src = ch_raw
+                    from api.services.pipeline.watermark import stamp_audio as _sa  # noqa: PLC0415
+                    _sa(src, cfg)
                     idx = ch["index"]
                     k   = f"books/{req.book_id}/chapters/ch_{idx:02d}_{req.language}.mp3"
                     audio_url = upload_file(src, k, CONTENT_TYPES[".mp3"])
@@ -1127,15 +1133,22 @@ async def run_pipeline(
                     errors[f"audio_chapter_{ch['index']}"] = str(e)
 
             # Calculate status based on actual processing, not just chapter count
-            total_attempted = ch_processed + ch_errors
             if ch_errors > 0 and ch_processed == 0:
                 step_status["audio_chapters"] = "failed"
+                # Collect first error message as the step-level error for display
+                first_err = next(
+                    (v for k, v in errors.items() if k.startswith("audio_chapter_")), None
+                )
+                errors["audio_chapters"] = (
+                    f"All {ch_errors} chapter(s) failed. "
+                    + (f"First error: {first_err}" if first_err else "Check logs for details.")
+                )
             elif ch_errors > 0:
                 step_status["audio_chapters"] = "partial"
+                errors["audio_chapters"] = f"{ch_errors} of {ch_errors + ch_processed} chapter(s) failed"
             elif ch_processed > 0:
                 step_status["audio_chapters"] = "done"
             elif ch_skipped_no_summary > 0:
-                # All chapters skipped due to missing summaries
                 step_status["audio_chapters"] = "failed"
                 errors["audio_chapters"] = f"All {ch_skipped_no_summary} chapters skipped: no summaries available"
             else:
@@ -1159,10 +1172,12 @@ async def run_pipeline(
             set_step("mindmap")
             await _checkpoint()
             try:
+                from api.services.pipeline.watermark import stamp_mindmap_json, stamp_mindmap_mermaid  # noqa: PLC0415
                 if mindmap_format == "json":
                     mindmap_data = await generate_json_mindmap(
                         req.title or req.book_id, full_summary, req.language, model=model_mindmap
                     )
+                    mindmap_data = stamp_mindmap_json(mindmap_data, cfg)
                     json_path = os.path.join(tmp, "mindmap.json")
                     with open(json_path, "w", encoding="utf-8") as f:
                         json_module.dump(mindmap_data, f, ensure_ascii=False)
@@ -1172,6 +1187,7 @@ async def run_pipeline(
                     mermaid = await generate_mermaid_code(
                         req.title or req.book_id, full_summary, req.language, model=model_mindmap
                     )
+                    mermaid = stamp_mindmap_mermaid(mermaid, cfg)
                     svg_path = os.path.join(tmp, "mindmap.svg")
                     await render_mermaid_svg(mermaid, svg_path)
                     key = f"books/{req.book_id}/mindmap.svg"
@@ -1207,10 +1223,12 @@ async def run_pipeline(
                 ch_text  = ch["summary"]
                 async with mm_sem:
                     try:
+                        from api.services.pipeline.watermark import stamp_mindmap_json, stamp_mindmap_mermaid  # noqa: PLC0415
                         if mindmap_format == "json":
                             data = await generate_json_mindmap(
                                 ch_title, ch_text, req.language, model=model_mindmap
                             )
+                            data = stamp_mindmap_json(data, cfg)
                             json_path = os.path.join(tmp, f"ch{idx}_mindmap.json")
                             with open(json_path, "w", encoding="utf-8") as f:
                                 json_module.dump(data, f, ensure_ascii=False)
@@ -1221,6 +1239,7 @@ async def run_pipeline(
                             mermaid = await generate_mermaid_code(
                                 ch_title, ch_text, req.language, model=model_mindmap
                             )
+                            mermaid = stamp_mindmap_mermaid(mermaid, cfg)
                             svg_path = os.path.join(tmp, f"ch{idx}_mindmap.svg")
                             await render_mermaid_svg(mermaid, svg_path)
                             key = f"books/{req.book_id}/chapters/ch_{idx:02d}_mindmap.svg"
@@ -1261,8 +1280,16 @@ async def run_pipeline(
             # Calculate status based on actual processing
             if ch_errors > 0 and ch_processed == 0:
                 step_status["mindmap_chapters"] = "failed"
+                first_err = next(
+                    (v for k, v in errors.items() if k.startswith("mindmap_chapter_")), None
+                )
+                errors["mindmap_chapters"] = (
+                    f"All {ch_errors} chapter(s) failed. "
+                    + (f"First error: {first_err}" if first_err else "Check logs for details.")
+                )
             elif ch_errors > 0:
                 step_status["mindmap_chapters"] = "partial"
+                errors["mindmap_chapters"] = f"{ch_errors} of {ch_errors + ch_processed} chapter(s) failed"
             elif ch_processed > 0:
                 step_status["mindmap_chapters"] = "done"
             elif ch_skipped_no_summary > 0:

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 import jwt
@@ -53,6 +53,11 @@ log = logging.getLogger(__name__)
 _JWKS_CACHE: dict[str, tuple[float, dict]] = {}
 _JWKS_TTL_SEC = 3600   # 1 hour
 
+# Tolerance for clock skew between this server and Supabase's token issuer.
+# Applied to iat/nbf/exp checks so a slightly-off server clock doesn't reject
+# valid tokens ("token is not yet valid (iat)").
+_CLOCK_SKEW_LEEWAY_SEC = 60
+
 
 # ── Public dataclass for FastAPI dependency injection ───────────────────────
 
@@ -62,12 +67,25 @@ class AuthUser:
     id:    str          # auth.users.id (uuid)
     email: str          # auth.users.email
     role:  str          # "authenticated" by default; "service_role" for backend
-    is_admin: bool      # computed from ADMIN_EMAILS
+    is_admin: bool      # computed from ADMIN_EMAILS or app_users.role
+    # Application role from app_users.role: "admin" | "editor" | "viewer".
+    # Drives data scoping (editors see only their own jobs/documents).
+    app_role: str = "viewer"
 
     @property
     def jwt_subject(self) -> str:
         """Alias for `id` — useful when caller speaks JWT terminology."""
         return self.id
+
+    def owner_filter(self) -> dict:
+        """
+        PostgREST-style filter for row ownership.
+
+        Admins see everything ({} = no filter); everyone else is restricted to
+        rows whose user_id matches their own id. Rows with NULL user_id are
+        therefore visible to admins only.
+        """
+        return {} if self.is_admin else {"user_id": self.id}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -99,6 +117,55 @@ def _is_admin_email(email: str | None) -> bool:
         # Single-tenant mode — every authenticated user is an admin
         return True
     return email.lower() in admins
+
+
+# ── DB-backed role map (app_users.role) ──────────────────────────────────────
+# Roles (admin/editor/viewer) can be granted via the database instead of the
+# ADMIN_EMAILS env var. We cache the whole email→role map in-process for 60s so
+# the auth path doesn't pay a DB round trip on every request.
+_DB_ROLE_CACHE: dict[str, object] = {"t": 0.0, "roles": {}}
+_DB_ROLE_TTL_SEC = 60.0
+
+
+async def _db_role_map() -> dict[str, str]:
+    """Lower-cased email → role for active app_users. Cached 60s."""
+    now = time.time()
+    if (now - float(_DB_ROLE_CACHE["t"])) < _DB_ROLE_TTL_SEC:
+        return _DB_ROLE_CACHE["roles"]  # type: ignore[return-value]
+    roles: dict[str, str] = {}
+    try:
+        from api.services.db import find
+        rows = await find(
+            "app_users",
+            filters={"is_active": True},
+            select="email, role",
+        )
+        roles = {
+            (r.get("email") or "").lower(): (r.get("role") or "viewer")
+            for r in rows if r.get("email")
+        }
+    except Exception as exc:
+        # DB unreachable or table missing — serve the stale map rather than
+        # locking users out on a transient blip.
+        log.debug("auth: could not load DB roles: %s", exc)
+        return _DB_ROLE_CACHE["roles"]  # type: ignore[return-value]
+    _DB_ROLE_CACHE["t"] = now
+    _DB_ROLE_CACHE["roles"] = roles
+    return roles
+
+
+async def _resolve_app_role(email: str | None) -> str:
+    """
+    Resolve the application role for an email.
+
+    ADMIN_EMAILS env (or single-tenant mode) always wins as 'admin'. Otherwise
+    the role comes from app_users.role, defaulting to 'viewer'.
+    """
+    if _is_admin_email(email):
+        return "admin"
+    if not email:
+        return "viewer"
+    return (await _db_role_map()).get(email.lower(), "viewer")
 
 
 def _extract_token(request: Request) -> str | None:
@@ -192,16 +259,21 @@ def _decode(token: str) -> dict | None:
     kid = header.get("kid")
 
     # ── Decode kwargs that work for both audience-on and audience-off projects
+    # `leeway` tolerates small clock skew between this server and Supabase's
+    # token issuer. Without it, a server clock a few seconds behind rejects
+    # freshly-issued tokens with "The token is not yet valid (iat)".
     def _try_decode(key, algorithms):
         # First try with the standard "authenticated" audience that Supabase uses.
         try:
             return jwt.decode(
                 token, key, algorithms=algorithms, audience="authenticated",
+                leeway=_CLOCK_SKEW_LEEWAY_SEC,
             )
         except InvalidAudienceError:
             # Some projects disable audience verification — retry without it.
             return jwt.decode(
                 token, key, algorithms=algorithms, options={"verify_aud": False},
+                leeway=_CLOCK_SKEW_LEEWAY_SEC,
             )
 
     # ── HS256 (legacy projects) ──────────────────────────────────────────────
@@ -274,6 +346,12 @@ def _payload_to_user(payload: dict) -> AuthUser:
     )
 
 
+async def _apply_app_role(user: AuthUser) -> AuthUser:
+    """Resolve the DB app_role (and the derived is_admin) onto an AuthUser."""
+    app_role = await _resolve_app_role(user.email)
+    return replace(user, app_role=app_role, is_admin=user.is_admin or app_role == "admin")
+
+
 # ── FastAPI dependencies ─────────────────────────────────────────────────────
 
 async def get_current_user(request: Request) -> AuthUser | None:
@@ -286,14 +364,14 @@ async def get_current_user(request: Request) -> AuthUser | None:
     payload = _decode(token)
     if not payload:
         return None
-    return _payload_to_user(payload)
+    return await _apply_app_role(_payload_to_user(payload))
 
 
 async def require_user(request: Request) -> AuthUser:
     """Hard auth — raises 401 when no valid token is present."""
     if not auth_enabled():
         # Auth disabled → no-op AuthUser. Lets dev environments run without Supabase.
-        return AuthUser(id="dev", email="dev@local", role="dev", is_admin=True)
+        return AuthUser(id="dev", email="dev@local", role="dev", is_admin=True, app_role="admin")
 
     token = _extract_token(request)
     if not token:
@@ -310,7 +388,7 @@ async def require_user(request: Request) -> AuthUser:
             detail="invalid or expired access token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return _payload_to_user(payload)
+    return await _apply_app_role(_payload_to_user(payload))
 
 
 async def require_admin(request: Request) -> AuthUser:

@@ -1,9 +1,10 @@
 import json
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
+from api.auth import AuthUser, require_user
 from api.config.settings import settings
 from api.models.requests import SumReq
 from api.services.db import find, insert, upsert, update
@@ -22,7 +23,7 @@ def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def run(req: SumReq) -> AsyncIterator[str]:
+async def run(req: SumReq, user_id: Optional[str] = None) -> AsyncIterator[str]:
 
     # ── 1. Cache check (our internal cache from prior summary runs) ──────────
     try:
@@ -88,13 +89,16 @@ async def run(req: SumReq) -> AsyncIterator[str]:
     if existing:
         job_id = existing[0]["id"]
     else:
-        j = await insert("summary_jobs", {
+        new_job: dict = {
             "book_id":  req.book_id,
             "length":   req.length,
             "style":    req.style,
             "language": req.language,
             "status":   "processing",
-        })
+        }
+        if user_id:
+            new_job["user_id"] = user_id
+        j = await insert("summary_jobs", new_job)
         job_id = j["id"]
 
     await update("summary_jobs", {"id": job_id}, {"status": "processing"})
@@ -183,9 +187,9 @@ async def run(req: SumReq) -> AsyncIterator[str]:
 
 
 @router.post("/summarize")
-async def summarize(req: SumReq):
+async def summarize(req: SumReq, user: AuthUser = Depends(require_user)):
     return StreamingResponse(
-        run(req),
+        run(req, user_id=user.id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

@@ -25,12 +25,14 @@ from typing import Any
 from fastapi import (
     APIRouter,
     BackgroundTasks,
+    Depends,
     File,
     HTTPException,
     UploadFile,
 )
 from pydantic import BaseModel, Field
 
+from api.auth import AuthUser, require_user
 from api.config.settings import settings
 from api.services.documents import repository as repo
 from api.services.documents.processor import process_document
@@ -39,21 +41,37 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 log = logging.getLogger(__name__)
 
 
+def _check_doc_access(doc: dict, user: AuthUser) -> None:
+    """
+    Raise 404 if the caller may not access this document.
+
+    Admins access everything. Everyone else may only access documents they own
+    (matching user_id). We use 404 rather than 403 so we don't leak the
+    existence of other users' documents.
+    """
+    if not user.is_admin and (doc.get("user_id") or None) != user.id:
+        raise HTTPException(status_code=404, detail="document not found")
+
+
 # ── List endpoint (diagnostic / admin) ──────────────────────────────────────
 
 @router.get("")
-async def list_documents(limit: int = 50) -> dict[str, Any]:
+async def list_documents(
+    limit: int = 50,
+    user: AuthUser = Depends(require_user),
+) -> dict[str, Any]:
     """
-    Quick diagnostic — return every document row the API can see.
+    Return document rows visible to the caller.
 
-    Use this to confirm the API is actually writing to the database you
-    expect.  If this returns rows but PgAdmin shows none, your PgAdmin is
-    connected to a different database than the API uses.
+    Admins see every document; editors/viewers see only the documents they
+    uploaded (rows whose user_id matches their id). Rows with no owner are
+    therefore visible to admins only.
     """
     from api.services.db import find as _find
     try:
         rows = await _find(
             "documents",
+            filters=user.owner_filter(),
             select="id, original_filename, status, progress, page_count, language, created_at",
             order="created_at DESC",
             limit=limit,
@@ -173,7 +191,10 @@ def _validate_pdf_bytes(raw: bytes) -> None:
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 @router.post("/upload", response_model=UploadResponse, status_code=201)
-async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
+async def upload_document(
+    file: UploadFile = File(...),
+    user: AuthUser = Depends(require_user),
+) -> UploadResponse:
     """
     Upload a PDF and create a `documents` row.  Returns the document id;
     call POST /documents/{id}/process next to start the pipeline.
@@ -204,6 +225,7 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
             "original_file_path": str(target_path),
             "status":             "uploaded",
             "progress":           0,
+            "user_id":            user.id,
         })
     except Exception as exc:
         log.exception("upload_document: DB insert failed")
@@ -221,6 +243,7 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
 async def start_processing(
     document_id: str,
     background_tasks: BackgroundTasks,
+    user: AuthUser = Depends(require_user),
 ) -> ProcessResponse:
     """
     Kick off the OCR → extract → AI → chunk pipeline as a background task.
@@ -232,6 +255,7 @@ async def start_processing(
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}") from exc
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
+    _check_doc_access(doc, user)
 
     # Reject double-processing — the processor is idempotent but we'd rather
     # surface a clear 409 than silently noop.
@@ -243,13 +267,17 @@ async def start_processing(
 
 
 @router.get("/{document_id}/status", response_model=StatusResponse)
-async def get_status(document_id: str) -> StatusResponse:
+async def get_status(
+    document_id: str,
+    user: AuthUser = Depends(require_user),
+) -> StatusResponse:
     try:
         doc = await repo.get_document(document_id)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}") from exc
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
+    _check_doc_access(doc, user)
     return StatusResponse(
         documentId    = document_id,
         status        = doc.get("status") or "uploaded",
@@ -261,13 +289,17 @@ async def get_status(document_id: str) -> StatusResponse:
 
 
 @router.get("/{document_id}/text", response_model=TextResponse)
-async def get_text(document_id: str) -> TextResponse:
+async def get_text(
+    document_id: str,
+    user: AuthUser = Depends(require_user),
+) -> TextResponse:
     try:
         doc = await repo.get_document(document_id)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}") from exc
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
+    _check_doc_access(doc, user)
     pages = await repo.get_pages(document_id)
     return TextResponse(
         documentId=document_id,
@@ -276,13 +308,17 @@ async def get_text(document_id: str) -> TextResponse:
 
 
 @router.get("/{document_id}/summary", response_model=SummaryResponse)
-async def get_summary(document_id: str) -> SummaryResponse:
+async def get_summary(
+    document_id: str,
+    user: AuthUser = Depends(require_user),
+) -> SummaryResponse:
     try:
         doc = await repo.get_document(document_id)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}") from exc
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
+    _check_doc_access(doc, user)
     row = await repo.get_summary(document_id)
     if not row:
         raise HTTPException(
@@ -298,13 +334,17 @@ async def get_summary(document_id: str) -> SummaryResponse:
 
 
 @router.get("/{document_id}/json", response_model=JsonResponse)
-async def get_structured_json(document_id: str) -> JsonResponse:
+async def get_structured_json(
+    document_id: str,
+    user: AuthUser = Depends(require_user),
+) -> JsonResponse:
     try:
         doc = await repo.get_document(document_id)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Database unreachable: {exc}") from exc
     if not doc:
         raise HTTPException(status_code=404, detail="document not found")
+    _check_doc_access(doc, user)
     row = await repo.get_summary(document_id)
     if not row:
         raise HTTPException(
