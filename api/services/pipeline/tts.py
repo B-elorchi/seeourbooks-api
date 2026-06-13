@@ -131,6 +131,16 @@ async def synthesize(
     cfg = cfg or {}
     lang = language.upper()          # "EN" or "AR"
 
+    # ── Spoken audio watermark ───────────────────────────────────────────────
+    # Prepend a short branding intro that is read aloud at the start of the
+    # audio (e.g. "Seeourbook تقدم لكم"). Configurable per language in
+    # Admin → Settings → Watermarks. Empty = no intro.
+    watermark = (cfg.get(f"AUDIO_WATERMARK_TEXT_{lang}") or "").strip()
+    if watermark:
+        # Trailing period + blank line gives the TTS engine a natural pause
+        # before the content begins.
+        text = f"{watermark}.\n\n{text}"
+
     provider = cfg.get(f"TTS_PROVIDER_{lang}") or (
         settings.TTS_PROVIDER_EN if language == "en" else settings.TTS_PROVIDER_AR
     )

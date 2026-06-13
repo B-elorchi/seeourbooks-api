@@ -191,6 +191,10 @@ def _defaults() -> dict[str, str]:
         # ── Watermarks ────────────────────────────────────────────────────────
         "WATERMARK_TEXT":                 settings.WATERMARK_TEXT,
         "WATERMARK_POSITION":             settings.WATERMARK_POSITION,
+        # Spoken intro read at the start of generated audio, per language.
+        # Empty = no intro.
+        "AUDIO_WATERMARK_TEXT_EN":        "SeeOurBook presents",
+        "AUDIO_WATERMARK_TEXT_AR":        "Seeourbook تقدم لكم",
     }
 
 

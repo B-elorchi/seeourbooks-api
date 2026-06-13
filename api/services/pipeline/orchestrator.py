@@ -635,6 +635,16 @@ async def run_pipeline(
             import logging as _log
             _log.getLogger(__name__).warning("checkpoint write failed: %s", exc)
 
+    async def _skip_step(name: str) -> None:
+        """
+        Mark a requested step as 'skipped' (disabled in config or missing input)
+        and clear any stale error/result from a previous run, so a step turned
+        off in the admin panel never lingers as 'failed' in the UI.
+        """
+        step_status[name] = "skipped"
+        errors.pop(name, None)
+        await _persist_step_result(job_id, name, "skipped")
+
     # ── Production catalog enrichment ─────────────────────────────────────────
     if not (req.title and req.author and req.summary):
         book_row = await _fetch_book_from_catalog(req.book_id)
@@ -955,7 +965,10 @@ async def run_pipeline(
         # ── cover ─────────────────────────────────────────────────────────────
         async def _do_cover() -> None:
             nonlocal cover_url
-            if "cover" not in steps or not cover_enabled:
+            if "cover" not in steps:
+                return
+            if not cover_enabled:
+                await _skip_step("cover")
                 return
             step_status["cover"] = "running"
             set_step("cover")
@@ -988,7 +1001,10 @@ async def run_pipeline(
         # ── audio_full ────────────────────────────────────────────────────────
         async def _do_audio_full() -> None:
             nonlocal full_audio, full_audio_path, translated_audio
-            if "audio_full" not in steps or not tts_enabled or not full_summary:
+            if "audio_full" not in steps:
+                return
+            if not tts_enabled or not full_summary:
+                await _skip_step("audio_full")
                 return
             if audio_blocked:
                 step_status["audio_full"] = "failed"
@@ -1074,7 +1090,10 @@ async def run_pipeline(
         # ── audio_chapters ────────────────────────────────────────────────────
         async def _do_audio_chapters() -> None:
             nonlocal chapter_audio, chapter_results
-            if "audio_chapters" not in steps or not tts_enabled or not chapter_results:
+            if "audio_chapters" not in steps:
+                return
+            if not tts_enabled or not chapter_results:
+                await _skip_step("audio_chapters")
                 return
             if audio_blocked:
                 step_status["audio_chapters"] = "failed"
@@ -1166,7 +1185,10 @@ async def run_pipeline(
         # ── mindmap ───────────────────────────────────────────────────────────
         async def _do_mindmap() -> None:
             nonlocal mindmap_url, mindmap_data, mindmap_path_saved
-            if "mindmap" not in steps or not mindmap_enabled or not full_summary:
+            if "mindmap" not in steps:
+                return
+            if not mindmap_enabled or not full_summary:
+                await _skip_step("mindmap")
                 return
             step_status["mindmap"] = "running"
             set_step("mindmap")
@@ -1206,7 +1228,10 @@ async def run_pipeline(
         # ── mindmap_chapters ──────────────────────────────────────────────────
         async def _do_mindmap_chapters() -> None:
             nonlocal chapter_mindmap, chapter_results
-            if "mindmap_chapters" not in steps or not mindmap_enabled or not chapter_results:
+            if "mindmap_chapters" not in steps:
+                return
+            if not mindmap_enabled or not chapter_results:
+                await _skip_step("mindmap_chapters")
                 return
             step_status["mindmap_chapters"] = "running"
             set_step("mindmap_chapters")
@@ -1327,10 +1352,10 @@ async def run_pipeline(
         # ── alt_text ──────────────────────────────────────────────────────────
         async def _do_alt_text() -> None:
             nonlocal alt_text
-            if (
-                "alt_text" not in steps or not alttext_enabled
-                or not cover_url or not os.path.exists(cover_path_saved)
-            ):
+            if "alt_text" not in steps:
+                return
+            if not alttext_enabled or not cover_url or not os.path.exists(cover_path_saved):
+                await _skip_step("alt_text")
                 return
             step_status["alt_text"] = "running"
             set_step("alt_text")
@@ -1350,7 +1375,10 @@ async def run_pipeline(
         # ── video ─────────────────────────────────────────────────────────────
         async def _do_video() -> None:
             nonlocal video_url, video_meta
-            if "video" not in steps or not video_enabled or not full_summary:
+            if "video" not in steps:
+                return
+            if not video_enabled or not full_summary:
+                await _skip_step("video")
                 return
             step_status["video"] = "running"
             set_step("video")
@@ -1392,9 +1420,12 @@ async def run_pipeline(
             nonlocal epub_url
             log.info("_do_inject_epub called: inject_epub in steps=%s, epub_enabled=%s, has_full_summary=%s", 
                      "inject_epub" in steps, epub_enabled, bool(full_summary))
-            if "inject_epub" not in steps or not epub_enabled or not full_summary:
-                log.info("_do_inject_epub skipped: steps=%s, epub_enabled=%s, full_summary=%s", 
+            if "inject_epub" not in steps:
+                return
+            if not epub_enabled or not full_summary:
+                log.info("_do_inject_epub skipped: steps=%s, epub_enabled=%s, full_summary=%s",
                          steps, epub_enabled, bool(full_summary))
+                await _skip_step("inject_epub")
                 return
             step_status["inject_epub"] = "running"
             set_step("inject_epub")

@@ -31,8 +31,9 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form
 
+from api.auth import AuthUser, get_current_user
 from api.jobs.store import create_job, set_running, set_done, set_failed, set_partial
 from api.models.requests import PipelineReq, PipelineOptions, Chapter
 from api.services.db import update as db_update
@@ -53,6 +54,7 @@ async def document_upload(
     steps:    str         = Form(""),           # "summarize,audio_full" or ""
     length:   str         = Form("10min"),
     style:    str         = Form("narrative"),
+    user:     AuthUser | None = Depends(get_current_user),
 ):
     """Upload a PDF and start a pipeline job on its content. Returns 202 immediately."""
 
@@ -85,7 +87,7 @@ async def document_upload(
         options  = PipelineOptions(length=length, style=style),
         source   = "pdf_upload",
     )
-    job_id = await create_job(book_id, placeholder_req.model_dump())
+    job_id = await create_job(book_id, placeholder_req.model_dump(), user_id=user.id if user else None)
 
     background_tasks.add_task(
         _extract_then_run,
