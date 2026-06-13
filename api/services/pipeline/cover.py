@@ -228,7 +228,12 @@ async def _generate_gemini_openrouter(model: str, prompt: str, output_path: str)
         "model":      model,
         "messages":   [{"role": "user", "content": prompt}],
         "modalities": ["image", "text"],   # ← tells OpenRouter we want image output
-        "max_tokens": 4096,
+        # Reasoning-capable image models (e.g. gemini-3-pro-image-preview) can
+        # burn the whole completion budget "thinking" and never emit the image,
+        # returning content=None + a long `reasoning` field. Disable reasoning
+        # and give a generous token ceiling so the image is actually produced.
+        "reasoning":  {"enabled": False},
+        "max_tokens": 32768,
     }
 
     async with httpx.AsyncClient(timeout=120) as http:
