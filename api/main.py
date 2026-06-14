@@ -85,7 +85,45 @@ async def _recover_stuck_jobs() -> None:
         log.warning("Could not check for stuck jobs on startup: %s", exc)
 
 
-app = FastAPI(title="SeeOurBook Summarizer API", lifespan=lifespan)
+app = FastAPI(
+    title="SeeOurBook Summarizer API",
+    lifespan=lifespan,
+    swagger_ui_parameters={"persistAuthorization": True},
+)
+
+# Register both auth schemes so the Swagger UI shows two "Authorize" inputs:
+#   • BearerAuth  — Supabase JWT (used by most endpoints via require_user / require_admin)
+#   • ApiKeyAuth  — X-API-Key header (used when API_KEY_AUTH_ENABLED=true)
+def _custom_openapi():
+    import fastapi.openapi.utils as ou  # noqa: PLC0415
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = ou.get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description or "",
+        routes=app.routes,
+    )
+    schema.setdefault("components", {}).setdefault("securitySchemes", {}).update({
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": "Supabase JWT — paste the access_token from /api/auth/me",
+        },
+        "ApiKeyAuth": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key",
+            "description": "API key generated from the Users page (when API_KEY_AUTH_ENABLED=true)",
+        },
+    })
+    # Apply both schemes globally (each endpoint can override with [])
+    schema["security"] = [{"BearerAuth": []}, {"ApiKeyAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = _custom_openapi  # type: ignore[method-assign]
 
 app.add_middleware(
     CORSMiddleware,

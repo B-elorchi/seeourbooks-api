@@ -755,6 +755,137 @@ async def admin_costs(days: int = 30) -> dict:
     }
 
 
+@router.get("/costs/by-book")
+async def admin_costs_by_book(days: int = 30, limit: int = 20) -> list:
+    """Cost breakdown grouped by book (job), sorted by cost descending."""
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        rows = await find("usage_logs", filters={"created_at": ("gte", since_iso)},
+                          select="job_id, cost_usd", order="created_at DESC", limit=50000)
+    except Exception:
+        return []
+
+    # Aggregate by job_id
+    by_job: dict[str, float] = {}
+    for r in rows:
+        jid = r.get("job_id") or "__none__"
+        by_job[jid] = by_job.get(jid, 0.0) + float(r.get("cost_usd") or 0)
+
+    job_ids = [j for j in by_job if j != "__none__"]
+    if not job_ids:
+        return []
+
+    # Fetch book titles from pipeline_jobs
+    try:
+        jobs = await find("pipeline_jobs",
+                          filters={"id": ("in", job_ids[:200])},
+                          select="id, book_id, input, user_id")
+    except Exception:
+        jobs = []
+
+    meta: dict[str, dict] = {j["id"]: j for j in jobs}
+
+    results = []
+    for jid, cost in sorted(by_job.items(), key=lambda x: x[1], reverse=True):
+        if jid == "__none__" or cost < 0.0001:
+            continue
+        m = meta.get(jid, {})
+        inp = m.get("input") or {}
+        if isinstance(inp, str):
+            try:
+                import json as _json; inp = _json.loads(inp)
+            except Exception:
+                inp = {}
+        results.append({
+            "job_id":   jid,
+            "book_id":  m.get("book_id") or jid[:8],
+            "title":    inp.get("title") or m.get("book_id") or jid[:8],
+            "user_id":  m.get("user_id"),
+            "cost_usd": round(cost, 4),
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+@router.get("/costs/by-user")
+async def admin_costs_by_user(days: int = 30) -> list:
+    """Cost breakdown grouped by user (via pipeline_jobs.user_id), sorted by cost."""
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        rows = await find("usage_logs", filters={"created_at": ("gte", since_iso)},
+                          select="job_id, cost_usd", order="created_at DESC", limit=50000)
+    except Exception:
+        return []
+
+    by_job: dict[str, float] = {}
+    for r in rows:
+        jid = r.get("job_id") or "__none__"
+        by_job[jid] = by_job.get(jid, 0.0) + float(r.get("cost_usd") or 0)
+
+    job_ids = [j for j in by_job if j != "__none__"]
+    if not job_ids:
+        return []
+
+    try:
+        jobs = await find("pipeline_jobs",
+                          filters={"id": ("in", job_ids[:200])},
+                          select="id, user_id")
+    except Exception:
+        jobs = []
+
+    # Map job → user
+    job_user: dict[str, str] = {j["id"]: (j.get("user_id") or "__anonymous__") for j in jobs}
+
+    # Aggregate by user
+    by_user: dict[str, float] = {}
+    for jid, cost in by_job.items():
+        uid = job_user.get(jid, "__anonymous__")
+        by_user[uid] = by_user.get(uid, 0.0) + cost
+
+    # Fetch user emails from app_users
+    user_ids = [u for u in by_user if u != "__anonymous__"]
+    user_emails: dict[str, str] = {}
+    if user_ids:
+        try:
+            users = await find("app_users",
+                               filters={"id": ("in", user_ids[:100])},
+                               select="id, email, name")
+            user_emails = {u["id"]: (u.get("name") or u.get("email") or u["id"][:8]) for u in users}
+        except Exception:
+            pass
+
+    results = []
+    for uid, cost in sorted(by_user.items(), key=lambda x: x[1], reverse=True):
+        if cost < 0.0001:
+            continue
+        results.append({
+            "user_id":  uid,
+            "label":    user_emails.get(uid, "Anonymous" if uid == "__anonymous__" else uid[:8]),
+            "cost_usd": round(cost, 4),
+        })
+    return results
+
+
+@router.get("/costs/daily")
+async def admin_costs_daily(days: int = 30) -> list:
+    """Daily cost totals for the last N days — for a trend line chart."""
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        rows = await find("usage_logs", filters={"created_at": ("gte", since_iso)},
+                          select="created_at, cost_usd", order="created_at ASC", limit=50000)
+    except Exception:
+        return []
+
+    daily: dict[str, float] = {}
+    for r in rows:
+        day = (r.get("created_at") or "")[:10]
+        if day:
+            daily[day] = daily.get(day, 0.0) + float(r.get("cost_usd") or 0)
+
+    return [{"date": d, "cost_usd": round(c, 4)} for d, c in sorted(daily.items())]
+
+
 @router.post("/jobs/{job_id}/rerun", status_code=202)
 async def admin_rerun_steps(
     job_id: str,

@@ -183,6 +183,15 @@ async def _extract_then_run(
 
         await set_running(job_id)
         result = await run_pipeline(req, job_id=job_id)
+
+        # Attach extracted pages so the job detail view can show a text reader.
+        # Cap at 300 pages and 3 000 chars/page to stay within JSONB size limits.
+        result["extracted_pages"] = [
+            {"page": p.get("page", i + 1), "content": _sanitize(p.get("content", ""))[:3000]}
+            for i, p in enumerate(pages[:300])
+        ]
+        result["page_count_extracted"] = total_pages
+
         if result["status"] == "done":
             await set_done(job_id, result)
         elif result["status"] == "partial":
