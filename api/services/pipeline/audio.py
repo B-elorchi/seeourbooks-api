@@ -41,11 +41,39 @@ def _ffmpeg_available() -> bool:
 
 def _fallback_passthrough(input_path: str, output_path: str) -> dict:
     """When ffmpeg is unavailable (or disabled), just move the raw TTS file."""
-    # Use shutil.move so it works across filesystems too (rename is intra-fs only)
     if input_path != output_path:
         shutil.move(input_path, output_path)
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     return {"duration_seconds": 0, "size_mb": round(size_mb, 2)}
+
+
+def _detect_codec(path: str) -> str:
+    """
+    Ask ffprobe for the first audio stream's codec name.
+    Returns '' if ffprobe is unavailable or the file is unreadable.
+    Gemini TTS (native + OpenRouter) often returns raw PCM even though the
+    file is named .mp3 — the codec will come back as 'pcm_s16le' or empty.
+    """
+    if not shutil.which("ffprobe"):
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip().lower()
+    except Exception:
+        return ""
+
+
+def _run(cmd: list[str]) -> None:
+    subprocess.run(cmd, check=True, capture_output=True)
 
 
 def process_audio(input_path: str, output_path: str, title: str, author: str) -> dict:
@@ -56,6 +84,10 @@ def process_audio(input_path: str, output_path: str, title: str, author: str) ->
     Falls back to a no-op passthrough when:
       - PIPELINE_STEP_AUDIO_PROCESSING is disabled in settings, or
       - ffmpeg is not installed on the host.
+
+    Handles two TTS output formats automatically:
+      1. Valid MP3/AAC  → loudnorm → re-encode fallback → passthrough
+      2. Raw PCM (s16le 24kHz mono, Gemini TTS) → forced decode → loudnorm
     """
     if not settings.PIPELINE_STEP_AUDIO_PROCESSING:
         return _fallback_passthrough(input_path, output_path)
@@ -69,61 +101,68 @@ def process_audio(input_path: str, output_path: str, title: str, author: str) ->
         "-metadata", f"album=SeeOurBook Summary",
     ]
 
-    # Primary: loudness-normalize to EBU R128.
-    # -fflags +genpts  regenerates presentation timestamps — fixes the
-    # "time_base 1/0" crash that occurs when Gemini TTS returns raw PCM
-    # or concatenated chunks with missing/zero frame headers.
-    # -ar 44100 on INPUT forces ffmpeg to assume a sane sample rate before
-    # the filter graph tries to configure itself.
-    cmd_normalize = [
-        "ffmpeg", "-y",
-        "-fflags", "+genpts",
-        "-ar", "44100",
-        "-i", input_path,
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-        "-ar", "44100",
-        "-ac", "2",
-        "-b:a", "128k",
-        *_meta,
-        output_path,
-    ]
-
-    # Fallback: plain re-encode without the loudnorm filter. Runs when the
-    # input audio is so malformed that the filter graph fails to init. Still
-    # better than raw TTS bytes — we at least get clean MP3 framing and tags.
-    cmd_reencode = [
-        "ffmpeg", "-y",
-        "-fflags", "+genpts",
-        "-i", input_path,
-        "-ar", "44100",
-        "-ac", "2",
-        "-b:a", "128k",
-        *_meta,
-        output_path,
-    ]
-
-    def _run(cmd: list[str]) -> None:
-        subprocess.run(cmd, check=True, capture_output=True)
+    codec = _detect_codec(input_path)
+    is_pcm = not codec or codec.startswith("pcm_")
+    if is_pcm:
+        log.info("audio: input detected as raw PCM (codec=%r) — transcoding with explicit format", codec or "unknown")
 
     try:
-        _run(cmd_normalize)
+        if is_pcm:
+            # Gemini returns s16le PCM at 24 000 Hz mono — tell ffmpeg explicitly.
+            _run([
+                "ffmpeg", "-y",
+                "-f", "s16le", "-ar", "24000", "-ac", "1",
+                "-i", input_path,
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-ar", "44100", "-ac", "2", "-b:a", "128k",
+                *_meta, output_path,
+            ])
+        else:
+            # Normal compressed audio (MP3/AAC/etc.)
+            _run([
+                "ffmpeg", "-y",
+                "-fflags", "+genpts",
+                "-i", input_path,
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-ar", "44100", "-ac", "2", "-b:a", "128k",
+                *_meta, output_path,
+            ])
+
     except FileNotFoundError:
         log.warning("ffmpeg vanished mid-run, falling back to passthrough")
         return _fallback_passthrough(input_path, output_path)
+
     except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[-600:]
-        log.warning(
-            "ffmpeg loudnorm failed (exit %s): %s — retrying without filter",
-            exc.returncode, stderr,
-        )
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[-500:]
+        log.warning("ffmpeg loudnorm failed (exit %s): %s — retrying without filter", exc.returncode, stderr)
+
+        # Second attempt: same format detection but skip the loudnorm filter.
         try:
-            _run(cmd_reencode)
+            if is_pcm:
+                _run([
+                    "ffmpeg", "-y",
+                    "-f", "s16le", "-ar", "24000", "-ac", "1",
+                    "-i", input_path,
+                    "-ar", "44100", "-ac", "2", "-b:a", "128k",
+                    *_meta, output_path,
+                ])
+            else:
+                _run([
+                    "ffmpeg", "-y",
+                    "-fflags", "+genpts",
+                    "-i", input_path,
+                    "-ar", "44100", "-ac", "2", "-b:a", "128k",
+                    *_meta, output_path,
+                ])
         except subprocess.CalledProcessError as exc2:
-            stderr2 = (exc2.stderr or b"").decode("utf-8", errors="replace")[-500:]
-            log.error("ffmpeg re-encode also failed (exit %s): %s", exc2.returncode, stderr2)
+            log.error(
+                "ffmpeg re-encode also failed (exit %s): %s",
+                exc2.returncode,
+                (exc2.stderr or b"").decode("utf-8", errors="replace")[-400:],
+            )
             return _fallback_passthrough(input_path, output_path)
 
-    # Get duration via ffprobe (also optional — if it fails, just skip)
+    # Get duration via ffprobe (best-effort)
     duration = 0
     try:
         if shutil.which("ffprobe"):
