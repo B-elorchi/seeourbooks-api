@@ -63,33 +63,65 @@ def process_audio(input_path: str, output_path: str, title: str, author: str) ->
     if not _ffmpeg_available():
         return _fallback_passthrough(input_path, output_path)
 
-    cmd = [
+    _meta = [
+        "-metadata", f"title={title}",
+        "-metadata", f"artist={author}",
+        "-metadata", f"album=SeeOurBook Summary",
+    ]
+
+    # Primary: loudness-normalize to EBU R128.
+    # -fflags +genpts  regenerates presentation timestamps — fixes the
+    # "time_base 1/0" crash that occurs when Gemini TTS returns raw PCM
+    # or concatenated chunks with missing/zero frame headers.
+    # -ar 44100 on INPUT forces ffmpeg to assume a sane sample rate before
+    # the filter graph tries to configure itself.
+    cmd_normalize = [
         "ffmpeg", "-y",
+        "-fflags", "+genpts",
+        "-ar", "44100",
         "-i", input_path,
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
         "-ar", "44100",
         "-ac", "2",
         "-b:a", "128k",
-        "-metadata", f"title={title}",
-        "-metadata", f"artist={author}",
-        "-metadata", f"album=SeeOurBook Summary",
+        *_meta,
         output_path,
     ]
-    try:
+
+    # Fallback: plain re-encode without the loudnorm filter. Runs when the
+    # input audio is so malformed that the filter graph fails to init. Still
+    # better than raw TTS bytes — we at least get clean MP3 framing and tags.
+    cmd_reencode = [
+        "ffmpeg", "-y",
+        "-fflags", "+genpts",
+        "-i", input_path,
+        "-ar", "44100",
+        "-ac", "2",
+        "-b:a", "128k",
+        *_meta,
+        output_path,
+    ]
+
+    def _run(cmd: list[str]) -> None:
         subprocess.run(cmd, check=True, capture_output=True)
+
+    try:
+        _run(cmd_normalize)
     except FileNotFoundError:
-        # ffmpeg disappeared between cache check and execution (extremely unlikely
-        # but possible on hot-swapped containers) — handle exactly like missing ffmpeg.
         log.warning("ffmpeg vanished mid-run, falling back to passthrough")
         return _fallback_passthrough(input_path, output_path)
     except subprocess.CalledProcessError as exc:
-        # ffmpeg ran but failed (bad input, codec issue, etc.).  Surface the real
-        # error from stderr so the admin sees WHY rather than a generic crash.
-        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[-500:]
-        log.error("ffmpeg failed (exit %s): %s", exc.returncode, stderr)
-        # Fall back to passthrough so the step still succeeds — we'd rather have
-        # un-normalized audio than no audio.
-        return _fallback_passthrough(input_path, output_path)
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")[-600:]
+        log.warning(
+            "ffmpeg loudnorm failed (exit %s): %s — retrying without filter",
+            exc.returncode, stderr,
+        )
+        try:
+            _run(cmd_reencode)
+        except subprocess.CalledProcessError as exc2:
+            stderr2 = (exc2.stderr or b"").decode("utf-8", errors="replace")[-500:]
+            log.error("ffmpeg re-encode also failed (exit %s): %s", exc2.returncode, stderr2)
+            return _fallback_passthrough(input_path, output_path)
 
     # Get duration via ffprobe (also optional — if it fails, just skip)
     duration = 0

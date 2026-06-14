@@ -459,13 +459,15 @@ async def _gemini(text: str, voice: str, language: str, model: str, output_path:
 
     # Extract base64-encoded audio from Gemini native response shape:
     #   candidates[0].content.parts[0].inlineData.data
-    audio_b64: str | None = None
+    audio_b64:   str | None = None
+    audio_mime:  str | None = None
     try:
         parts = data["candidates"][0]["content"]["parts"]
         for part in parts:
             inline_data = part.get("inlineData")
             if inline_data and inline_data.get("mimeType", "").startswith("audio/"):
-                audio_b64 = inline_data.get("data")
+                audio_b64  = inline_data.get("data")
+                audio_mime = inline_data.get("mimeType", "audio/mp3")
                 break
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(
@@ -479,8 +481,36 @@ async def _gemini(text: str, voice: str, language: str, model: str, output_path:
             f"Response excerpt: {str(data)[:400]}"
         )
 
-    with open(output_path, "wb") as f:
-        f.write(base64.b64decode(audio_b64))
+    raw_bytes = base64.b64decode(audio_b64)
+
+    # Gemini native API often returns audio/pcm (raw L16 PCM at 24kHz mono).
+    # Saving raw PCM as .mp3 makes ffmpeg mis-detect the format, causing the
+    # "time_base 1/0" crash. Detect this and transcode to MP3 via ffmpeg so
+    # the caller always receives a valid MP3 regardless of Gemini's output format.
+    _is_pcm = (audio_mime or "").lower() in ("audio/pcm", "audio/l16", "audio/raw")
+    if _is_pcm:
+        import shutil, subprocess, tempfile
+        tmp_pcm = output_path + ".pcm"
+        try:
+            with open(tmp_pcm, "wb") as f:
+                f.write(raw_bytes)
+            # PCM: signed 16-bit little-endian at 24 000 Hz mono (Gemini default)
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "s16le", "-ar", "24000", "-ac", "1",
+                    "-i", tmp_pcm,
+                    "-ar", "44100", "-ac", "2", "-b:a", "128k",
+                    output_path,
+                ],
+                check=True, capture_output=True,
+            )
+        finally:
+            if os.path.exists(tmp_pcm):
+                os.remove(tmp_pcm)
+    else:
+        with open(output_path, "wb") as f:
+            f.write(raw_bytes)
 
 
 # Valid OpenAI audio voices for gpt-audio / gpt-audio-mini
