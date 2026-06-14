@@ -62,6 +62,9 @@ async def run_haiku_pass(
             max_tokens=max_tokens,
         )
 
+        if not summary or not summary.strip():
+            raise ValueError(f"Model returned empty summary for chunk {cid}")
+
         await upsert(
             "chunk_summaries",
             {

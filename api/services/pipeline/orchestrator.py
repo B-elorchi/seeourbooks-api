@@ -342,6 +342,7 @@ async def _fetch_catalog_chapters(book_id: str) -> list[dict]:
     return [
         {"index": r["chunk_index"], "title": f"Chapter {r['chunk_index']}", "text": r["content"]}
         for r in rows
+        if r.get("content") and str(r["content"]).strip()
     ]
 
 
@@ -764,7 +765,11 @@ async def run_pipeline(
                                 select="chunk_index, summary",
                                 order="chunk_index ASC",
                             )
-                            chunk_sum_map = {r["chunk_index"]: r.get("summary") or "" for r in chunk_rows}
+                            chunk_sum_map = {
+                                r["chunk_index"]: r.get("summary") or ""
+                                for r in chunk_rows
+                                if r.get("summary") and str(r["summary"]).strip()
+                            }
                             if chunk_sum_map:
                                 chapter_results = [
                                     {
@@ -820,8 +825,22 @@ async def run_pipeline(
                         log.info("Generated %d chapter summaries from text", len(chapter_results))
                         # Save back to DB for future use
                         await _persist_chunk_summaries(req.book_id, chapter_results)
-                    
-                    step_status["summarize"] = "done"
+
+                    # Determine actual summarize status based on valid summaries
+                    _valid = [c for c in chapter_results if c.get("summary") and str(c["summary"]).strip()]
+                    if not _valid and chapters:
+                        step_status["summarize"] = "failed"
+                        errors["summarize"] = (
+                            "All chapter summaries are empty. "
+                            "The source text may be missing, unextractable, or the AI model failed."
+                        )
+                    elif len(_valid) < len(chapters):
+                        step_status["summarize"] = "partial"
+                        errors["summarize"] = (
+                            f"{len(chapters) - len(_valid)} of {len(chapters)} chapters failed to summarize"
+                        )
+                    else:
+                        step_status["summarize"] = "done"
                 else:
                     haiku_conc = max(1, int(cfg.get("HAIKU_CONCURRENCY", "6")))
                     sem = asyncio.Semaphore(haiku_conc)
@@ -879,7 +898,21 @@ async def run_pipeline(
                         sentences = [s.strip() for s in full_summary.replace(".\n", ". ").split(". ") if s.strip()]
                         quick_summary = ". ".join(sentences[:2]) + "." if sentences else full_summary[:200]
 
-                    step_status["summarize"] = "done"
+                    # Determine actual summarize status based on valid summaries
+                    _valid = [c for c in chapter_results if c.get("summary") and str(c["summary"]).strip()]
+                    if not _valid and chapters:
+                        step_status["summarize"] = "failed"
+                        errors["summarize"] = (
+                            "All chapter summaries are empty. "
+                            "The source text may be missing, unextractable, or the AI model failed."
+                        )
+                    elif len(_valid) < len(chapters):
+                        step_status["summarize"] = "partial"
+                        errors["summarize"] = (
+                            f"{len(chapters) - len(_valid)} of {len(chapters)} chapters failed to summarize"
+                        )
+                    else:
+                        step_status["summarize"] = "done"
                     # Save chunk summaries back to chunks.summary
                     await _persist_chunk_summaries(req.book_id, chapter_results)
 
