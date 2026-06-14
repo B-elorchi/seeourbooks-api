@@ -128,6 +128,21 @@ def _vendor(model: str) -> str:
     return model.split("/", 1)[0] if "/" in model else ""
 
 
+# OpenRouter image models that require reasoning to be enabled — sending
+# `reasoning: {enabled: False}` to these returns 400 "Reasoning is mandatory
+# for this endpoint and cannot be disabled". Match the family prefix so future
+# minor-version releases don't need a code change.
+_MANDATORY_REASONING_PREFIXES = (
+    "google/gemini-3-pro-image",
+    "google/gemini-3-flash-image",
+)
+
+
+def _mandates_reasoning(model: str) -> bool:
+    name = (model or "").lower()
+    return any(name.startswith(p) for p in _MANDATORY_REASONING_PREFIXES)
+
+
 def _bare(model: str) -> str:
     """Strip vendor prefix."""
     return model.split("/", 1)[1] if "/" in model else model
@@ -224,17 +239,18 @@ async def _generate_gemini_openrouter(model: str, prompt: str, output_path: str)
         "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
         "Content-Type":  "application/json",
     }
-    payload = {
+    payload: dict = {
         "model":      model,
         "messages":   [{"role": "user", "content": prompt}],
         "modalities": ["image", "text"],   # ← tells OpenRouter we want image output
-        # Reasoning-capable image models (e.g. gemini-3-pro-image-preview) can
-        # burn the whole completion budget "thinking" and never emit the image,
-        # returning content=None + a long `reasoning` field. Disable reasoning
-        # and give a generous token ceiling so the image is actually produced.
-        "reasoning":  {"enabled": False},
         "max_tokens": 32768,
     }
+    # Some models can be told to skip reasoning and emit the image directly;
+    # others (e.g. gemini-3-pro-image-preview) mandate reasoning and 400 if we
+    # try to turn it off. Don't bother sending the field for those — saves a
+    # round-trip and a noisy warning on every cover.
+    if not _mandates_reasoning(model):
+        payload["reasoning"] = {"enabled": False}
 
     async with httpx.AsyncClient(timeout=120) as http:
         r = await http.post(
@@ -245,9 +261,9 @@ async def _generate_gemini_openrouter(model: str, prompt: str, output_path: str)
         # Some models reject the `reasoning` control with a 400 — retry once
         # without it rather than failing the whole cover step.
         if r.status_code == 400 and "reasoning" in payload:
-            log.warning(
-                "cover: %s rejected request (400): %s — retrying without reasoning control",
-                model, r.text[:300],
+            log.info(
+                "cover: %s requires reasoning — retrying without the disable flag",
+                model,
             )
             payload.pop("reasoning", None)
             r = await http.post(

@@ -45,29 +45,53 @@ def _provider_label(model: str) -> str:
 # provider 5xx, network timeout), the request is retried with the next model in
 # this chain.  Each entry is the list of fallbacks tried AFTER the primary.
 #
-# Design notes:
-#   - Claude → equivalent OpenAI tier (Haiku → 4.1-mini, Sonnet/Opus → 4.1)
-#   - OpenAI → equivalent Claude tier
-#   - OpenRouter wrappers fall back to native — if OpenRouter is down, native
-#     Anthropic/OpenAI is often still up.
+# Design rule (per product decision): EVERY fallback routes through OpenRouter
+# (`vendor/model` format). We never fall back to a native Anthropic or native
+# OpenAI endpoint — the single OPENROUTER_API_KEY is enough to access every
+# vendor, and consolidating billing/quota there avoids needing to maintain a
+# separate Anthropic/OpenAI account just for emergencies.
+#
+# Tier mapping:
+#   Haiku / 4.1-mini class  → anthropic/claude-haiku-4-5 → openai/gpt-4.1-mini → google/gemini-2.5-flash
+#   Sonnet / 4.1 class      → anthropic/claude-sonnet-4-6 → openai/gpt-4.1     → google/gemini-2.5-pro
+#   Opus class              → anthropic/claude-opus-4-7  → openai/gpt-4.1      → google/gemini-2.5-pro
 #
 # Admins can override per-model via the provider_config table: set
-# FALLBACK_<model> = "<m1>,<m2>,<m3>" to use a custom chain.
+# FALLBACK_<model> = "<m1>,<m2>,<m3>" to use a custom chain. The override is
+# used as-is; it does NOT have to be OpenRouter-only.
+_HAIKU_TIER_FALLBACKS = [
+    "anthropic/claude-haiku-4-5",
+    "openai/gpt-4.1-mini",
+    "google/gemini-2.5-flash",
+]
+_SONNET_TIER_FALLBACKS = [
+    "anthropic/claude-sonnet-4-6",
+    "openai/gpt-4.1",
+    "google/gemini-2.5-pro",
+]
+_OPUS_TIER_FALLBACKS = [
+    "anthropic/claude-opus-4-7",
+    "openai/gpt-4.1",
+    "google/gemini-2.5-pro",
+]
+
 _DEFAULT_FALLBACK_CHAINS: dict[str, list[str]] = {
-    # Native Anthropic → OpenRouter Anthropic → Native OpenAI tier-equivalent
-    "claude-haiku-4-5":          ["anthropic/claude-haiku-4-5",  "openai/gpt-4.1-mini", "gpt-4.1-mini"],
-    "claude-haiku-4-5-20251001": ["anthropic/claude-haiku-4-5",  "openai/gpt-4.1-mini", "gpt-4.1-mini"],
-    "claude-sonnet-4-6":         ["anthropic/claude-sonnet-4-6", "openai/gpt-4.1",      "gpt-4.1"],
-    "claude-opus-4-7":           ["anthropic/claude-opus-4-7",   "openai/gpt-4.1",      "gpt-4.1"],
-    # Native OpenAI → Claude tier-equivalent via OpenRouter then native
-    "gpt-4.1-mini":              ["openai/gpt-4.1-mini",  "anthropic/claude-haiku-4-5",  "claude-haiku-4-5"],
-    "gpt-4.1":                   ["openai/gpt-4.1",       "anthropic/claude-sonnet-4-6", "claude-sonnet-4-6"],
-    # OpenRouter wrappers → native counterpart
-    "anthropic/claude-haiku-4-5":  ["claude-haiku-4-5",  "openai/gpt-4.1-mini", "gpt-4.1-mini"],
-    "anthropic/claude-sonnet-4-6": ["claude-sonnet-4-6", "openai/gpt-4.1",      "gpt-4.1"],
-    "anthropic/claude-opus-4-7":   ["claude-opus-4-7",   "openai/gpt-4.1",      "gpt-4.1"],
-    "openai/gpt-4.1-mini":         ["gpt-4.1-mini",      "anthropic/claude-haiku-4-5",  "claude-haiku-4-5"],
-    "openai/gpt-4.1":              ["gpt-4.1",           "anthropic/claude-sonnet-4-6", "claude-sonnet-4-6"],
+    # Native Anthropic IDs → OpenRouter fallbacks
+    "claude-haiku-4-5":          _HAIKU_TIER_FALLBACKS,
+    "claude-haiku-4-5-20251001": _HAIKU_TIER_FALLBACKS,
+    "claude-sonnet-4-6":         _SONNET_TIER_FALLBACKS,
+    "claude-opus-4-7":           _OPUS_TIER_FALLBACKS,
+    # Native OpenAI IDs → OpenRouter fallbacks
+    "gpt-4.1-mini":              _HAIKU_TIER_FALLBACKS,
+    "gpt-4.1":                   _SONNET_TIER_FALLBACKS,
+    # OpenRouter primaries → other OpenRouter siblings (never bail to native)
+    "anthropic/claude-haiku-4-5":  ["openai/gpt-4.1-mini", "google/gemini-2.5-flash"],
+    "anthropic/claude-sonnet-4-6": ["openai/gpt-4.1",      "google/gemini-2.5-pro"],
+    "anthropic/claude-opus-4-7":   ["openai/gpt-4.1",      "google/gemini-2.5-pro"],
+    "openai/gpt-4.1-mini":         ["anthropic/claude-haiku-4-5",  "google/gemini-2.5-flash"],
+    "openai/gpt-4.1":              ["anthropic/claude-sonnet-4-6", "google/gemini-2.5-pro"],
+    "google/gemini-2.5-flash":     ["anthropic/claude-haiku-4-5",  "openai/gpt-4.1-mini"],
+    "google/gemini-2.5-pro":       ["anthropic/claude-sonnet-4-6", "openai/gpt-4.1"],
 }
 
 
