@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     TTS_VOICE_EN:      str = "aura-asteria-en"
     TTS_VOICE_AR:      str = ""              # set in admin: voice ID for chosen provider
 
+    # Sample rate (Hz) to assume when a TTS provider returns headerless raw PCM
+    # (Gemini TTS emits signed 16-bit little-endian PCM at 24 000 Hz mono).
+    # Used by the audio post-processing step to transcode such output to MP3.
+    TTS_PCM_SAMPLE_RATE:   int = 24000
+
     ELEVENLABS_API_KEY:    str = ""
     ELEVENLABS_VOICE_EN:   str = ""
     ELEVENLABS_VOICE_AR:   str = ""
