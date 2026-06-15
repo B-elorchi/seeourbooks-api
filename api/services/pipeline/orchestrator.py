@@ -402,6 +402,21 @@ async def _fetch_gutenberg_metadata(book_id: str) -> dict:
 
 
 def _pick_cached_summary(book_row: dict, language: str) -> str | None:
+    """
+    Return the best cached summary for the given language.
+
+    IMPORTANT — order matters: we prefer the FULL summary over the short
+    "10-minute / quick" version. This value becomes the book's `full_summary`,
+    which is what the audio (TTS) and downstream steps narrate. Picking the
+    10-min/quick text here would make the audio read the Quick Summary instead
+    of the full Summary.
+
+    Columns (catalog `books` table):
+      English — summary_english   = full Summary        (preferred)
+                summary_en_10min  = Quick / 10-min read (fallback)
+      Arabic  — arabic_summary_v2 = full Summary v2     (preferred)
+                arabic_summary    = full Summary v1      (fallback)
+    """
     _NULL_SENTINELS = {"", "null", "none", "nil", "n/a", "na", "undefined"}
 
     def _nonempty(value) -> str | None:
@@ -418,8 +433,8 @@ def _pick_cached_summary(book_row: dict, language: str) -> str | None:
             or _nonempty(book_row.get("arabic_summary"))
         )
     return (
-        _nonempty(book_row.get("summary_en_10min"))
-        or _nonempty(book_row.get("summary_english"))
+        _nonempty(book_row.get("summary_english"))     # full Summary first
+        or _nonempty(book_row.get("summary_en_10min"))  # quick/10-min fallback
     )
 
 
