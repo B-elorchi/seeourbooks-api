@@ -869,13 +869,23 @@ async def admin_costs_by_user(days: int = 30) -> list:
 
 @router.get("/costs/daily")
 async def admin_costs_daily(days: int = 30) -> list:
-    """Daily cost totals for the last N days — for a trend line chart."""
-    since_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    """
+    Daily cost totals for the last N days — for a trend line chart.
+
+    Returns a CONTINUOUS series from (today − N + 1) through today: every day
+    in the window is present, with cost_usd = 0 for days that had no usage.
+    Without this, the chart's X-axis would skip empty days and "7 days" /
+    "30 days" would visually compress to however many days happened to have
+    cost — which is what the client reported.
+    """
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=days - 1)
+    since_iso = datetime(start.year, start.month, start.day, tzinfo=timezone.utc).isoformat()
     try:
         rows = await find("usage_logs", filters={"created_at": ("gte", since_iso)},
                           select="created_at, cost_usd", order="created_at ASC", limit=50000)
     except Exception:
-        return []
+        rows = []
 
     daily: dict[str, float] = {}
     for r in rows:
@@ -883,7 +893,13 @@ async def admin_costs_daily(days: int = 30) -> list:
         if day:
             daily[day] = daily.get(day, 0.0) + float(r.get("cost_usd") or 0)
 
-    return [{"date": d, "cost_usd": round(c, 4)} for d, c in sorted(daily.items())]
+    # Build a zero-filled, gap-free series for the whole window.
+    series = []
+    for i in range(days):
+        d = start + timedelta(days=i)
+        key = d.isoformat()
+        series.append({"date": key, "cost_usd": round(daily.get(key, 0.0), 4)})
+    return series
 
 
 @router.post("/jobs/{job_id}/rerun", status_code=202)
