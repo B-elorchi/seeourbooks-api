@@ -455,6 +455,7 @@ async def _resolve_book_title(book_id: str) -> str | None:
         )
         if rows:
             title = (rows[0].get("title") or "").strip()
+            log.debug("_resolve_book_title catalog lookup for %s: %r", book_id, title)
             if title and title.lower() != book_id.lower():
                 return title
     except (TypeError, ValueError):
@@ -467,6 +468,7 @@ async def _resolve_book_title(book_id: str) -> str | None:
         try:
             meta = await _fetch_gutenberg_metadata(book_id)
             title = (meta.get("title") or "").strip()
+            log.debug("_resolve_book_title gutendex lookup for %s: %r", book_id, title)
             if title:
                 return title
         except Exception as exc:
@@ -1149,6 +1151,7 @@ async def run_pipeline(
                 if not cover_title:
                     cover_title = "Untitled"
 
+                log.info("Generating cover for book_id=%s with title=%r", req.book_id, cover_title)
                 await generate_cover(
                     cover_title,
                     req.author or "",
@@ -1170,7 +1173,7 @@ async def run_pipeline(
             _t = round(time.time() - started)
             await _persist_step_result(job_id, "cover", step_status["cover"], output_url=cover_url, duration_sec=_t)
             if step_status["cover"] == "done":
-                await _persist_cover(req.book_id, req.title or req.book_id, cover_url)
+                await _persist_cover(req.book_id, cover_title, cover_url)
             await _checkpoint()
 
         # ── audio_full ────────────────────────────────────────────────────────
