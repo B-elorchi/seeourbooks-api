@@ -78,8 +78,11 @@ def _merge_results(old: dict | str | None, new: dict) -> dict:
 
     new_steps = new.get("steps") or {}
     for step, status in new_steps.items():
-        if status != "skipped":                     # skipped = wasn't attempted
-            merged.setdefault("steps", {})[step] = status
+        if status == "skipped" and step in old_step_map:
+            # The new run didn't request this step — keep the previous status
+            # (done / partial / failed) instead of overwriting with skipped.
+            continue
+        merged.setdefault("steps", {})[step] = status
 
     # ── Metadata (cover_url, alt_text, etc.) ──────────────────────────────────
     old_meta  = merged.get("metadata") or {}
@@ -187,7 +190,19 @@ async def pipeline_run(req: PipelineReq, background_tasks: BackgroundTasks):
     Poll /api/pipeline/status/{job_id} to check progress.
     """
     job_id = await create_job(req.book_id, req.model_dump())
-    background_tasks.add_task(_run_job, job_id, req)
+
+    # If a completed/partial result already exists for this book, reuse its
+    # successful outputs (summaries, audio, etc.) so the user can regenerate
+    # just one step without redoing everything.
+    previous_result = None
+    try:
+        prev_job = await get_output(req.book_id)
+        if prev_job:
+            previous_result = prev_job.get("result")
+    except Exception:
+        pass
+
+    background_tasks.add_task(_run_job, job_id, req, previous_result, True)
     return {"job_id": job_id, "status": "queued", "status_url": f"/api/pipeline/status/{job_id}"}
 
 

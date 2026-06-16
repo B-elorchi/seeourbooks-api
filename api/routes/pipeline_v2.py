@@ -43,7 +43,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel
 
-from api.jobs.store import create_job, set_failed, set_cancelled, is_cancelled
+from api.jobs.store import create_job, set_failed, set_cancelled, is_cancelled, get_output
 from api.models.requests import PipelineReq, PipelineOptions, VALID_STEPS
 from api.routes.pipeline import _run_job, JobCancelledError
 from api.services.db import find, insert, upsert, update
@@ -113,6 +113,17 @@ async def v2_pipeline_run(req: V2PipelineReq, background_tasks: BackgroundTasks,
         options=req.options,
     )
 
+    # Look for a previous completed/partial result so we can reuse existing
+    # summaries when the user only asks for a subset of steps (e.g. just cover).
+    previous_result = None
+    try:
+        prev_job = await get_output(book_id)
+        if prev_job:
+            previous_result = prev_job.get("result")
+            log.info("v2: found previous result for book %s — will reuse done steps", book_id)
+    except Exception as exc:
+        log.debug("v2: could not load previous result for %s: %s", book_id, exc)
+
     # Attach user_id from API key if present
     api_user = await get_api_key_user(request)
     user_id = api_user.user_id if api_user else None
@@ -130,7 +141,7 @@ async def v2_pipeline_run(req: V2PipelineReq, background_tasks: BackgroundTasks,
 
     # Do everything heavy in the background: ingest (if needed) → run pipeline.
     background_tasks.add_task(
-        _ingest_then_run, job_id, book_id, bid, book_row, req,
+        _ingest_then_run, job_id, book_id, bid, book_row, req, previous_result,
     )
 
     return {
@@ -150,6 +161,7 @@ async def _ingest_then_run(
     bid: object,
     book_row: dict | None,
     req: V2PipelineReq,
+    previous_result: dict | str | None = None,
 ) -> None:
     """
     Background worker: ensure chunks exist (download + ingest if missing),
@@ -206,7 +218,9 @@ async def _ingest_then_run(
         source=req.source,
         options=req.options,
     )
-    await _run_job(job_id, pipeline_req)
+    # force_steps=True: run exactly the steps the user selected (plus auto-added
+    # dependencies), don't auto-switch to retrying old failed steps.
+    await _run_job(job_id, pipeline_req, previous_result, True)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
