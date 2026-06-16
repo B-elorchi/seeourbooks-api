@@ -1073,17 +1073,36 @@ async def tts_preview(body: TTSPreviewRequest) -> dict:
     cfg: dict = {}
     lang = body.language.upper()
     cfg[f"TTS_PROVIDER_{lang}"] = body.provider
-    if body.model:
-        if body.provider == "gemini":
+
+    # Route provider-specific model/voice config keys so the preview matches
+    # how the pipeline actually resolves settings at runtime.
+    if body.provider == "gemini":
+        if body.model:
             cfg["GEMINI_TTS_MODEL"] = body.model
-        elif body.provider == "openrouter":
-            cfg["OPENROUTER_TTS_MODEL"] = body.model
-    if body.voice:
-        if body.provider == "gemini":
+        if body.voice:
             cfg["GEMINI_TTS_VOICE"] = body.voice
-        elif body.provider == "openrouter":
+    elif body.provider == "openrouter":
+        if body.model:
+            cfg["OPENROUTER_TTS_MODEL"] = body.model
+        if body.voice:
+            # Per-language voice takes priority in the pipeline; also set the shared fallback.
+            cfg[f"OPENROUTER_TTS_VOICE_{lang}"] = body.voice
             cfg["OPENROUTER_TTS_VOICE"] = body.voice
-        else:
+    elif body.provider == "elevenlabs":
+        if body.voice:
+            cfg[f"ELEVENLABS_VOICE_{lang}"] = body.voice
+        if body.model:
+            cfg["ELEVENLABS_MODEL"] = body.model
+    elif body.provider == "cartesia":
+        if body.model:
+            cfg["CARTESIA_MODEL"] = body.model
+        if body.voice:
+            cfg[f"CARTESIA_VOICE_{lang}"] = body.voice
+    else:
+        # deepgram and any other provider that uses the generic TTS_VOICE_* key
+        if body.model:
+            cfg[f"TTS_VOICE_{lang}"] = body.model
+        elif body.voice:
             cfg[f"TTS_VOICE_{lang}"] = body.voice
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:

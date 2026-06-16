@@ -256,9 +256,14 @@ async def _dispatch_tts(
                 "add OPENROUTER_API_KEY to your .env file. Get one at https://openrouter.ai/keys."
             )
         or_model = cfg.get("OPENROUTER_TTS_MODEL") or settings.OPENROUTER_TTS_MODEL
-        or_voice = cfg.get("OPENROUTER_TTS_VOICE") or settings.OPENROUTER_TTS_VOICE
-        # Always use the OpenRouter-specific voice setting — ignore the generic
-        # TTS_VOICE_* which may hold a Cartesia/ElevenLabs UUID incompatible with OpenRouter.
+        # Per-language voice (OPENROUTER_TTS_VOICE_EN / _AR) takes priority,
+        # falling back to the shared OPENROUTER_TTS_VOICE, then the settings default.
+        lang_voice_key = f"OPENROUTER_TTS_VOICE_{language.upper()}"
+        or_voice = (
+            cfg.get(lang_voice_key)
+            or cfg.get("OPENROUTER_TTS_VOICE")
+            or settings.OPENROUTER_TTS_VOICE
+        )
         await _openrouter_tts(text, or_voice, language, or_model, output_path)
     else:
         raise ValueError(f"Unknown TTS provider: {provider!r}")
