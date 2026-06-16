@@ -1111,14 +1111,16 @@ async def tts_preview(body: TTSPreviewRequest) -> dict:
     try:
         await synthesize(preview_text, body.language, tmp_path, cfg=cfg)
         with open(tmp_path, "rb") as f:
-            audio_b64 = base64.b64encode(f.read()).decode()
+            audio_bytes = f.read()
+        audio_b64 = base64.b64encode(audio_bytes).decode()
+        from api.services.pipeline.tts import _detect_mime_type
         return {
             "ok": True,
             "provider": body.provider,
             "voice": body.voice,
             "language": body.language,
             "audio_base64": audio_b64,
-            "mime_type": "audio/mpeg",
+            "mime_type": _detect_mime_type(audio_bytes),
         }
     except Exception as exc:
         log.warning("TTS preview failed: %s", exc)

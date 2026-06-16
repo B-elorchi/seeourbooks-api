@@ -525,6 +525,47 @@ _OPENAI_AUDIO_VOICES: set[str] = {
 }
 
 
+def _transcode_to_mp3(input_path: str, output_path: str) -> None:
+    """Transcode any ffmpeg-readable audio file to MP3 stereo 44100 Hz."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError(
+            "ffmpeg is not installed. Cannot transcode non-MP3 TTS output."
+        )
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-ar", "44100", "-ac", "2", "-b:a", "128k",
+            output_path,
+        ],
+        check=True, capture_output=True,
+    )
+
+
+def _is_mp3(data: bytes) -> bool:
+    """Detect MP3 by magic bytes (ID3v2 or MPEG sync word)."""
+    return data.startswith((b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"))
+
+
+def _detect_mime_type(data: bytes) -> str:
+    """Best-effort MIME type from file magic bytes."""
+    if data.startswith(b"ID3") or data.startswith((b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")):
+        return "audio/mpeg"
+    if data.startswith(b"RIFF"):
+        return "audio/wav"
+    if data.startswith(b"OggS"):
+        return "audio/ogg"
+    if data.startswith(b"fLaC"):
+        return "audio/flac"
+    if data.startswith(b"\x00\x00\x00 ") or data.startswith(b"ftyp"):
+        return "audio/mp4"
+    return "audio/mpeg"
+
+
 async def _openrouter_tts(text: str, voice: str, language: str, model: str, output_path: str) -> None:
     """
     TTS via OpenRouter's dedicated speech endpoint (OpenAI-compatible):
@@ -532,9 +573,11 @@ async def _openrouter_tts(text: str, voice: str, language: str, model: str, outp
         POST https://openrouter.ai/api/v1/audio/speech
         { "model": ..., "input": ..., "voice": ... }
 
-    The response body is the raw audio file (mp3) — NOT JSON. This endpoint
-    supports both OpenAI audio models (openai/gpt-audio…) AND Google Gemini TTS
-    models (google/gemini-*-tts-*) with OpenAI voice names like "alloy".
+    The response body is the raw audio file. This endpoint supports both OpenAI
+    audio models (openai/gpt-audio…) AND Google Gemini TTS models
+    (google/gemini-*-tts-*). Depending on the model, the returned bytes may be
+    MP3, WAV, or another format, so we transcode to MP3 to keep the pipeline
+    consistent.
 
     NOTE: the chat/completions endpoint with modalities=["audio","text"] does
     NOT work for these models — it returns "No endpoints found that support the
@@ -567,12 +610,39 @@ async def _openrouter_tts(text: str, voice: str, language: str, model: str, outp
         )
 
     content = r.content
-    if not content or len(content) < 100:
-        # Some errors come back 200 with a tiny JSON body — surface it clearly.
+    content_type = (r.headers.get("content-type") or "").lower()
+
+    log.info(
+        "OpenRouter TTS response: model=%s voice=%s lang=%s status=%s "
+        "content-type=%s bytes=%d",
+        model, chosen_voice, language, r.status_code, content_type, len(content),
+    )
+
+    # Errors sometimes come back as 200 with a JSON body — surface them clearly.
+    if not content or len(content) < 100 or "json" in content_type:
         raise RuntimeError(
             f"OpenRouter TTS returned no audio (model={model}, voice={chosen_voice}, "
-            f"language={language}). Body: {content[:300]!r}"
+            f"language={language}, content-type={content_type}). Body: {content[:500]!r}"
         )
 
-    with open(output_path, "wb") as f:
-        f.write(content)
+    # If the provider already returned a valid MP3, just write it through.
+    if _is_mp3(content):
+        with open(output_path, "wb") as f:
+            f.write(content)
+        return
+
+    # Otherwise save the raw bytes and transcode to MP3 via ffmpeg so the
+    # pipeline always works with a single known format.
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+        _transcode_to_mp3(tmp_path, output_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
