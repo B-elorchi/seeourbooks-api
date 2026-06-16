@@ -33,6 +33,22 @@ log = logging.getLogger(__name__)
 # Sending Arabic text to these produces garbled / unrecognisable audio.
 _DEEPGRAM_ENGLISH_VOICE_PREFIXES = ("aura-",)
 
+# OpenRouter TTS voice catalogs. Gemini models require native Gemini voice names;
+# OpenAI audio models require OpenAI voice names. We hardcode the allowed names so
+# a config mismatch (e.g. AR voice left as "fable" after switching to a Google
+# model) is corrected automatically instead of producing a 500.
+_OPENROUTER_GEMINI_VOICES = {
+    "Achernar", "Achird", "Algenib", "Algieba", "Alnilam", "Aoede", "Autonoe",
+    "Callirrhoe", "Charon", "Despina", "Enceladus", "Erinome", "Fenrir", "Gacrux",
+    "Iapetus", "Kore", "Laomedeia", "Leda", "Orus", "Puck", "Pulcherrima",
+    "Rasalgethi", "Sadachbia", "Sadaltager", "Schedar", "Sulafat", "Umbriel",
+    "Vindemiatrix", "Zephyr", "Zubenelgenubi",
+}
+_OPENROUTER_OPENAI_VOICES = {
+    "alloy", "echo", "fable", "onyx", "nova", "shimmer", "coral", "verse",
+    "ballad", "ash", "sage", "marin", "cedar",
+}
+
 # Per-provider character budget — the maximum size of a single TTS request body.
 # Deepgram's published limit is 2000 but accounts on lower tiers 413 below that,
 # so we use 1500 as a safe operational ceiling.  All other providers happily
@@ -612,6 +628,21 @@ async def _openrouter_tts(text: str, voice: str, language: str, model: str, outp
     """
     is_gemini = model.startswith("google/")
     chosen_voice = voice or ("Kore" if is_gemini else "alloy")
+
+    # Correct mismatched voice names so switching OpenRouter TTS models doesn't
+    # leave a stale voice from the previous vendor.
+    if is_gemini and chosen_voice not in _OPENROUTER_GEMINI_VOICES:
+        log.warning(
+            "OpenRouter Gemini TTS got non-Gemini voice %r for model %s; "
+            "falling back to 'Kore'.", chosen_voice, model,
+        )
+        chosen_voice = "Kore"
+    elif not is_gemini and chosen_voice not in _OPENROUTER_OPENAI_VOICES:
+        log.warning(
+            "OpenRouter OpenAI-audio TTS got non-OpenAI voice %r for model %s; "
+            "falling back to 'alloy'.", chosen_voice, model,
+        )
+        chosen_voice = "alloy"
 
     payload: dict = {
         "model": model,

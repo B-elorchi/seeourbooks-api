@@ -121,6 +121,15 @@ def _defaults() -> dict[str, str]:
         # Set 0 to fall back to the length preset (3min=450 … 15min=2250).
         "SUMMARY_MAX_WORDS_EN":          "4000",
         "SUMMARY_MAX_WORDS_AR":          "4000",
+        # Character-count presets for the user-facing length_preset option.
+        # These override SUMMARY_MAX_WORDS_* when length_preset is set.
+        # Approximate words = chars // 5. 0 disables the preset.
+        "SUMMARY_LENGTH_SMALL_EN":       "1500",
+        "SUMMARY_LENGTH_SMALL_AR":       "1200",
+        "SUMMARY_LENGTH_MEDIUM_EN":      "3000",
+        "SUMMARY_LENGTH_MEDIUM_AR":      "2500",
+        "SUMMARY_LENGTH_LARGE_EN":       "6000",
+        "SUMMARY_LENGTH_LARGE_AR":       "5000",
         # Max words for each per-chapter summary (Pass 1 / Haiku). 0 = default.
         "CHAPTER_SUMMARY_MAX_WORDS":     "0",
         # ── Summary quality / coverage check (gates audio generation) ────────

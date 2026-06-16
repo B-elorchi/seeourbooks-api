@@ -51,6 +51,38 @@ from api.services.db import insert as db_insert
 ALL_STEPS = VALID_STEPS
 
 
+def _cfg_int(cfg: dict[str, str], key: str, default: int = 0) -> int:
+    """Parse an integer config value; return `default` on missing/invalid."""
+    try:
+        return int(cfg.get(key) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_target_words(options: "PipelineOptions", cfg: dict[str, str], language: str) -> int | None:
+    """
+    Convert user length preset / custom char count to a target word count.
+    Falls back to None when no preset is active, so callers can use legacy
+    SUMMARY_MAX_WORDS_* or time-based length presets.
+    """
+    lang = (language or "en").lower()
+    preset = (options.length_preset or "").strip().lower()
+
+    if preset == "custom":
+        if options.max_chars and options.max_chars > 0:
+            return max(1, options.max_chars // 5)
+        return None
+
+    if preset in {"small", "medium", "large"}:
+        key = f"SUMMARY_LENGTH_{preset.upper()}_{lang.upper()}"
+        chars = _cfg_int(cfg, key)
+        if chars > 0:
+            return max(1, chars // 5)
+        return None
+
+    return None
+
+
 class JobCancelledError(Exception):
     pass
 
@@ -78,8 +110,8 @@ def _resolve_steps(requested: list[str] | None, previous_result: dict | None = N
     # Enforce dependencies. Only auto-add 'summarize' when we don't already
     # have a usable summary from the previous result.
     if not has_summary:
-        if {"audio_full", "audio_chapters", "mindmap", "mindmap_chapters",
-            "inject_epub", "video"} & steps:
+        if ({"audio_full", "audio_chapters", "mindmap", "mindmap_chapters",
+             "inject_epub", "video", "translate"} & steps):
             steps.add("summarize")
     if "alt_text" in steps:
         steps.add("cover")
@@ -401,6 +433,48 @@ async def _fetch_gutenberg_metadata(book_id: str) -> dict:
     return result
 
 
+async def _resolve_book_title(book_id: str) -> str | None:
+    """
+    Try to resolve a human-readable title for a book_id.
+
+    1. Look up the production catalog (`books` table).
+    2. If the book_id is numeric, try Gutendex.
+    3. Return None if nothing useful is found.
+    """
+    if not book_id:
+        return None
+
+    # 1. Catalog lookup
+    try:
+        bid = int(book_id)
+        rows = await find(
+            "books",
+            filters={"book_id": bid},
+            select="title",
+            limit=1,
+        )
+        if rows:
+            title = (rows[0].get("title") or "").strip()
+            if title and title.lower() != book_id.lower():
+                return title
+    except (TypeError, ValueError):
+        pass
+    except Exception as exc:
+        log.debug("title resolution catalog lookup failed: %s", exc)
+
+    # 2. Gutenberg fallback (numeric IDs only)
+    if book_id.isdigit():
+        try:
+            meta = await _fetch_gutenberg_metadata(book_id)
+            title = (meta.get("title") or "").strip()
+            if title:
+                return title
+        except Exception as exc:
+            log.debug("title resolution Gutenberg lookup failed: %s", exc)
+
+    return None
+
+
 def _pick_cached_summary(book_row: dict, language: str) -> str | None:
     """
     Return the best cached summary for the given language.
@@ -491,6 +565,11 @@ async def run_pipeline(
     translated_summary: str        = ""   # summary translated into the other language
     translated_lang:    str        = ""   # "en" or "ar"
     translated_audio:   dict | None = None  # audio of the translated summary
+    translated_mindmap_url:  str | None = None
+    translated_mindmap_data: dict | None = None
+    translated_mindmap_path_saved: str | None = None
+    chapter_audio_translated: dict[int, str] = {}
+    chapter_mindmap_translated: dict[int, dict] = {}
 
     # ── Pre-load previous result so live checkpoints always carry forward
     # assets from steps that aren't being re-run in this pass.
@@ -662,12 +741,15 @@ async def run_pipeline(
         await _persist_step_result(job_id, name, "skipped")
 
     # ── Production catalog enrichment ─────────────────────────────────────────
-    if not (req.title and req.author and req.summary):
+    # Treat a title that is just the book_id as missing — some callers send the
+    # id in the title field, which would otherwise get stamped onto the cover.
+    _title_is_missing = not req.title or str(req.title).strip() == str(req.book_id).strip()
+    if _title_is_missing or not req.author or not req.summary:
         book_row = await _fetch_book_from_catalog(req.book_id)
         if book_row:
             updates: dict = {}
             catalog_title = book_row.get("title", "")
-            if not req.title and catalog_title and catalog_title != req.book_id:
+            if _title_is_missing and catalog_title and catalog_title != req.book_id:
                 updates["title"] = catalog_title
             if not req.author and book_row.get("author"):
                 updates["author"] = book_row["author"]
@@ -680,7 +762,8 @@ async def run_pipeline(
             if updates:
                 req = req.model_copy(update=updates)
 
-    if req.book_id and req.book_id.isdigit() and not req.title:
+    _title_is_missing = not req.title or str(req.title).strip() == str(req.book_id).strip()
+    if req.book_id and req.book_id.isdigit() and _title_is_missing:
         gutenberg_meta = await _fetch_gutenberg_metadata(req.book_id)
         meta_updates: dict = {}
         if gutenberg_meta.get("title"):
@@ -735,22 +818,17 @@ async def run_pipeline(
     video_provider   = cfg.get("VIDEO_PROVIDER") or settings.VIDEO_PROVIDER
 
     # Per-language summary length + chapter-summary length overrides (0 = use preset)
-    def _cfg_int(key: str) -> int:
-        try:
-            return int(cfg.get(key) or "0")
-        except (TypeError, ValueError):
-            return 0
     _lang_up         = (req.language or "en").upper()
-    summary_max_words = _cfg_int(f"SUMMARY_MAX_WORDS_{_lang_up}")
-    chapter_max_words = _cfg_int("CHAPTER_SUMMARY_MAX_WORDS")
+    _target_words    = _resolve_target_words(req.options, cfg, req.language)
+    summary_max_words = _target_words or _cfg_int(cfg, f"SUMMARY_MAX_WORDS_{_lang_up}")
+    chapter_max_words = _target_words if _target_words else _cfg_int(cfg, "CHAPTER_SUMMARY_MAX_WORDS")
     # Summary QA / coverage gating
     qa_enabled       = cfg.get("SUMMARY_QA_ENABLED", "true") == "true"
     qa_model         = cfg.get("SUMMARY_QA_MODEL") or "deepseek/deepseek-chat"
-    qa_threshold     = _cfg_int("SUMMARY_QA_THRESHOLD") or 70
+    qa_threshold     = _cfg_int(cfg, "SUMMARY_QA_THRESHOLD") or 70
     # Cross-language translation + optional target-language audio
     translate_enabled   = cfg.get("TRANSLATE_SUMMARY_ENABLED", "true") == "true"
     translate_model     = cfg.get("TRANSLATE_MODEL") or model_sonnet
-    target_audio_enabled = cfg.get("TARGET_LANG_AUDIO_ENABLED", "false") == "true"
     target_lang         = "en" if (req.language or "en") == "ar" else "ar"
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -982,11 +1060,18 @@ async def run_pipeline(
         audio_blocked = bool(summary_qa and summary_qa.get("passed") is False)
 
         # ═════════════════════════════════════════════════════════════════════
-        # TRANSLATION — always produce the summary in the OTHER language too.
-        # (Audio in the target language is handled inside audio_full when
-        #  TARGET_LANG_AUDIO_ENABLED is on.)
+        # TRANSLATION — produce the summary in the OTHER language too.
+        # Always runs when the legacy TRANSLATE_SUMMARY_ENABLED flag is true.
+        # When the explicit "translate" step is requested, we also translate
+        # every chapter summary so downstream target-language audio/mindmaps
+        # can be generated.
         # ═════════════════════════════════════════════════════════════════════
-        if translate_enabled and full_summary and not audio_blocked:
+        translate_step_requested = "translate" in steps
+        if (translate_enabled or translate_step_requested) and full_summary and not audio_blocked:
+            if translate_step_requested:
+                step_status["translate"] = "running"
+                set_step("translate")
+                await _checkpoint()
             try:
                 translated_summary = await translate_summary(
                     full_summary, req.language, target_lang, model=translate_model,
@@ -1000,8 +1085,42 @@ async def run_pipeline(
                         req.book_id, target_lang, req.options.length, req.options.style,
                         translated_summary, translate_model,
                     )
+                    if translate_step_requested:
+                        step_status["translate"] = "done"
             except Exception as exc:
                 log.warning("translation step failed: %s", exc)
+                if translate_step_requested:
+                    step_status["translate"] = "failed"
+                    errors["translate"] = str(exc)
+            if translate_step_requested:
+                _t = round(time.time() - started)
+                await _persist_step_result(job_id, "translate", step_status["translate"],
+                                           error_msg=errors.get("translate"), duration_sec=_t)
+            await _checkpoint()
+
+        # Translate per-chapter summaries when the translate step is requested.
+        if translate_step_requested and translated_summary and chapter_results:
+            try:
+                async def _translate_chapter(ch: dict) -> None:
+                    if not ch.get("summary"):
+                        return
+                    tr = await translate_summary(
+                        ch["summary"], req.language, target_lang, model=translate_model,
+                    )
+                    if tr:
+                        ch["translated_summary"] = tr
+
+                await asyncio.gather(*[_translate_chapter(ch) for ch in chapter_results])
+                _tr_count = sum(1 for ch in chapter_results if ch.get("translated_summary"))
+                log.info("Translated %d/%d chapter summaries %s→%s",
+                         _tr_count, len(chapter_results), req.language, target_lang)
+                if step_status.get("translate") == "done" and _tr_count < len(chapter_results):
+                    step_status["translate"] = "partial"
+            except Exception as exc:
+                log.warning("chapter translation failed: %s", exc)
+                if step_status.get("translate") == "done":
+                    step_status["translate"] = "partial"
+                errors["translate_chapters"] = str(exc)
             await _checkpoint()
 
         # ═════════════════════════════════════════════════════════════════════
@@ -1022,8 +1141,16 @@ async def run_pipeline(
             set_step("cover")
             await _checkpoint()
             try:
+                # Never stamp the raw book_id onto a cover. If the request didn't
+                # include a real title, try to fetch one from the catalog/Gutenberg.
+                cover_title = req.title
+                if not cover_title or cover_title.strip() == str(req.book_id).strip():
+                    cover_title = await _resolve_book_title(req.book_id)
+                if not cover_title:
+                    cover_title = "Untitled"
+
                 await generate_cover(
-                    req.title or req.book_id,
+                    cover_title,
                     req.author or "",
                     cover_path_saved,
                     cfg,
@@ -1093,9 +1220,9 @@ async def run_pipeline(
                 full_audio_path = src
                 step_status["audio_full"] = "done"
 
-                # ── Target-language audio (optional) ──────────────────────────
+                # ── Target-language audio ─────────────────────────────────────
                 # Generate audio of the translated summary in the OTHER language.
-                if target_audio_enabled and translated_summary:
+                if translated_summary:
                     try:
                         t_raw  = os.path.join(tmp, "audio_t_raw.mp3")
                         t_proc = os.path.join(tmp, "audio_t.mp3")
@@ -1137,7 +1264,7 @@ async def run_pipeline(
 
         # ── audio_chapters ────────────────────────────────────────────────────
         async def _do_audio_chapters() -> None:
-            nonlocal chapter_audio, chapter_results
+            nonlocal chapter_audio, chapter_results, chapter_audio_translated
             if "audio_chapters" not in steps:
                 return
             if not tts_enabled or not chapter_results:
@@ -1199,6 +1326,39 @@ async def run_pipeline(
                     ch_errors += 1
                     errors[f"audio_chapter_{ch['index']}"] = str(e)
 
+            # ── Target-language chapter audios ──────────────────────────────
+            if translated_summary and translated_lang:
+                target_audio_key = f"audio_{translated_lang}"
+                for ch in chapter_results:
+                    if not ch.get("translated_summary"):
+                        continue
+                    try:
+                        ch_t_raw  = os.path.join(tmp, f"ch{ch['index']}_{translated_lang}_raw.mp3")
+                        ch_t_proc = os.path.join(tmp, f"ch{ch['index']}_{translated_lang}.mp3")
+                        await synthesize(ch["translated_summary"], translated_lang, ch_t_raw, cfg)
+                        if audio_proc_enabled:
+                            loop = asyncio.get_event_loop()
+                            await loop.run_in_executor(
+                                None, process_audio, ch_t_raw, ch_t_proc,
+                                ch["title"], req.author or "",
+                            )
+                            src = ch_t_proc
+                        else:
+                            src = ch_t_raw
+                        from api.services.pipeline.watermark import stamp_audio as _sa_t  # noqa: PLC0415
+                        _sa_t(src, cfg)
+                        idx = ch["index"]
+                        k   = f"books/{req.book_id}/chapters/ch_{idx:02d}_{translated_lang}.mp3"
+                        audio_url = upload_file(src, k, CONTENT_TYPES[".mp3"])
+                        chapter_audio_translated[idx] = audio_url
+                        ch[target_audio_key] = audio_url
+                        await _checkpoint()
+                    except JobCancelledError:
+                        raise
+                    except Exception as e:
+                        log.warning("target-language chapter audio %s failed: %s", ch["index"], e)
+                        errors[f"audio_chapter_{ch['index']}_{translated_lang}"] = str(e)
+
             # Calculate status based on actual processing, not just chapter count
             if ch_errors > 0 and ch_processed == 0:
                 step_status["audio_chapters"] = "failed"
@@ -1233,6 +1393,7 @@ async def run_pipeline(
         # ── mindmap ───────────────────────────────────────────────────────────
         async def _do_mindmap() -> None:
             nonlocal mindmap_url, mindmap_data, mindmap_path_saved
+            nonlocal translated_mindmap_url, translated_mindmap_data, translated_mindmap_path_saved
             if "mindmap" not in steps:
                 return
             if not mindmap_enabled or not full_summary:
@@ -1263,6 +1424,31 @@ async def run_pipeline(
                     key = f"books/{req.book_id}/mindmap.svg"
                     mindmap_url = upload_file(svg_path, key, CONTENT_TYPES[".svg"])
                     mindmap_path_saved = svg_path
+
+                # ── Target-language mind map ──────────────────────────────────
+                if translated_summary and translated_lang:
+                    if mindmap_format == "json":
+                        t_data = await generate_json_mindmap(
+                            req.title or req.book_id, translated_summary, translated_lang, model=model_mindmap
+                        )
+                        t_data = stamp_mindmap_json(t_data, cfg)
+                        t_json_path = os.path.join(tmp, f"mindmap_{translated_lang}.json")
+                        with open(t_json_path, "w", encoding="utf-8") as f:
+                            json_module.dump(t_data, f, ensure_ascii=False)
+                        t_key = f"books/{req.book_id}/mindmap_{translated_lang}.json"
+                        translated_mindmap_url = upload_file(t_json_path, t_key, CONTENT_TYPES[".json"])
+                        translated_mindmap_data = t_data
+                    else:
+                        t_mermaid = await generate_mermaid_code(
+                            req.title or req.book_id, translated_summary, translated_lang, model=model_mindmap
+                        )
+                        t_mermaid = stamp_mindmap_mermaid(t_mermaid, cfg)
+                        t_svg_path = os.path.join(tmp, f"mindmap_{translated_lang}.svg")
+                        await render_mermaid_svg(t_mermaid, t_svg_path)
+                        t_key = f"books/{req.book_id}/mindmap_{translated_lang}.svg"
+                        translated_mindmap_url = upload_file(t_svg_path, t_key, CONTENT_TYPES[".svg"])
+                        translated_mindmap_path_saved = t_svg_path
+
                 step_status["mindmap"] = "done"
             except JobCancelledError:
                 raise
@@ -1275,7 +1461,7 @@ async def run_pipeline(
 
         # ── mindmap_chapters ──────────────────────────────────────────────────
         async def _do_mindmap_chapters() -> None:
-            nonlocal chapter_mindmap, chapter_results
+            nonlocal chapter_mindmap, chapter_results, chapter_mindmap_translated
             if "mindmap_chapters" not in steps:
                 return
             if not mindmap_enabled or not chapter_results:
@@ -1349,6 +1535,58 @@ async def run_pipeline(
                 if err is not None:
                     ch_errors += 1
                     errors[f"mindmap_chapter_{idx}"] = err
+
+            # ── Target-language chapter mind maps ─────────────────────────────
+            if translated_summary and translated_lang:
+                chapters_with_translated = [ch for ch in chapter_results if ch.get("translated_summary")]
+                if chapters_with_translated:
+                    async def _chapter_mindmap_target(ch: dict) -> tuple[int, dict | None, str | None]:
+                        idx      = ch["index"]
+                        ch_title = ch.get("title") or f"Chapter {idx}"
+                        ch_text  = ch["translated_summary"]
+                        async with mm_sem:
+                            try:
+                                from api.services.pipeline.watermark import stamp_mindmap_json, stamp_mindmap_mermaid  # noqa: PLC0415
+                                if mindmap_format == "json":
+                                    data = await generate_json_mindmap(
+                                        ch_title, ch_text, translated_lang, model=model_mindmap
+                                    )
+                                    data = stamp_mindmap_json(data, cfg)
+                                    json_path = os.path.join(tmp, f"ch{idx}_mindmap_{translated_lang}.json")
+                                    with open(json_path, "w", encoding="utf-8") as f:
+                                        json_module.dump(data, f, ensure_ascii=False)
+                                    key = f"books/{req.book_id}/chapters/ch_{idx:02d}_mindmap_{translated_lang}.json"
+                                    url = upload_file(json_path, key, CONTENT_TYPES[".json"])
+                                    return idx, {"url": url, "data": data, "format": "json"}, None
+                                else:
+                                    mermaid = await generate_mermaid_code(
+                                        ch_title, ch_text, translated_lang, model=model_mindmap
+                                    )
+                                    mermaid = stamp_mindmap_mermaid(mermaid, cfg)
+                                    svg_path = os.path.join(tmp, f"ch{idx}_mindmap_{translated_lang}.svg")
+                                    await render_mermaid_svg(mermaid, svg_path)
+                                    key = f"books/{req.book_id}/chapters/ch_{idx:02d}_mindmap_{translated_lang}.svg"
+                                    url = upload_file(svg_path, key, CONTENT_TYPES[".svg"])
+                                    return idx, {"url": url, "data": None, "format": "mermaid"}, None
+                            except Exception as e:
+                                return idx, None, str(e)
+
+                    mm_target_results = await asyncio.gather(
+                        *[_chapter_mindmap_target(ch) for ch in chapters_with_translated]
+                    )
+                    for idx, result, err in mm_target_results:
+                        if result is not None:
+                            chapter_mindmap_translated[idx] = result
+                            for ch in chapter_results:
+                                if ch["index"] == idx:
+                                    ch[f"mindmap_{translated_lang}_url"] = result.get("url")
+                                    ch["mindmap_format"] = result.get("format")
+                                    if result.get("data"):
+                                        ch[f"mindmap_{translated_lang}_data"] = result.get("data")
+                                    break
+                        if err is not None:
+                            log.warning("target-language chapter mindmap %s failed: %s", idx, err)
+                            errors[f"mindmap_chapter_{idx}_{translated_lang}"] = err
 
             # Calculate status based on actual processing
             if ch_errors > 0 and ch_processed == 0:
@@ -1576,12 +1814,19 @@ async def run_pipeline(
     lang = req.language
     for ch in chapter_results:
         ch[f"audio_{lang}"] = chapter_audio.get(ch["index"])
+        if translated_lang:
+            ch[f"audio_{translated_lang}"] = chapter_audio_translated.get(ch["index"])
         cm = chapter_mindmap.get(ch["index"])
         if cm:
             ch["mindmap_url"]    = cm["url"]
             ch["mindmap_format"] = cm["format"]
             if cm["data"] is not None:
                 ch["mindmap_data"] = cm["data"]
+        cmt = chapter_mindmap_translated.get(ch["index"])
+        if cmt and translated_lang:
+            ch[f"mindmap_{translated_lang}_url"] = cmt["url"]
+            if cmt["data"] is not None:
+                ch[f"mindmap_{translated_lang}_data"] = cmt["data"]
 
     # ── Overall status ────────────────────────────────────────────────────────
     active = {s for s in steps if s in ALL_STEPS}
@@ -1609,10 +1854,14 @@ async def run_pipeline(
         "video":      video_url,
         "chapters": [
             {
-                "index":       ch["index"],
-                "title":       ch.get("title"),
-                "audio_url":   chapter_audio.get(ch["index"]),
-                "mindmap_url": (chapter_mindmap.get(ch["index"]) or {}).get("url"),
+                "index":        ch["index"],
+                "title":        ch.get("title"),
+                "audio_url":    chapter_audio.get(ch["index"]),
+                "audio_en_url": chapter_audio.get(ch["index"]) if lang == "en" else chapter_audio_translated.get(ch["index"]),
+                "audio_ar_url": chapter_audio_translated.get(ch["index"]) if lang == "en" else chapter_audio.get(ch["index"]),
+                "mindmap_url":    (chapter_mindmap.get(ch["index"]) or {}).get("url"),
+                "mindmap_en_url": (chapter_mindmap.get(ch["index"]) if lang == "en" else chapter_mindmap_translated.get(ch["index"]) or {}).get("url"),
+                "mindmap_ar_url": (chapter_mindmap_translated.get(ch["index"]) if lang == "en" else chapter_mindmap.get(ch["index"]) or {}).get("url"),
             }
             for ch in chapter_results
         ],
@@ -1663,6 +1912,16 @@ async def run_pipeline(
         "mindmap": (
             {"url": mindmap_url, "data": mindmap_data} if mindmap_data else
             {"url": mindmap_url} if mindmap_url else
+            None
+        ),
+        "mindmap_en": (
+            {"url": mindmap_url, "data": mindmap_data} if lang == "en" and mindmap_url else
+            {"url": translated_mindmap_url, "data": translated_mindmap_data} if translated_lang == "en" and translated_mindmap_url else
+            None
+        ),
+        "mindmap_ar": (
+            {"url": mindmap_url, "data": mindmap_data} if lang == "ar" and mindmap_url else
+            {"url": translated_mindmap_url, "data": translated_mindmap_data} if translated_lang == "ar" and translated_mindmap_url else
             None
         ),
         "epub": ({f"enriched_{lang}": {"url": epub_url}} if epub_url else None),

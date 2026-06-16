@@ -3,12 +3,14 @@ from pydantic import BaseModel, field_validator
 
 # Valid pipeline step names — keep in sync with ALL_STEPS in orchestrator.py
 VALID_STEPS = {
-    "summarize", "audio_full", "audio_chapters",
+    "summarize", "translate", "audio_full", "audio_chapters",
     "cover", "alt_text",
     "mindmap", "mindmap_chapters",
     "inject_epub",
     "video",
 }
+
+_LENGTH_PRESETS = {"small", "medium", "large", "custom"}
 
 
 class SumReq(BaseModel):
@@ -27,6 +29,21 @@ class Chapter(BaseModel):
 class PipelineOptions(BaseModel):
     length: str = "10min"       # 3min | 5min | 10min | 15min
     style:  str = "narrative"   # narrative | bullets | academic
+    length_preset: str | None = None   # small | medium | large | custom
+    max_chars:     int | None = None   # used when length_preset == "custom"
+
+    @field_validator("length_preset")
+    @classmethod
+    def _check_length_preset(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip().lower()
+        if v not in _LENGTH_PRESETS:
+            raise ValueError(
+                f"Invalid length_preset '{v}'. "
+                f"Valid presets are: {sorted(_LENGTH_PRESETS)}."
+            )
+        return v
 
 
 class PipelineReq(BaseModel):
