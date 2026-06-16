@@ -551,6 +551,33 @@ def _transcode_to_mp3(input_path: str, output_path: str) -> None:
         )
 
 
+def _transcode_pcm_to_mp3(input_path: str, output_path: str) -> None:
+    """Transcode raw signed 16-bit little-endian PCM (24 kHz mono) to MP3."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError(
+            "ffmpeg is not installed. Cannot transcode PCM TTS output."
+        )
+
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "s16le", "-ar", "24000", "-ac", "1",
+            "-i", input_path,
+            "-ar", "44100", "-ac", "2", "-b:a", "128k",
+            output_path,
+        ],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed to transcode PCM audio (exit {result.returncode}). "
+            f"stderr: {result.stderr.decode('utf-8', errors='ignore')[:800]}"
+        )
+
+
 def _is_mp3(data: bytes) -> bool:
     """Detect MP3 by magic bytes (ID3v2 or MPEG sync word)."""
     return data.startswith((b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"))
@@ -573,28 +600,28 @@ def _detect_mime_type(data: bytes) -> str:
 
 async def _openrouter_tts(text: str, voice: str, language: str, model: str, output_path: str) -> None:
     """
-    TTS via OpenRouter's dedicated speech endpoint (OpenAI-compatible):
+    TTS via OpenRouter's /audio/speech endpoint.
 
-        POST https://openrouter.ai/api/v1/audio/speech
-        { "model": ..., "input": ..., "voice": ... }
+    - OpenAI audio models (openai/gpt-audio…) accept OpenAI voice names
+      (alloy, echo, …) and return MP3 by default.
+    - Google Gemini TTS models (google/gemini-*-tts-*) accept native Gemini
+      voice names (Kore, Aoede, …) and, when asked for response_format="pcm",
+      return raw signed 16-bit little-endian PCM at 24 kHz mono.
 
-    The response body is the raw audio file. This endpoint supports both OpenAI
-    audio models (openai/gpt-audio…) AND Google Gemini TTS models
-    (google/gemini-*-tts-*). It is OpenAI-compatible, so voice names must be
-    OpenAI voices (alloy, echo, nova, …) even when using Gemini models. The
-    returned bytes may be MP3, WAV, or another format, so we transcode to MP3.
-
-    NOTE: the chat/completions endpoint with modalities=["audio","text"] does
-    NOT work for these models — it returns "No endpoints found that support the
-    requested output modalities", which is why we use /audio/speech here.
+    We always output a standard MP3 so the rest of the pipeline is format-agnostic.
     """
-    chosen_voice = voice or "alloy"
+    is_gemini = model.startswith("google/")
+    chosen_voice = voice or ("Kore" if is_gemini else "alloy")
 
-    payload = {
+    payload: dict = {
         "model": model,
         "input": text,
         "voice": chosen_voice,
     }
+    if is_gemini:
+        # Gemini models via OpenRouter return raw PCM; this matches the native
+        # Gemini API and avoids broken/missing default encodings.
+        payload["response_format"] = "pcm"
 
     async with httpx.AsyncClient(timeout=180) as client:
         r = await client.post(
@@ -625,22 +652,36 @@ async def _openrouter_tts(text: str, voice: str, language: str, model: str, outp
     )
 
     # Errors sometimes come back as 200 with a JSON/HTML body — surface them clearly.
-    if not content or len(content) < 100 or not content_type.startswith("audio/"):
+    if not content or len(content) < 100:
         raise RuntimeError(
             f"OpenRouter TTS returned no audio (model={model}, voice={chosen_voice}, "
             f"language={language}, content-type={content_type}). Body: {content[:500]!r}"
         )
 
-    # If the provider already returned a valid MP3, just write it through.
+    import tempfile
+
+    # Gemini models return raw PCM that must be wrapped/transcoded to MP3.
+    if is_gemini:
+        with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(content)
+            _transcode_pcm_to_mp3(tmp_path, output_path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return
+
+    # OpenAI audio models return MP3 by default.
     if _is_mp3(content):
         with open(output_path, "wb") as f:
             f.write(content)
         return
 
-    # Otherwise save the raw bytes and transcode to MP3 via ffmpeg so the
-    # pipeline always works with a single known format.
-    import tempfile
-
+    # Fallback: try to transcode whatever format was returned.
     with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
         tmp_path = tmp.name
     try:
