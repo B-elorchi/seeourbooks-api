@@ -535,15 +535,20 @@ def _transcode_to_mp3(input_path: str, output_path: str) -> None:
             "ffmpeg is not installed. Cannot transcode non-MP3 TTS output."
         )
 
-    subprocess.run(
+    result = subprocess.run(
         [
             "ffmpeg", "-y",
             "-i", input_path,
             "-ar", "44100", "-ac", "2", "-b:a", "128k",
             output_path,
         ],
-        check=True, capture_output=True,
+        capture_output=True,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed to transcode OpenRouter audio (exit {result.returncode}). "
+            f"stderr: {result.stderr.decode('utf-8', errors='ignore')[:800]}"
+        )
 
 
 def _is_mp3(data: bytes) -> bool:
@@ -575,9 +580,9 @@ async def _openrouter_tts(text: str, voice: str, language: str, model: str, outp
 
     The response body is the raw audio file. This endpoint supports both OpenAI
     audio models (openai/gpt-audio…) AND Google Gemini TTS models
-    (google/gemini-*-tts-*). Depending on the model, the returned bytes may be
-    MP3, WAV, or another format, so we transcode to MP3 to keep the pipeline
-    consistent.
+    (google/gemini-*-tts-*). It is OpenAI-compatible, so voice names must be
+    OpenAI voices (alloy, echo, nova, …) even when using Gemini models. The
+    returned bytes may be MP3, WAV, or another format, so we transcode to MP3.
 
     NOTE: the chat/completions endpoint with modalities=["audio","text"] does
     NOT work for these models — it returns "No endpoints found that support the
@@ -614,12 +619,13 @@ async def _openrouter_tts(text: str, voice: str, language: str, model: str, outp
 
     log.info(
         "OpenRouter TTS response: model=%s voice=%s lang=%s status=%s "
-        "content-type=%s bytes=%d",
+        "content-type=%s bytes=%d first_bytes=%r",
         model, chosen_voice, language, r.status_code, content_type, len(content),
+        content[:40],
     )
 
-    # Errors sometimes come back as 200 with a JSON body — surface them clearly.
-    if not content or len(content) < 100 or "json" in content_type:
+    # Errors sometimes come back as 200 with a JSON/HTML body — surface them clearly.
+    if not content or len(content) < 100 or not content_type.startswith("audio/"):
         raise RuntimeError(
             f"OpenRouter TTS returned no audio (model={model}, voice={chosen_voice}, "
             f"language={language}, content-type={content_type}). Body: {content[:500]!r}"
@@ -640,7 +646,12 @@ async def _openrouter_tts(text: str, voice: str, language: str, model: str, outp
     try:
         with open(tmp_path, "wb") as f:
             f.write(content)
-        _transcode_to_mp3(tmp_path, output_path)
+        try:
+            _transcode_to_mp3(tmp_path, output_path)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc}. Input first bytes: {content[:80]!r}"
+            ) from exc
     finally:
         try:
             os.unlink(tmp_path)
