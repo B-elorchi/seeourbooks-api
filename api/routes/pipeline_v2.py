@@ -102,6 +102,21 @@ async def v2_pipeline_run(req: V2PipelineReq, background_tasks: BackgroundTasks,
     # Quick, non-blocking lookup so we can echo any known title in the response.
     book_row = await _get_book_row(bid)
 
+    # If the stored title is just the id/placeholder, try to resolve it from
+    # Gutendex now so the immediate response doesn't show "11" as the title.
+    if _is_placeholder_title((book_row or {}).get("title"), book_id) and book_id.isdigit():
+        try:
+            g = await _gutendex_meta(book_id)
+            if g.get("title"):
+                patch = {"book_id": bid, "title": g["title"]}
+                if g.get("author"):
+                    patch["author"] = g["author"]
+                await upsert("books", patch, conflict="book_id")
+                book_row = {**(book_row or {}), **patch}
+                log.info("v2: resolved placeholder title for book %s to %r", book_id, g["title"])
+        except Exception as exc:
+            log.debug("v2: could not resolve placeholder title for %s: %s", book_id, exc)
+
     # Build the pipeline request up-front (title/author may be backfilled later).
     pipeline_req = PipelineReq(
         book_id=book_id,
@@ -234,6 +249,22 @@ async def _get_book_row(bid: object) -> dict | None:
     return rows[0] if rows else None
 
 
+def _is_placeholder_title(title: str | None, book_id: str) -> bool:
+    """Detect titles that are just the id / 'Book <id>' / empty / generic placeholders."""
+    if not title:
+        return True
+    t = str(title).strip()
+    if not t:
+        return True
+    if t == str(book_id).strip():
+        return True
+    if t.lower() == f"book {book_id}".lower():
+        return True
+    if t.lower() in {"untitled", "unknown", "n/a", "null", "none"}:
+        return True
+    return False
+
+
 async def _ensure_book_row(
     book_id: str,
     bid: object,
@@ -250,12 +281,23 @@ async def _ensure_book_row(
       4. fallback "Book <id>" so we never block on a missing title
     """
     if existing:
-        # Backfill title/author from the EPUB if the row was missing them.
+        # Backfill title/author from the EPUB or Gutendex if the row is missing
+        # them or if the title is just a placeholder (e.g. the raw book_id).
         patch: dict = {}
-        if not existing.get("title") and epub_meta.get("title"):
+        title_placeholder = _is_placeholder_title(existing.get("title"), book_id)
+        if title_placeholder and epub_meta.get("title"):
             patch["title"] = epub_meta["title"]
         if not existing.get("author") and epub_meta.get("author"):
             patch["author"] = epub_meta["author"]
+
+        # For numeric ids, Gutendex is a reliable fallback when EPUB meta is empty.
+        if (title_placeholder or not existing.get("author")) and book_id.isdigit():
+            g = await _gutendex_meta(book_id)
+            if title_placeholder and g.get("title"):
+                patch["title"] = g["title"]
+            if not existing.get("author") and g.get("author"):
+                patch["author"] = g["author"]
+
         if patch:
             try:
                 await upsert("books", {"book_id": bid, **patch}, conflict="book_id")
@@ -268,12 +310,12 @@ async def _ensure_book_row(
     title  = epub_meta.get("title", "")
     author = epub_meta.get("author", "")
 
-    if not title and book_id.isdigit():
+    if (not title or _is_placeholder_title(title, book_id)) and book_id.isdigit():
         g = await _gutendex_meta(book_id)
         title  = title  or g.get("title", "")
         author = author or g.get("author", "")
 
-    if not title:
+    if _is_placeholder_title(title, book_id):
         title = f"Book {book_id}"   # last-resort placeholder — pipeline can still run
 
     row: dict = {

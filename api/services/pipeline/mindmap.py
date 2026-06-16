@@ -33,12 +33,12 @@ async def generate_mermaid_code(title: str, summary: str, language: str, model: 
     """Use an AI model to generate Mermaid graph TD code for the book."""
     model = model or settings.MODEL_MINDMAP
 
-    # mermaid.ink cannot render Arabic / RTL text — node labels must always be
-    # short English keywords regardless of the book's language.
+    # Output language instruction: the diagram text should match the book's language.
     lang_note = (
-        "The book is in Arabic. Use short English keywords for all node labels "
-        "(concepts, not translations). The summary is in Arabic for context only."
-        if language == "ar" else ""
+        "IMPORTANT: The book is in Arabic. ALL node labels, the root title, and any "
+        "other text in the diagram MUST be written in Arabic. Do not use English."
+        if language == "ar" else
+        "Write all node labels in English."
     )
 
     template = await get_config_value("PROMPT_MINDMAP_MERMAID", PROMPT_MINDMAP_MERMAID_DEFAULT)
@@ -68,13 +68,13 @@ _EDGE_RE = re.compile(
 )
 
 
-def _wrap_node(token: str) -> str:
+def _wrap_node(token: str, id_counter: list[int]) -> str:
     """
     Ensure a node reference uses the form  ID[Label]  required by Mermaid.
 
     - If token already has [..] or (..) or {..} shape  → leave as-is
-    - If token is a single word                        → leave as-is (valid ID)
-    - If token has spaces                              → wrap as N_<id>[Label]
+    - If token is a plain Latin single-word ID             → leave as-is
+    - Otherwise (spaces, Arabic, CJK, symbols, ...)        → wrap as N{counter}["Label"]
     """
     token = token.strip()
     if not token:
@@ -82,20 +82,23 @@ def _wrap_node(token: str) -> str:
     # Already bracketed in any shape Mermaid understands
     if any(c in token for c in "[(){<"):
         return token
-    if " " not in token:
-        return token   # plain ID, valid as-is
-    # Multi-word bare label → convert to ID[Label]
-    safe_id = re.sub(r"[^A-Za-z0-9]", "_", token)[:40] or "N"
-    return f"{safe_id}[{token}]"
+    # Plain single-word Latin ID — valid as-is
+    if " " not in token and token.isascii() and token[0].isalpha():
+        return token
+    # Everything else gets a generated ID + quoted label (quotes protect Arabic/CJK)
+    id_counter[0] += 1
+    safe_label = token.replace('"', '\\"')
+    return f'N{id_counter[0]}["{safe_label}"]'
 
 
 def _sanitize_mermaid(code: str) -> str:
     """
     Post-process LLM output to fix the most common Mermaid syntax mistakes —
-    specifically: multi-word node names used directly in edges without brackets.
-    Mermaid 400s on  'Atomic Habits --> Small Changes'  unless wrapped.
+    specifically: multi-word or non-Latin node names used directly in edges
+    without brackets. Mermaid 400s on  'Atomic Habits --> Small Changes' unless wrapped.
     """
     fixed_lines: list[str] = []
+    id_counter = [0]
     for line in code.splitlines():
         m = _EDGE_RE.match(line)
         if not m:
@@ -106,7 +109,7 @@ def _sanitize_mermaid(code: str) -> str:
         if lhs.lower().startswith("graph") and arrow == "--":
             fixed_lines.append(line)
             continue
-        fixed_lines.append(f"{indent}{_wrap_node(lhs)} {arrow} {_wrap_node(rhs)}")
+        fixed_lines.append(f"{indent}{_wrap_node(lhs, id_counter)} {arrow} {_wrap_node(rhs, id_counter)}")
     return "\n".join(fixed_lines)
 
 
@@ -120,8 +123,11 @@ async def generate_json_mindmap(title: str, summary: str, language: str, model: 
     model = model or settings.MODEL_MINDMAP
 
     lang_note = (
-        "The book is in Arabic. Use short English keywords for all text values."
-        if language == "ar" else ""
+        "IMPORTANT: The book is in Arabic. ALL text values in the JSON "
+        "(center_node.text and every sub_node) MUST be written in Arabic. "
+        "Do not use English."
+        if language == "ar" else
+        "Write all text values in English."
     )
 
     template = await get_config_value("PROMPT_MINDMAP_JSON", PROMPT_MINDMAP_JSON_DEFAULT)

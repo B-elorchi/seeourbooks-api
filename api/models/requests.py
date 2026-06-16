@@ -3,9 +3,12 @@ from pydantic import BaseModel, field_validator
 
 # Valid pipeline step names — keep in sync with ALL_STEPS in orchestrator.py
 VALID_STEPS = {
-    "summarize", "translate", "audio_full", "audio_chapters",
+    "summarize", "translate",
+    "audio_full", "audio_chapters",
+    "audio_full_translate", "audio_chapters_translate",
     "cover", "alt_text",
     "mindmap", "mindmap_chapters",
+    "mindmap_translate", "mindmap_chapters_translate",
     "inject_epub",
     "video",
 }
