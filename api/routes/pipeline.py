@@ -40,7 +40,7 @@ def _failed_steps(result: dict | str | None) -> list[str]:
         except Exception:
             return []
     steps = result.get("steps") or {}
-    return [s for s, status in steps.items() if status in ("failed", "running", "pending")]
+    return [s for s, status in steps.items() if status in ("failed", "running", "pending", "partial")]
 
 
 def _merge_results(old: dict | str | None, new: dict) -> dict:
@@ -241,9 +241,16 @@ async def _run_job(
     from api.services.usage_logger import set_job_context  # noqa: PLC0415
     set_job_context(job_id)
 
+    # When the admin explicitly force-requests the summarize step, tell the
+    # orchestrator to skip the catalog-cached summary and regenerate from scratch.
+    _force_regen_summary = force_steps and "summarize" in (req.steps or [])
+
     await set_running(job_id)
     try:
-        result = await run_pipeline(req, job_id=job_id, previous_result=previous_result)
+        result = await run_pipeline(
+            req, job_id=job_id, previous_result=previous_result,
+            force_regenerate_summary=_force_regen_summary,
+        )
 
         # Merge new outputs with the previous partial result (if any)
         if previous_result:

@@ -52,7 +52,18 @@ async def translate_summary(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=approx_tokens,
         )
-        return (out or "").strip()
+        out = (out or "").strip()
+        # Strip common preamble phrases the model adds despite the instruction.
+        # E.g. "هَذِهِ تَرْجَمَةُ النَّصِّ بِالتَّشْكِيلِ الكَامِلِ:\n\n"
+        # or   "Here is the translation:\n\n"
+        _preamble_re = (
+            r"^(هَذِهِ تَرْجَمَةُ|هذه ترجمة|إليكم الترجمة|الترجمة:|"
+            r"here is the translation|here's the translation|"
+            r"below is the translation|translation:)\s*[:\n]+"
+        )
+        import re as _re
+        out = _re.sub(_preamble_re, "", out, count=1, flags=_re.IGNORECASE).strip()
+        return out
     except Exception as exc:
         log.warning("translate_summary failed (%s→%s): %s", source_lang, target_lang, exc)
         return ""

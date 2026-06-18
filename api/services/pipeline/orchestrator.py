@@ -620,6 +620,7 @@ async def run_pipeline(
     *,
     job_id: str | None = None,
     previous_result: dict | str | None = None,
+    force_regenerate_summary: bool = False,
 ) -> dict:
     """
     Execute the pipeline and return the full result dict.
@@ -715,8 +716,8 @@ async def run_pipeline(
             full_audio = _paudio[_lang_key]
 
         # Quick / full summary (needed if summarize is skipped this run).
-        # Don't preload when QA failed — summarize will regenerate it fresh.
-        if not full_summary and _psums and not _prev_qa_failed:
+        # Don't preload when QA failed or when summarize is force-requested.
+        if not full_summary and _psums and not _prev_qa_failed and not force_regenerate_summary:
             _first_sum = next(iter(_psums.values()), {})
             full_summary  = _first_sum.get("text", "")
             quick_summary = _prev.get("quick_summary", "")
@@ -908,10 +909,9 @@ async def run_pipeline(
                 updates["title"] = catalog_title
             if not req.author and book_row.get("author"):
                 updates["author"] = book_row["author"]
-            if not req.summary and not _prev_qa_failed:
-                # Skip loading cached summary when the previous run's QA failed —
-                # we need the orchestrator to regenerate it, not reuse the same
-                # low-coverage text that already failed the threshold.
+            if not req.summary and not _prev_qa_failed and not force_regenerate_summary:
+                # Skip loading cached summary when QA previously failed OR when
+                # summarize was explicitly force-requested — regenerate fresh.
                 cached = _pick_cached_summary(book_row, req.language)
                 if cached:
                     updates["summary"] = cached
