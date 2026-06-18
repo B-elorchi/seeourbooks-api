@@ -28,8 +28,10 @@ from pydantic import BaseModel
 from api.auth import require_admin
 from api.services.config.runtime import get_all_config, set_config_key, refresh_config_cache
 from api.services.db import find, insert, upsert
-from api.jobs.store import get_job, reset_for_manual_retry, delete_job, timeout_stuck_jobs
+from api.jobs.store import get_job, get_output, reset_for_manual_retry, delete_job, timeout_stuck_jobs, can_retry
 from api.models.requests import PipelineReq
+from api.services.pipeline.cover import _build_prompt
+from api.services.openrouter_keys import openrouter_key_has_credits, reset_openrouter_keys
 
 log = logging.getLogger(__name__)
 
@@ -218,6 +220,59 @@ async def admin_get_book(book_id: str) -> dict:
     if not rows:
         raise HTTPException(404, f"Book {book_id!r} not found in the database")
     return rows[0]
+
+
+@router.get("/books/{book_id}/cover-prompt")
+async def admin_book_cover_prompt(book_id: str) -> dict:
+    """
+    Build and return the exact cover-image prompt that would be sent to the
+    image model for this book.  Uses the book metadata plus the latest available
+    summary (from a previous pipeline run).  No image is generated.
+    """
+    try:
+        bid: object = book_id
+        try:
+            bid = int(book_id)
+        except ValueError:
+            pass
+        rows = await find("books", filters={"book_id": bid}, limit=1)
+    except Exception as exc:
+        raise HTTPException(502, f"DB read failed: {exc}") from exc
+
+    if not rows:
+        raise HTTPException(404, f"Book {book_id!r} not found in the database")
+
+    book = rows[0]
+
+    # Try to reuse the latest generated summary for this book.
+    summary: str | None = None
+    try:
+        output = await get_output(book_id)
+        if output:
+            result = output.get("result") or output
+            sums = result.get("summaries") or {}
+            if sums:
+                first = next(iter(sums.values()), {})
+                summary = first.get("text") or ""
+            if not summary:
+                summary = result.get("quick_summary") or ""
+    except Exception:
+        summary = ""
+
+    prompt = await _build_prompt(
+        title=book.get("title") or "",
+        author=book.get("author") or "",
+        summary=summary or None,
+        genres=book.get("genres") or None,
+        year=book.get("year"),
+        language=book.get("language") or "en",
+    )
+
+    return {
+        "book_id": book_id,
+        "prompt":  prompt,
+        "summary_chars": len(summary or ""),
+    }
 
 
 # ── In-memory ingest status store (keyed by book_id) ─────────────────────────
@@ -1349,6 +1404,82 @@ async def admin_timeout_stuck_jobs(max_age_minutes: int = 60) -> dict:
         "count":       len(timed_out),
         "max_age_minutes": max_age_minutes,
     }
+
+
+_CREDIT_ERROR_KEYWORDS = (
+    "limit", "credits", "insufficient", "exceeded", "quota",
+    "low credits", "key limit", "rate limit", "402", "403",
+)
+
+
+def _looks_like_credit_failure(job: dict) -> bool:
+    """Return True if a job likely failed because an API key ran out of credits."""
+    msg = str(job.get("error_msg") or "").lower()
+    return any(k in msg for k in _CREDIT_ERROR_KEYWORDS)
+
+
+async def auto_retry_credit_failures(background_tasks: BackgroundTasks | None = None) -> list[str]:
+    """
+    Check whether the active OpenRouter key has credits again.  If it does,
+    automatically re-queue jobs that failed because of credit/key-limit errors
+    so they can resume without manual admin intervention.
+
+    Returns the list of job IDs that were re-queued.
+    """
+    from api.routes.pipeline import _run_job  # local import avoids cycle
+
+    if not await openrouter_key_has_credits():
+        return []
+
+    # Credits are back — clear any exhaustion state from previous failures.
+    reset_openrouter_keys()
+
+    try:
+        failed = await find(
+            "pipeline_jobs",
+            filters={"status": ("in", ["failed", "partial"])},
+            select="id,input,result,error_msg,retry_count,max_retries",
+            order="created_at DESC",
+            limit=500,
+        )
+    except Exception as exc:
+        log.warning("auto_retry_credit_failures: could not query jobs — %s", exc)
+        return []
+
+    retried: list[str] = []
+    for job in failed:
+        if not _looks_like_credit_failure(job):
+            continue
+        if not can_retry(job):
+            continue
+
+        job_id = job["id"]
+        try:
+            req = PipelineReq.model_validate(job.get("input") or {})
+            await reset_for_manual_retry(job_id)
+            if background_tasks:
+                background_tasks.add_task(_run_job, job_id, req, job.get("result"), False)
+            else:
+                import asyncio
+                asyncio.create_task(_run_job(job_id, req, job.get("result"), False))
+            retried.append(job_id)
+        except Exception as exc:
+            log.warning("auto_retry_credit_failures: could not retry %s — %s", job_id, exc)
+
+    if retried:
+        log.info("Auto-retried %d credit-failed job(s) after key regained credits.", len(retried))
+    return retried
+
+
+@router.post("/jobs/auto-retry-credit-failures", status_code=200)
+async def admin_auto_retry_credit_failures(background_tasks: BackgroundTasks) -> dict:
+    """
+    Manually trigger the credit-aware auto-retry loop.  If the OpenRouter key
+    has credits, any failed/partial jobs whose error message mentions credit/
+    limit/rate-limit keywords are re-queued.
+    """
+    retried = await auto_retry_credit_failures(background_tasks)
+    return {"ok": True, "retried": retried, "count": len(retried)}
 
 
 @router.post("/jobs/{job_id}/rerun", status_code=202)

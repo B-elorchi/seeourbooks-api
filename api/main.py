@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -19,6 +20,7 @@ async def lifespan(app: FastAPI):
     await db_startup()       # connect pool (postgres) or validate creds (supabase)
     await run_migrations()   # fix any stale provider_config values automatically
     await _recover_stuck_jobs()
+    asyncio.create_task(_auto_retry_credit_failures_loop())
     yield
     await db_shutdown()      # graceful close
 
@@ -83,6 +85,29 @@ async def _recover_stuck_jobs() -> None:
                 log.error("Could not recover job %s: %s", job_id, exc)
     except Exception as exc:
         log.warning("Could not check for stuck jobs on startup: %s", exc)
+
+
+async def _auto_retry_credit_failures_loop() -> None:
+    """
+    Background loop: every 5 minutes, check whether the active OpenRouter key
+    has credits again.  If it does, automatically re-queue jobs that failed
+    because of credit/key-limit errors.
+    """
+    import asyncio
+    import logging
+    from api.routes.admin import auto_retry_credit_failures  # local import avoids cycle
+    log = logging.getLogger(__name__)
+
+    while True:
+        try:
+            await asyncio.sleep(300)  # 5 minutes
+            retried = await auto_retry_credit_failures(background_tasks=None)
+            if retried:
+                log.info("Auto-retry loop re-queued %d credit-failed job(s).", len(retried))
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            log.warning("Auto-retry credit loop error: %s", exc)
 
 
 app = FastAPI(

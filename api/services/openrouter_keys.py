@@ -15,6 +15,8 @@ import logging
 import os
 from typing import Iterable
 
+import httpx
+
 from api.config.settings import settings
 
 log = logging.getLogger(__name__)
@@ -151,3 +153,44 @@ def is_credit_error(status_code: int | None, body: str) -> bool:
         )):
             return True
     return False
+
+
+async def openrouter_key_has_credits(key: str | None = None) -> bool:
+    """
+    Ask OpenRouter whether the given key (or the current active key) still has
+    credits / spending headroom.  Returns True when the key is usable, False
+    when it is exhausted, invalid, or the check itself fails.
+    """
+    if not key:
+        try:
+            key = get_openrouter_key()
+        except RuntimeError:
+            return False
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://openrouter.ai/api/v1/auth/key",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+        if r.status_code >= 400:
+            return False
+
+        body = r.json()
+        data = body.get("data") or {}
+
+        # Try a few known shapes for limit / usage / remaining credits.
+        limit = data.get("limit") or data.get("credit_limit") or data.get("total_credits")
+        usage = data.get("usage") or data.get("credit_usage") or data.get("total_usage") or 0
+        remaining = data.get("remaining") or data.get("credits") or data.get("credit_remaining")
+
+        if remaining is not None:
+            return float(remaining) > 0
+        if limit is not None:
+            return float(limit) - float(usage) > 0
+
+        # No explicit limit → treat as usable (e.g. unlimited/key has credits).
+        return True
+    except Exception as exc:
+        log.warning("Could not check OpenRouter credits: %s", exc)
+        return False

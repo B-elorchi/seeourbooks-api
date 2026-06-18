@@ -1042,13 +1042,56 @@ async def run_pipeline(
                     elif len(_valid) < len(chapters):
                         step_status["summarize"] = "partial"
                         errors["summarize"] = (
-                            f"{len(chapters) - len(_valid)} of {len(chapters)} chapters failed to summarize"
+                            f"{len(chapters) - len(_valid)} of {len(chapters)} chapters failed to summarize. "
+                            f"Audio is blocked until all chapters complete. "
+                            f"Retry — only the failed chapters will be re-processed."
                         )
                     else:
                         step_status["summarize"] = "done"
                 else:
                     haiku_conc = max(1, int(cfg.get("HAIKU_CONCURRENCY", "6")))
                     sem = asyncio.Semaphore(haiku_conc)
+
+                    # ── Smart resume: reload already-summarized chapters ───────
+                    # On retry, we skip chapters that already have a summary so
+                    # only the chapters that actually failed are re-processed.
+                    _existing: dict[int, str] = {}
+
+                    # 1) From previous pipeline result (any book_id type)
+                    for _pc in (_prev_parsed or {}).get("chapters", []):
+                        _pi  = _pc.get("index")
+                        _ps  = (_pc.get("summary") or "").strip()
+                        if _pi is not None and _ps:
+                            _existing[_pi] = _ps
+
+                    # 2) From DB chunks table (numeric book_ids only)
+                    if req.book_id.isdigit() and not _existing:
+                        try:
+                            _dbrows = await find(
+                                "chunks",
+                                filters={"book_id": req.book_id},
+                                select="chunk_index,summary",
+                                order="chunk_index ASC",
+                            )
+                            for _r in (_dbrows or []):
+                                _pi = _r.get("chunk_index")
+                                _ps = (_r.get("summary") or "").strip()
+                                if _pi is not None and _ps:
+                                    _existing[_pi] = _ps
+                            if _existing:
+                                log.info(
+                                    "Smart resume: loaded %d chapter summaries from DB",
+                                    len(_existing),
+                                )
+                        except Exception as _exc:
+                            log.debug("Could not preload chunk summaries from DB: %s", _exc)
+
+                    _chapters_to_run = [ch for ch in chapters if ch["index"] not in _existing]
+                    if _existing:
+                        log.info(
+                            "Smart resume: %d/%d chapters already done, running %d",
+                            len(_existing), len(chapters), len(_chapters_to_run),
+                        )
 
                     async def _summarize_chunk(ch: dict) -> dict:
                         async with sem:
@@ -1063,10 +1106,7 @@ async def run_pipeline(
                                     max_words=chapter_max_words or None,
                                 )
                             except Exception as exc:
-                                import logging as _log
-                                _log.getLogger(__name__).warning(
-                                    "Haiku pass failed for chunk %s: %s", ch["index"], exc,
-                                )
+                                log.warning("Haiku pass failed for chunk %s: %s", ch["index"], exc)
                                 sums = []
                             summary = sums[0] if sums else ""
                             return {
@@ -1076,9 +1116,24 @@ async def run_pipeline(
                                 "read_time_min": max(1, len(summary.split()) // 200) if summary else 1,
                             }
 
-                    chapter_results = list(await asyncio.gather(
-                        *[_summarize_chunk(ch) for ch in chapters]
-                    ))
+                    # Pre-fill from cache, then run remaining chapters
+                    chapter_results = [
+                        {
+                            "index":         _pi,
+                            "title":         next(
+                                (c["title"] for c in chapters if c["index"] == _pi),
+                                f"Chapter {_pi + 1}",
+                            ),
+                            "summary":       _ps,
+                            "read_time_min": max(1, len(_ps.split()) // 200),
+                        }
+                        for _pi, _ps in _existing.items()
+                    ]
+                    if _chapters_to_run:
+                        _new = list(await asyncio.gather(
+                            *[_summarize_chunk(ch) for ch in _chapters_to_run]
+                        ))
+                        chapter_results.extend(_new)
                     chapter_results.sort(key=lambda c: c["index"])
 
                     chunk_summaries = [c["summary"] for c in chapter_results if c.get("summary")]
@@ -1114,7 +1169,9 @@ async def run_pipeline(
                     elif len(_valid) < len(chapters):
                         step_status["summarize"] = "partial"
                         errors["summarize"] = (
-                            f"{len(chapters) - len(_valid)} of {len(chapters)} chapters failed to summarize"
+                            f"{len(chapters) - len(_valid)} of {len(chapters)} chapters failed to summarize. "
+                            f"Audio is blocked until all chapters complete. "
+                            f"Retry — only the failed chapters will be re-processed."
                         )
                     else:
                         step_status["summarize"] = "done"
@@ -1168,8 +1225,18 @@ async def run_pipeline(
                               "reason": f"QA error: {exc}", "missing": []}
             await _checkpoint()
 
-        # Audio is blocked only when QA ran and explicitly failed.
-        audio_blocked = bool(summary_qa and summary_qa.get("passed") is False)
+        # Audio is blocked when QA explicitly failed OR when summarize is partial
+        # (some chapters are still missing — audio would contain incomplete stories).
+        _summarize_partial = step_status.get("summarize") == "partial"
+        audio_blocked = (
+            bool(summary_qa and summary_qa.get("passed") is False)
+            or _summarize_partial
+        )
+        if _summarize_partial and not errors.get("audio_blocked"):
+            errors["audio_blocked"] = (
+                "Audio blocked: some chapters failed to summarize. "
+                "Retry the job — only failed chapters will be re-processed."
+            )
 
         # ═════════════════════════════════════════════════════════════════════
         # TRANSLATION — produce the summary in the OTHER language too.

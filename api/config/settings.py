@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     # sonic-3.5 supports 40+ languages including Arabic, French, Spanish, etc.
     # See https://docs.cartesia.ai/build-with-cartesia/models for current snapshots.
     CARTESIA_MODEL:        str = "sonic-3.5-2026-05-04"
+    # Default Cartesia voice IDs.  The EN default is Cartesia's public
+    # "Barbershop Man" voice.  Set AR to a multilingual/Arabic-capable voice
+    # in Admin → Providers → Text-to-Speech, or leave it empty to fall back to EN.
+    CARTESIA_VOICE_EN:     str = "a0e99841-438c-4a64-b679-ae501e7d6091"
+    CARTESIA_VOICE_AR:     str = ""
 
     # Gemini TTS via native Google API — supports Arabic + 30+ languages natively.
     # Set TTS_PROVIDER_AR='gemini' to use. Voice defaults to 'Kore'.
