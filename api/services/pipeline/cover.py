@@ -24,19 +24,49 @@ Routing logic
 import base64
 import logging
 import httpx
-from openai import AsyncOpenAI
+import openai
 
 from api.config.settings import settings
 from api.services.usage_logger import log_image_usage
 from api.services.config.runtime import get_config_value, PROMPT_COVER_DEFAULT
+from api.services.openrouter_keys import (
+    get_openrouter_key,
+    rotate_openrouter_key,
+    is_credit_error,
+    openrouter_key_count,
+)
 
 log = logging.getLogger(__name__)
 
 
-async def _build_prompt(title: str, author: str, summary: str | None,
-                        genres: list[str] | None, year: int | None,
-                        language: str | None) -> str:
+async def _build_prompt(
+    title: str,
+    author: str,
+    summary: str | None,
+    genres: list[str] | None,
+    year: int | None,
+    language: str | None,
+    cfg: dict | None = None,
+) -> str:
     """Compose a content-aware cover prompt from the book's metadata + summary."""
+    cfg = cfg or {}
+
+    # ── Configurable size limits ────────────────────────────────────────────
+    # New IMAGE_* keys take precedence; legacy COVER_* keys are still honoured.
+    max_prompt_chars = int(
+        cfg.get("IMAGE_PROMPT_MAX_CHARS")
+        or cfg.get("COVER_MAX_PROMPT_CHARS")
+        or settings.IMAGE_PROMPT_MAX_CHARS
+        or settings.COVER_MAX_PROMPT_CHARS
+        or 3000
+    )
+    summary_max_chars = int(
+        cfg.get("IMAGE_SUMMARY_MAX_CHARS")
+        or cfg.get("COVER_SUMMARY_MAX_CHARS")
+        or settings.IMAGE_SUMMARY_MAX_CHARS
+        or settings.COVER_SUMMARY_MAX_CHARS
+        or 1200
+    )
 
     # ── Details block (only include what we actually have) ──────────────────
     parts: list[str] = []
@@ -47,14 +77,6 @@ async def _build_prompt(title: str, author: str, summary: str | None,
     if language:
         parts.append(f"- Original language: {language}")
     details = "\n".join(parts) if parts else "- (no additional metadata)"
-
-    # ── Summary block — trim to keep prompt under model limits ──────────────
-    if summary:
-        snippet = summary.strip().replace("\n", " ")
-        if len(snippet) > 1200:
-            snippet = snippet[:1200].rsplit(" ", 1)[0] + "…"
-    else:
-        snippet = "(no summary provided — invent a visual that matches the title and genre)"
 
     # ── Genre hint for visual style ──────────────────────────────────────────
     genre_hint = (", ".join(genres) if genres else "general").lower()
@@ -67,24 +89,50 @@ async def _build_prompt(title: str, author: str, summary: str | None,
     if clean_author.lower() in ("", "unknown", "n/a", "anonymous", "غير معروف", "مجهول"):
         clean_author = ""
 
-    prompt = template.format(
-        title      = title or "Untitled",
-        author     = clean_author,
-        details    = details,
-        summary    = snippet,
-        genre_hint = genre_hint,
-    )
-
-    # When the author is unknown, override any author-rendering instructions in
-    # the template: produce a title-only cover rather than printing "Unknown".
+    author_override = ""
     if not clean_author:
-        prompt += (
+        author_override = (
             "\n\nIMPORTANT — AUTHOR IS UNKNOWN:\n"
             "- Do NOT render any author name, byline, placeholder, or the word "
             "\"Unknown\" anywhere on the cover.\n"
             "- Render ONLY the title as text. Leave the lower author area as "
             "clean negative space / artwork with no text."
         )
+
+    def _make(summary_snippet: str) -> str:
+        p = template.format(
+            title      = title or "Untitled",
+            author     = clean_author,
+            details    = details,
+            summary    = summary_snippet,
+            genre_hint = genre_hint,
+        )
+        return p + author_override
+
+    # ── Summary block — trim to keep prompt under model limits ──────────────
+    if summary:
+        snippet = summary.strip().replace("\n", " ")
+        if len(snippet) > summary_max_chars:
+            snippet = snippet[:summary_max_chars].rsplit(" ", 1)[0] + "…"
+    else:
+        snippet = "(no summary provided — invent a visual that matches the title and genre)"
+
+    prompt = _make(snippet)
+
+    # If the admin custom template makes the prompt too long, shrink the summary.
+    if len(prompt) > max_prompt_chars:
+        overflow = len(prompt) - max_prompt_chars + 500  # safety margin
+        reduced_max = max(200, summary_max_chars - overflow)
+        if summary:
+            snippet = summary.strip().replace("\n", " ")
+            if len(snippet) > reduced_max:
+                snippet = snippet[:reduced_max].rsplit(" ", 1)[0] + "…"
+        prompt = _make(snippet)
+
+    # Final hard guard — truncate the whole prompt if it still exceeds the limit.
+    if len(prompt) > max_prompt_chars:
+        prompt = prompt[:max_prompt_chars].rsplit(" ", 1)[0] + "…"
+
     return prompt
 
 _OPENROUTER_BASE = "https://openrouter.ai/api/v1"
@@ -228,17 +276,10 @@ async def _generate_gemini_openrouter(model: str, prompt: str, output_path: str)
     Uses raw httpx to access the full chat-completions response — the OpenAI
     SDK strips OpenRouter's non-standard `message.images` field where Gemini
     actually returns the generated image, leaving `message.content` as None.
-    """
-    if not settings.OPENROUTER_API_KEY:
-        raise ValueError(
-            f"OPENROUTER_API_KEY is not set. Add it to your .env file to use {model}. "
-            "Get a key at https://openrouter.ai/keys"
-        )
 
-    headers = {
-        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
-        "Content-Type":  "application/json",
-    }
+    Rotates to the next configured OpenRouter key on credit/limit errors
+    (HTTP 402/403/429) so a single exhausted key doesn't fail the cover step.
+    """
     payload: dict = {
         "model":      model,
         "messages":   [{"role": "user", "content": prompt}],
@@ -252,33 +293,66 @@ async def _generate_gemini_openrouter(model: str, prompt: str, output_path: str)
     if not _mandates_reasoning(model):
         payload["reasoning"] = {"enabled": False}
 
+    last_error: Exception | None = None
+    max_attempts = max(3, openrouter_key_count() + 1)  # try each configured key at least once
+
     async with httpx.AsyncClient(timeout=120) as http:
-        r = await http.post(
-            f"{_OPENROUTER_BASE}/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        # Some models reject the `reasoning` control with a 400 — retry once
-        # without it rather than failing the whole cover step.
-        if r.status_code == 400 and "reasoning" in payload:
-            log.info(
-                "cover: %s requires reasoning — retrying without the disable flag",
-                model,
-            )
-            payload.pop("reasoning", None)
+        for attempt in range(max_attempts):
+            key = get_openrouter_key()
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type":  "application/json",
+            }
+
             r = await http.post(
                 f"{_OPENROUTER_BASE}/chat/completions",
                 headers=headers,
                 json=payload,
             )
-        if r.status_code >= 400:
-            # Surface OpenRouter's actual error body — the bare status code is
-            # useless for diagnosing why the request was rejected.
+
+            # Some models reject the `reasoning` control with a 400 — retry once
+            # without it rather than failing the whole cover step.
+            if r.status_code == 400 and "reasoning" in payload:
+                log.info(
+                    "cover: %s requires reasoning — retrying without the disable flag",
+                    model,
+                )
+                payload.pop("reasoning", None)
+                r = await http.post(
+                    f"{_OPENROUTER_BASE}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+
+            if r.status_code < 400:
+                body = r.json()
+                break
+
+            # Credit / quota / rate-limit on this key → rotate and try again.
+            if is_credit_error(r.status_code, r.text):
+                rotate_openrouter_key(key)
+                log.warning(
+                    "OpenRouter Gemini image credit/limit error (HTTP %s) on attempt %s; "
+                    "rotating key and retrying.",
+                    r.status_code,
+                    attempt + 1,
+                )
+                last_error = RuntimeError(
+                    f"OpenRouter image request for {model} failed with HTTP "
+                    f"{r.status_code}: {r.text[:500]}"
+                )
+                continue
+
+            # Non-credit error → fail fast so the admin sees the real problem.
             raise RuntimeError(
                 f"OpenRouter image request for {model} failed with HTTP "
                 f"{r.status_code}: {r.text[:500]}"
             )
-        body = r.json()
+        else:
+            # Exhausted all keys.
+            raise last_error or RuntimeError(
+                f"OpenRouter image request for {model} failed on all configured keys."
+            )
 
     try:
         message = body["choices"][0]["message"]
@@ -302,29 +376,50 @@ async def _generate_gemini_openrouter(model: str, prompt: str, output_path: str)
 # ── OpenRouter — FLUX / SD image generation (images.generate) ─────────────────
 
 async def _generate_openrouter(model: str, prompt: str, size: str, output_path: str) -> None:
-    """Generate image via OpenRouter (FLUX / Stable Diffusion / etc.)."""
-    if not settings.OPENROUTER_API_KEY:
-        raise ValueError(
-            f"OPENROUTER_API_KEY is not set. Add it to your .env file to use {model}. "
-            "Get a key at https://openrouter.ai/keys"
-        )
+    """Generate image via OpenRouter (FLUX / Stable Diffusion / etc.).
 
-    client = AsyncOpenAI(base_url=_OPENROUTER_BASE, api_key=settings.OPENROUTER_API_KEY)
+    Rotates to the next configured OpenRouter key on credit/limit errors.
+    """
+    last_error: Exception | None = None
+    max_attempts = max(3, openrouter_key_count() + 1)
 
-    # OpenRouter image models generally accept standard sizes; pass through as-is.
-    # They do NOT support the 'quality' parameter — omit it.
-    resp = await client.images.generate(
-        model=model,
-        prompt=prompt,
-        size=size,
-        n=1,
+    for attempt in range(max_attempts):
+        key = get_openrouter_key()
+        client = openai.AsyncOpenAI(base_url=_OPENROUTER_BASE, api_key=key)
+
+        # OpenRouter image models generally accept standard sizes; pass through as-is.
+        # They do NOT support the 'quality' parameter — omit it.
+        try:
+            resp = await client.images.generate(
+                model=model,
+                prompt=prompt,
+                size=size,
+                n=1,
+            )
+        except openai.APIStatusError as exc:
+            if is_credit_error(exc.status_code, str(exc)):
+                rotate_openrouter_key(key)
+                log.warning(
+                    "OpenRouter FLUX/SD image credit/limit error (HTTP %s) on attempt %s; "
+                    "rotating key and retrying.",
+                    exc.status_code,
+                    attempt + 1,
+                )
+                last_error = exc
+                continue
+            raise
+
+        item = resp.data[0]
+        if getattr(item, "b64_json", None):
+            with open(output_path, "wb") as f:
+                f.write(base64.b64decode(item.b64_json))
+        else:
+            await _download_url(item.url, output_path)
+        return
+
+    raise last_error or RuntimeError(
+        f"OpenRouter image request for {model} failed on all configured keys."
     )
-    item = resp.data[0]
-    if getattr(item, "b64_json", None):
-        with open(output_path, "wb") as f:
-            f.write(base64.b64decode(item.b64_json))
-    else:
-        await _download_url(item.url, output_path)
 
 
 # ── Native OpenAI image generation ───────────────────────────────────────────
@@ -350,7 +445,7 @@ async def _generate_openai(bare_model: str, prompt: str, quality: str, size: str
             "to a FLUX / Gemini / Stable Diffusion model (those use OPENROUTER_API_KEY)."
         )
 
-    client = AsyncOpenAI(api_key=api_key)
+    client = openai.AsyncOpenAI(api_key=api_key)
 
     # Resolve size per model — admin's IMAGE_SIZE choice is respected if valid,
     # remapped to the nearest valid size for that model if not.
@@ -430,7 +525,7 @@ async def generate_cover(
 
     quality = cfg.get("IMAGE_QUALITY", settings.IMAGE_QUALITY)
     size    = cfg.get("IMAGE_SIZE",    settings.IMAGE_SIZE)
-    prompt  = await _build_prompt(title, author, summary, genres, year, language)
+    prompt  = await _build_prompt(title, author, summary, genres, year, language, cfg)
 
     # Silently upgrade any stale/deprecated model name saved in the DB
     if model in _MODEL_ALIASES:

@@ -26,6 +26,12 @@ import re
 import httpx
 from api.config.settings import settings
 from api.services.usage_logger import log_tts_usage
+from api.services.openrouter_keys import (
+    get_openrouter_key,
+    rotate_openrouter_key,
+    is_credit_error,
+    openrouter_key_count,
+)
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +76,20 @@ def _is_english_only_voice(voice: str) -> bool:
 
 _VALID_AUDIO_STYLES = {"single", "multi", "podcast", "audiobook", "news", "bedtime", "custom"}
 
+# Short bracket tags prepended to every TTS chunk (except the first, which already
+# has the full style prompt).  Gemini TTS treats bracketed tags as delivery
+# directions rather than spoken words, so they help keep voice/tone consistent
+# across chunk boundaries without being read aloud.
+_STYLE_TAGS: dict[str, str] = {
+    "single":    "",
+    "audiobook": "narrator",
+    "news":      "anchor",
+    "bedtime":   "soothing",
+    "custom":    "custom delivery",
+    "multi":     "dialogue",
+    "podcast":   "podcast",
+}
+
 
 def _gemini_voice_name(voice: str | None, fallback: str = "Kore") -> str:
     """Return a valid Gemini voice name, falling back if the input is missing/invalid."""
@@ -88,13 +108,18 @@ def _resolve_speaker_voices(cfg: dict, language: str) -> tuple[str, str]:
     return _gemini_voice_name(v1, "Kore"), _gemini_voice_name(v2, "Puck")
 
 
-def _apply_audio_style(text: str, style: str | None, cfg: dict) -> tuple[str, bool]:
+def _apply_audio_style(text: str, style: str | None, cfg: dict) -> tuple[str, bool, str]:
     """
     Apply a Gemini TTS style/profile to the transcript.
 
-    Returns (styled_text, use_multi_speaker).  Multi-speaker styles rewrite the
-    text as alternating Speaker1 / Speaker2 lines; other styles may prepend a
-    natural-language direction prompt.
+    Returns (styled_text, use_multi_speaker, chunk_prefix).  Multi-speaker
+    styles rewrite the text as alternating Speaker1 / Speaker2 lines; other
+    styles may prepend a natural-language direction prompt.
+
+    chunk_prefix is a short bracketed tag (e.g. "[narrator]") that is prepended
+    to every TTS chunk *except* the first one.  It reminds the model to keep the
+    same delivery across chunk boundaries, which prevents sudden tone shifts
+    ~40 seconds into a long audio file.
 
     Style control is prompt-based in Gemini TTS — there is no dedicated API
     field for pace/tone/profiles.  See:
@@ -104,10 +129,13 @@ def _apply_audio_style(text: str, style: str | None, cfg: dict) -> tuple[str, bo
     if style not in _VALID_AUDIO_STYLES:
         style = "single"
 
+    tag = _STYLE_TAGS.get(style, "").strip()
+    chunk_prefix = f"[{tag}]\n" if tag else ""
+
     # Custom style: admin provides the full direction prompt.
     if style == "custom":
         prompt = (cfg.get("GEMINI_TTS_STYLE_PROMPT") or "").strip()
-        return (f"{prompt}\n\n{text}" if prompt else text), False
+        return (f"{prompt}\n\n{text}" if prompt else text), False, chunk_prefix
 
     # Multi-speaker / podcast: alternate sentences between two speakers.
     if style in ("multi", "podcast"):
@@ -120,12 +148,12 @@ def _apply_audio_style(text: str, style: str | None, cfg: dict) -> tuple[str, bo
             intro = f"TTS the following conversation between {s1} and {s2}.\n\n"
         sentences = [s.strip() for s in _SENTENCE_BOUNDARY.split(text) if s.strip()]
         if not sentences:
-            return text, True
+            return text, True, chunk_prefix
         lines = []
         for i, sent in enumerate(sentences):
             speaker = s1 if i % 2 == 0 else s2
             lines.append(f"{speaker}: {sent}")
-        return intro + "\n".join(lines), True
+        return intro + "\n".join(lines), True, chunk_prefix
 
     # Single-speaker styles: prepend a direction prompt.
     prompts = {
@@ -138,7 +166,7 @@ def _apply_audio_style(text: str, style: str | None, cfg: dict) -> tuple[str, bo
     custom_prompt = (cfg.get("GEMINI_TTS_STYLE_PROMPT") or "").strip()
     if custom_prompt:
         prompt = custom_prompt
-    return (f"{prompt}\n\n{text}" if prompt else text), False
+    return (f"{prompt}\n\n{text}" if prompt else text), False, chunk_prefix
 
 
 # Sentence-ending punctuation in EN / AR / general — match end-of-sentence so we
@@ -251,7 +279,7 @@ async def synthesize(
     effective_style = "single"
     if is_gemini_tts:
         effective_style = (audio_style or cfg.get("GEMINI_TTS_AUDIO_STYLE") or "single").strip().lower()
-    styled_text, is_multi_style = _apply_audio_style(text, effective_style, cfg)
+    styled_text, is_multi_style, chunk_prefix = _apply_audio_style(text, effective_style, cfg)
 
     # ── Warning: Deepgram Aura voices are English-only ───────────────────────
     # Sending Arabic text to an aura-* voice produces garbled audio because
@@ -267,7 +295,13 @@ async def synthesize(
     # Provider-specific char budget — Deepgram is the strictest at ~1500 chars/req.
     max_chars = _PROVIDER_MAX_CHARS.get(provider, _DEFAULT_MAX_CHARS)
 
-    chunks = _split_text_for_tts(styled_text, max_chars=max_chars)
+    # Reserve room for the per-chunk continuity tag so a chunk + tag never
+    # exceeds the provider's per-request character budget.
+    split_budget = max_chars
+    if is_gemini_tts and chunk_prefix:
+        split_budget = max(max_chars - len(chunk_prefix), 1000)
+
+    chunks = _split_text_for_tts(styled_text, max_chars=split_budget)
     if not chunks:
         raise ValueError("synthesize() called with empty text")
 
@@ -294,6 +328,12 @@ async def synthesize(
     part_paths: list[str] = []
     try:
         for i, chunk in enumerate(chunks):
+            # Prepend a short continuity tag to every chunk after the first.
+            # The first chunk already contains the full style prompt / intro;
+            # subsequent chunks only contain content, so the tag reminds the
+            # model to keep the same voice/tone across boundaries.
+            if i > 0 and chunk_prefix:
+                chunk = chunk_prefix + chunk
             part = f"{output_path}.part{i:03d}.mp3"
             await _dispatch_tts(chunk, provider, voice, language, cfg, part, audio_style=effective_style)
             part_paths.append(part)
@@ -356,10 +396,11 @@ async def _dispatch_tts(
         # which may hold a Cartesia/ElevenLabs UUID incompatible with Gemini.
         await _gemini(text, gemini_voice, language, gemini_model, output_path, cfg=cfg, audio_style=audio_style)
     elif provider == "openrouter":
-        if not settings.OPENROUTER_API_KEY:
+        if not get_openrouter_key():
             raise ValueError(
-                "OPENROUTER_API_KEY is not set. OpenRouter TTS requires it — "
-                "add OPENROUTER_API_KEY to your .env file. Get one at https://openrouter.ai/keys."
+                "No OpenRouter API keys are configured. OpenRouter TTS requires "
+                "OPENROUTER_API_KEY (plus optional OPENROUTER_API_KEY_2 / _3) in your .env file. "
+                "Get one at https://openrouter.ai/keys."
             )
         or_model = cfg.get("OPENROUTER_TTS_MODEL") or settings.OPENROUTER_TTS_MODEL
         # Per-language voice (OPENROUTER_TTS_VOICE_EN / _AR) takes priority,
@@ -764,6 +805,8 @@ async def _openrouter_tts(
       return raw signed 16-bit little-endian PCM at 24 kHz mono.
 
     We always output a standard MP3 so the rest of the pipeline is format-agnostic.
+
+    Rotates to the next configured OpenRouter key on credit/limit errors.
     """
     is_gemini = model.startswith("google/")
     chosen_voice = voice or ("Kore" if is_gemini else "alloy")
@@ -793,23 +836,49 @@ async def _openrouter_tts(
         # Gemini API and avoids broken/missing default encodings.
         payload["response_format"] = "pcm"
 
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(
-            "https://openrouter.ai/api/v1/audio/speech",
-            headers={
-                "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
-                "Content-Type":  "application/json",
-                "HTTP-Referer":  "https://seeourbook.com",
-                "X-Title":       "SeeOurBook Summarizer",
-            },
-            json=payload,
-        )
+    last_error: Exception | None = None
+    max_attempts = max(3, openrouter_key_count() + 1)
 
-    if r.status_code >= 400:
-        raise RuntimeError(
-            f"OpenRouter TTS returned {r.status_code}: {r.text[:500]} "
-            f"(model={model}, voice={chosen_voice}, language={language})"
-        )
+    async with httpx.AsyncClient(timeout=180) as client:
+        for attempt in range(max_attempts):
+            key = get_openrouter_key()
+            r = await client.post(
+                "https://openrouter.ai/api/v1/audio/speech",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type":  "application/json",
+                    "HTTP-Referer":  "https://seeourbook.com",
+                    "X-Title":       "SeeOurBook Summarizer",
+                },
+                json=payload,
+            )
+
+            if r.status_code < 400:
+                break
+
+            if is_credit_error(r.status_code, r.text):
+                rotate_openrouter_key(key)
+                log.warning(
+                    "OpenRouter TTS credit/limit error (HTTP %s) on attempt %s; "
+                    "rotating key and retrying.",
+                    r.status_code,
+                    attempt + 1,
+                )
+                last_error = RuntimeError(
+                    f"OpenRouter TTS returned {r.status_code}: {r.text[:500]} "
+                    f"(model={model}, voice={chosen_voice}, language={language})"
+                )
+                continue
+
+            raise RuntimeError(
+                f"OpenRouter TTS returned {r.status_code}: {r.text[:500]} "
+                f"(model={model}, voice={chosen_voice}, language={language})"
+            )
+        else:
+            raise last_error or RuntimeError(
+                f"OpenRouter TTS failed on all configured keys "
+                f"(model={model}, voice={chosen_voice}, language={language})"
+            )
 
     content = r.content
     content_type = (r.headers.get("content-type") or "").lower()

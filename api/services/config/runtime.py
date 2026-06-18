@@ -167,6 +167,12 @@ def _defaults() -> dict[str, str]:
         "IMAGE_MODEL_AR":                 settings.IMAGE_MODEL_AR,
         "IMAGE_QUALITY":                  settings.IMAGE_QUALITY,
         "IMAGE_SIZE":                     settings.IMAGE_SIZE,
+        # Cover prompt size guard.  New key name is IMAGE_PROMPT_MAX_CHARS;
+        # COVER_MAX_PROMPT_CHARS is kept as a legacy alias.
+        "IMAGE_PROMPT_MAX_CHARS":         "3000",
+        "IMAGE_SUMMARY_MAX_CHARS":        "1200",
+        "COVER_MAX_PROMPT_CHARS":         "3000",
+        "COVER_SUMMARY_MAX_CHARS":        "1200",
         "ALTTEXT_PROVIDER_EN":            settings.ALTTEXT_PROVIDER_EN,
         "ALTTEXT_MODEL_EN":               settings.ALTTEXT_MODEL_EN,
         "ALTTEXT_PROVIDER_AR":            settings.ALTTEXT_PROVIDER_AR,

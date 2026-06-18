@@ -30,7 +30,11 @@ class Settings(BaseSettings):
     #   anthropic/claude-haiku-4-5-20251001
     #   openai/gpt-4.1-mini
     # Setting any MODEL_* to an OpenRouter name automatically routes via OpenRouter.
-    OPENROUTER_API_KEY: str = ""
+    # Primary + optional spare keys.  When the primary hits a credit/limit error,
+    # the pipeline rotates to OPENROUTER_API_KEY_2, then _3.
+    OPENROUTER_API_KEY:   str = ""
+    OPENROUTER_API_KEY_2: str = ""
+    OPENROUTER_API_KEY_3: str = ""
 
     # Native Gemini API key (for TTS, image generation, etc.)
     # Get one at https://aistudio.google.com/app/apikey
@@ -53,6 +57,15 @@ class Settings(BaseSettings):
     # Use "gpt-image-1" only if your OpenAI project has been granted access to it.
     IMAGE_QUALITY:     str = "high"          # high | standard | auto
     IMAGE_SIZE:        str = "1024x1536"   # gpt-image-1 portrait (1024x1792 is no longer valid)
+    # Cover prompt size limits.  OpenRouter Gemini image models have ~32k context
+    # windows, and image output consumes a large share of that.  Keep the text
+    # prompt small (default 3 000 chars / ~750 tokens) to avoid context overflow.
+    # Admin can override via IMAGE_PROMPT_MAX_CHARS in Admin → Settings → Cover Image.
+    IMAGE_PROMPT_MAX_CHARS:  int = 3000
+    IMAGE_SUMMARY_MAX_CHARS: int = 1200
+    # Legacy aliases — kept for backward compatibility with existing .env files.
+    COVER_MAX_PROMPT_CHARS:  int = 3000
+    COVER_SUMMARY_MAX_CHARS: int = 1200
     # Mind map generation model (text, not image)
     MODEL_MINDMAP:     str = "gpt-4.1-mini"  # any chat model — supports OpenRouter prefix
     # Mind map output format: "mermaid" → SVG via mermaid.ink | "json" → structured JSON

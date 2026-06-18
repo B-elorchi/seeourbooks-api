@@ -25,6 +25,11 @@ import openai
 
 from api.config.settings import settings
 from api.services.usage_logger import log_text_usage
+from api.services.openrouter_keys import (
+    get_openrouter_key,
+    rotate_openrouter_key,
+    is_credit_error,
+)
 
 log = logging.getLogger(__name__)
 
@@ -194,14 +199,15 @@ def _openai_client() -> openai.AsyncOpenAI:
 
 
 def _openrouter_client() -> openai.AsyncOpenAI:
-    if not settings.OPENROUTER_API_KEY:
+    key = get_openrouter_key()
+    if not key:
         raise ValueError(
-            "OPENROUTER_API_KEY is not set. "
-            "Add it to your .env to use OpenRouter models."
+            "No OpenRouter API keys are configured. "
+            "Set OPENROUTER_API_KEY or OPENROUTER_API_KEYS in your .env."
         )
     return openai.AsyncOpenAI(
         base_url=_OPENROUTER_BASE,
-        api_key=settings.OPENROUTER_API_KEY,
+        api_key=key,
         default_headers={
             "HTTP-Referer": "https://seeourbook.sa",
             "X-Title":      "SeeOurBook",
@@ -274,20 +280,32 @@ async def _chat_complete_single(
 ) -> str:
     """One attempt at a chat completion, no fallback logic."""
     if _is_openrouter(model):
-        client = _openrouter_client()
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=_prepend_system(system, messages),
-            max_tokens=max_tokens,
-        )
-        usage = getattr(resp, "usage", None)
-        await log_text_usage(
-            provider     = "openrouter",
-            model        = model,
-            input_tokens = getattr(usage, "prompt_tokens",     0) if usage else 0,
-            output_tokens= getattr(usage, "completion_tokens", 0) if usage else 0,
-        )
-        return resp.choices[0].message.content or ""
+        for attempt in range(2):
+            key_used = get_openrouter_key()
+            client = _openrouter_client()
+            try:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    messages=_prepend_system(system, messages),
+                    max_tokens=max_tokens,
+                )
+            except Exception as exc:
+                if attempt == 0 and is_credit_error(_exception_status(exc), str(exc)):
+                    rotate_openrouter_key(key_used)
+                    log.warning(
+                        "OpenRouter credit error for model %r; rotated key and retrying.",
+                        model,
+                    )
+                    continue
+                raise
+            usage = getattr(resp, "usage", None)
+            await log_text_usage(
+                provider     = "openrouter",
+                model        = model,
+                input_tokens = getattr(usage, "prompt_tokens",     0) if usage else 0,
+                output_tokens= getattr(usage, "completion_tokens", 0) if usage else 0,
+            )
+            return resp.choices[0].message.content or ""
 
     if _is_anthropic(model):
         client = _anthropic_client()
@@ -332,13 +350,28 @@ async def chat_stream(
     Works with any model — Anthropic native, OpenAI native, or OpenRouter.
     """
     if _is_openrouter(model):
-        client = _openrouter_client()
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=_prepend_system(system, messages),
-            max_tokens=max_tokens,
-            stream=True,
-        )
+        for attempt in range(2):
+            key_used = get_openrouter_key()
+            client = _openrouter_client()
+            try:
+                stream = await client.chat.completions.create(
+                    model=model,
+                    messages=_prepend_system(system, messages),
+                    max_tokens=max_tokens,
+                    stream=True,
+                )
+            except Exception as exc:
+                if attempt == 0 and is_credit_error(_exception_status(exc), str(exc)):
+                    rotate_openrouter_key(key_used)
+                    log.warning(
+                        "OpenRouter credit error for streaming model %r; rotated key and retrying.",
+                        model,
+                    )
+                    continue
+                raise
+            break
+        else:
+            return
         async for chunk in stream:
             delta = chunk.choices[0].delta.content
             if delta:

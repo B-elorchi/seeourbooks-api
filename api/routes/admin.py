@@ -560,6 +560,77 @@ async def admin_metrics() -> dict:
     }
 
 
+@router.get("/metrics/queued")
+async def admin_queued_metrics(minutes: int = 10) -> dict:
+    """
+    Return a focused queue snapshot:
+      - queued_last_n_minutes: jobs currently queued that were created in the
+        last `minutes` minutes (default 10).
+      - queued_with_progress: queued jobs that already have at least one step
+        completed (done/partial), i.e. waiting for retry after making progress.
+      - queued_total: all currently queued jobs.
+    """
+    try:
+        since = datetime.now(timezone.utc) - timedelta(minutes=max(1, minutes))
+        since_iso = since.isoformat()
+        rows = await find(
+            "pipeline_jobs",
+            filters={"status": "queued"},
+            select="id,created_at,result",
+            order="created_at DESC",
+            limit=5000,
+        )
+    except Exception as exc:
+        log.warning("admin_queued_metrics: DB unreachable — %s", exc)
+        return {
+            "minutes": minutes,
+            "queued_last_n_minutes": 0,
+            "queued_with_progress":  0,
+            "queued_total":          0,
+        }
+
+    total = len(rows)
+    recent = sum(
+        1 for r in rows
+        if r.get("created_at") and str(r["created_at"]) >= since_iso
+    )
+
+    # Jobs that already have at least one finished/partial step in the stored
+    # result, or in the granular pipeline_step_results table.
+    jobs_with_progress: set[str] = set()
+    queued_ids: list[str] = []
+    for r in rows:
+        job_id = r["id"]
+        queued_ids.append(job_id)
+        result = r.get("result") or {}
+        steps = result.get("steps") or {}
+        if any(status in ("done", "partial") for status in steps.values()):
+            jobs_with_progress.add(job_id)
+
+    if queued_ids:
+        try:
+            step_rows = await find(
+                "pipeline_step_results",
+                filters={
+                    "job_id": ("in", queued_ids),
+                    "status": ("in", ["done", "partial"]),
+                },
+                select="job_id",
+                limit=10000,
+            )
+            for sr in step_rows:
+                jobs_with_progress.add(sr["job_id"])
+        except Exception as exc:
+            log.debug("admin_queued_metrics: step_results lookup failed — %s", exc)
+
+    return {
+        "minutes": minutes,
+        "queued_last_n_minutes": recent,
+        "queued_with_progress":  len(jobs_with_progress),
+        "queued_total":          total,
+    }
+
+
 @router.get("/jobs")
 async def admin_jobs(limit: int = 100) -> list:
     """List all pipeline jobs ordered newest-first."""
@@ -883,7 +954,7 @@ async def admin_costs_daily(days: int = 30) -> list:
     since_iso = datetime(start.year, start.month, start.day, tzinfo=timezone.utc).isoformat()
     try:
         rows = await find("usage_logs", filters={"created_at": ("gte", since_iso)},
-                          select="created_at, cost_usd", order="created_at ASC", limit=50000)
+                          select="created_at, cost_usd", order="created_at DESC", limit=200000)
     except Exception:
         rows = []
 
@@ -902,18 +973,276 @@ async def admin_costs_daily(days: int = 30) -> list:
     return series
 
 
+_MAX_IN_BATCH = 200
+
+
+async def _book_costs_all_time(limit: int, offset: int) -> list:
+    """Read from the book_costs view and enrich with title/author from books."""
+    try:
+        rows = await find("book_costs", order="total_cost_usd.desc", limit=limit, offset=offset)
+    except Exception:
+        return []
+
+    book_ids = list({str(r.get("book_id", "")) for r in rows if r.get("book_id")})
+    books: dict[str, dict] = {}
+    if book_ids:
+        for i in range(0, len(book_ids), _MAX_IN_BATCH):
+            try:
+                batch_rows = await find(
+                    "books",
+                    filters={"book_id": ("in", book_ids[i:i + _MAX_IN_BATCH])},
+                    select="book_id,title,author",
+                )
+                for b in batch_rows:
+                    books[str(b.get("book_id", ""))] = b
+            except Exception:
+                pass
+
+    results = []
+    for r in rows:
+        bid = str(r.get("book_id", ""))
+        b = books.get(bid, {})
+        results.append({
+            "book_id":       bid,
+            "title":         b.get("title") or bid,
+            "author":        b.get("author") or "",
+            "user_id":       r.get("user_id"),
+            "total_jobs":    r.get("total_jobs", 0),
+            "total_calls":   r.get("total_calls", 0),
+            "cost_usd":      round(float(r.get("total_cost_usd") or 0), 4),
+            "first_call_at": r.get("first_call_at"),
+            "last_call_at":  r.get("last_call_at"),
+        })
+    return results
+
+
+async def _book_costs_by_days(days: int, limit: int, offset: int) -> list:
+    """Aggregate usage_logs over a date window and group by book."""
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        logs = await find(
+            "usage_logs",
+            filters={"created_at": ("gte", since_iso)},
+            select="job_id,cost_usd",
+            order="created_at DESC",
+            limit=50000,
+        )
+    except Exception:
+        return []
+
+    by_job: dict[str, dict] = {}
+    for r in logs:
+        jid = r.get("job_id") or "__none__"
+        entry = by_job.setdefault(jid, {"cost_usd": 0.0, "calls": 0})
+        entry["cost_usd"] += float(r.get("cost_usd") or 0)
+        entry["calls"] += 1
+
+    job_ids = [j for j in by_job if j != "__none__"]
+    if not job_ids:
+        return []
+
+    jobs: list[dict] = []
+    for i in range(0, len(job_ids), _MAX_IN_BATCH):
+        try:
+            jobs.extend(await find(
+                "pipeline_jobs",
+                filters={"id": ("in", job_ids[i:i + _MAX_IN_BATCH])},
+                select="id,book_id,user_id",
+            ))
+        except Exception:
+            pass
+
+    by_book: dict[str, dict] = {}
+    for j in jobs:
+        jid = j.get("id")
+        if not jid or jid not in by_job:
+            continue
+        bid = str(j.get("book_id") or jid[:8])
+        entry = by_book.setdefault(bid, {
+            "book_id": bid, "title": "", "author": "", "user_id": j.get("user_id"),
+            "total_jobs": 0, "total_calls": 0, "cost_usd": 0.0,
+        })
+        entry["total_jobs"] += 1
+        entry["total_calls"] += by_job[jid]["calls"]
+        entry["cost_usd"] += by_job[jid]["cost_usd"]
+
+    book_ids = list(by_book.keys())
+    books: dict[str, dict] = {}
+    if book_ids:
+        for i in range(0, len(book_ids), _MAX_IN_BATCH):
+            try:
+                batch_rows = await find(
+                    "books",
+                    filters={"book_id": ("in", book_ids[i:i + _MAX_IN_BATCH])},
+                    select="book_id,title,author",
+                )
+                for b in batch_rows:
+                    books[str(b.get("book_id", ""))] = b
+            except Exception:
+                pass
+
+    results = []
+    for bid, entry in by_book.items():
+        b = books.get(bid, {})
+        entry["title"] = b.get("title") or bid
+        entry["author"] = b.get("author") or ""
+        entry["cost_usd"] = round(entry["cost_usd"], 4)
+        results.append(entry)
+
+    results.sort(key=lambda x: x["cost_usd"], reverse=True)
+    return results[offset:offset + limit]
+
+
+async def _user_costs_all_time(limit: int, offset: int) -> list:
+    """Read from the user_costs view."""
+    try:
+        rows = await find("user_costs", order="total_cost_usd.desc", limit=limit, offset=offset)
+    except Exception:
+        return []
+
+    results = []
+    for r in rows:
+        results.append({
+            "user_id":       r.get("user_id"),
+            "label":         r.get("email") or r.get("name") or str(r.get("user_id", ""))[:8],
+            "role":          r.get("role"),
+            "total_jobs":    r.get("total_jobs", 0),
+            "total_calls":   r.get("total_calls", 0),
+            "cost_usd":      round(float(r.get("total_cost_usd") or 0), 4),
+            "first_call_at": r.get("first_call_at"),
+            "last_call_at":  r.get("last_call_at"),
+        })
+    return results
+
+
+async def _user_costs_by_days(days: int, limit: int, offset: int) -> list:
+    """Aggregate usage_logs over a date window and group by user."""
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        logs = await find(
+            "usage_logs",
+            filters={"created_at": ("gte", since_iso)},
+            select="job_id,cost_usd",
+            order="created_at DESC",
+            limit=50000,
+        )
+    except Exception:
+        return []
+
+    by_job: dict[str, dict] = {}
+    for r in logs:
+        jid = r.get("job_id") or "__none__"
+        entry = by_job.setdefault(jid, {"cost_usd": 0.0, "calls": 0})
+        entry["cost_usd"] += float(r.get("cost_usd") or 0)
+        entry["calls"] += 1
+
+    job_ids = [j for j in by_job if j != "__none__"]
+    if not job_ids:
+        return []
+
+    jobs: list[dict] = []
+    for i in range(0, len(job_ids), _MAX_IN_BATCH):
+        try:
+            jobs.extend(await find(
+                "pipeline_jobs",
+                filters={"id": ("in", job_ids[i:i + _MAX_IN_BATCH])},
+                select="id,user_id",
+            ))
+        except Exception:
+            pass
+
+    by_user: dict[str, dict] = {}
+    for j in jobs:
+        jid = j.get("id")
+        if not jid or jid not in by_job:
+            continue
+        uid = j.get("user_id") or "__anonymous__"
+        entry = by_user.setdefault(uid, {
+            "user_id": uid, "label": uid,
+            "total_jobs": 0, "total_calls": 0, "cost_usd": 0.0,
+        })
+        entry["total_jobs"] += 1
+        entry["total_calls"] += by_job[jid]["calls"]
+        entry["cost_usd"] += by_job[jid]["cost_usd"]
+
+    user_ids = [u for u in by_user if u != "__anonymous__"]
+    user_labels: dict[str, str] = {}
+    if user_ids:
+        for i in range(0, len(user_ids), _MAX_IN_BATCH):
+            try:
+                rows = await find(
+                    "app_users",
+                    filters={"id": ("in", user_ids[i:i + _MAX_IN_BATCH])},
+                    select="id,email,name",
+                )
+                for u in rows:
+                    user_labels[u["id"]] = u.get("name") or u.get("email") or u["id"][:8]
+            except Exception:
+                pass
+
+    results = []
+    for uid, entry in by_user.items():
+        entry["label"] = user_labels.get(uid, "Anonymous" if uid == "__anonymous__" else uid[:8])
+        entry["cost_usd"] = round(entry["cost_usd"], 4)
+        results.append(entry)
+
+    results.sort(key=lambda x: x["cost_usd"], reverse=True)
+    return results[offset:offset + limit]
+
+
+@router.get("/costs/books")
+async def admin_costs_books(days: int = 0, limit: int = 100, offset: int = 0) -> dict:
+    """
+    Full cost breakdown per book, with pagination.
+
+    - days=0 (default) → all-time totals from the `book_costs` view.
+    - days>0           → date-filtered aggregation over the last N days.
+    """
+    if limit < 1:
+        limit = 100
+    if limit > 500:
+        limit = 500
+    if offset < 0:
+        offset = 0
+
+    rows = await (_book_costs_by_days(days, limit, offset) if days > 0
+                  else _book_costs_all_time(limit, offset))
+    return {"days": days, "limit": limit, "offset": offset, "rows": rows}
+
+
+@router.get("/costs/users")
+async def admin_costs_users(days: int = 0, limit: int = 100, offset: int = 0) -> dict:
+    """
+    Full cost breakdown per user, with pagination.
+
+    - days=0 (default) → all-time totals from the `user_costs` view.
+    - days>0           → date-filtered aggregation over the last N days.
+    """
+    if limit < 1:
+        limit = 100
+    if limit > 500:
+        limit = 500
+    if offset < 0:
+        offset = 0
+
+    rows = await (_user_costs_by_days(days, limit, offset) if days > 0
+                  else _user_costs_all_time(limit, offset))
+    return {"days": days, "limit": limit, "offset": offset, "rows": rows}
+
+
 @router.post("/jobs/{job_id}/rerun", status_code=202)
 async def admin_rerun_steps(
     job_id: str,
     body: RerunRequest,
     background_tasks: BackgroundTasks,
+    force: bool = False,
 ) -> dict:
     """
-    Re-run specific pipeline steps for an existing job — regardless of their
-    previous status (done, failed, or skipped).
+    Re-run specific pipeline steps for an existing job.
 
-    Useful when you want to regenerate just one output (e.g. re-generate audio
-    or cover) without running the full pipeline again.
+    By default, steps that already succeeded in the previous run are skipped
+    (only failed / running / pending / skipped steps are retried).  Pass
+    `?force=true` to override and regenerate even steps that are already done.
 
     Body: {"steps": ["audio_full", "cover"]}
 
@@ -951,11 +1280,35 @@ async def admin_rerun_steps(
     except Exception as exc:
         raise HTTPException(422, f"Stored input is invalid: {exc}") from exc
 
-    # Check if inject_epub was in the original job steps and was completed
-    # If so, we need to re-run it to include the new assets
-    steps_to_run = list(body.steps)
     previous_result = job.get("result")
-    
+    result_dict = previous_result if isinstance(previous_result, dict) else {}
+    step_statuses = result_dict.get("steps", {}) or {}
+
+    # Filter out steps that already succeeded, unless the caller forces them.
+    skipped_done: list[str] = []
+    if not force:
+        steps_to_run = []
+        for s in body.steps:
+            if step_statuses.get(s) == "done":
+                skipped_done.append(s)
+            else:
+                steps_to_run.append(s)
+    else:
+        steps_to_run = list(body.steps)
+
+    if not steps_to_run and not skipped_done:
+        raise HTTPException(422, "No steps to rerun")
+    if not steps_to_run:
+        return {
+            "ok":           True,
+            "job_id":       job_id,
+            "status":       "skipped",
+            "rerun_steps":  [],
+            "skipped_done": skipped_done,
+            "message":      "All selected steps already succeeded. Use ?force=true to regenerate them.",
+            "status_url":   f"/api/pipeline/status/{job_id}",
+        }
+
     # Auto-add inject_epub if:
     # 1. It's not already in the requested steps
     # 2. It was in the original job input steps
@@ -963,29 +1316,28 @@ async def admin_rerun_steps(
     if "inject_epub" not in steps_to_run:
         original_steps = raw_input.get("steps", []) if isinstance(raw_input, dict) else []
         if "inject_epub" in original_steps and previous_result:
-            result_dict = previous_result if isinstance(previous_result, dict) else {}
-            step_statuses = result_dict.get("steps", {})
             if step_statuses.get("inject_epub") in ("done", "partial"):
                 steps_to_run.append("inject_epub")
                 log.info("Auto-adding inject_epub to rerun for job %s (needs to include new assets)", job_id)
 
     # Override steps to exactly what the admin selected (plus auto-added inject_epub)
     req = req.model_copy(update={"steps": steps_to_run})
-    
+
     # Debug logging
-    log.info("Rerun job %s: steps_to_run=%s, req.steps=%s", job_id, steps_to_run, req.steps)
+    log.info("Rerun job %s: force=%s steps_to_run=%s skipped_done=%s", job_id, force, steps_to_run, skipped_done)
 
     await reset_for_manual_retry(job_id)
-    # force_steps=True: use exactly the steps the admin chose, don't override
-    # with just-the-failed-steps logic that _run_job normally applies.
+    # force_steps=True: use exactly the steps we chose, don't override with
+    # just-the-failed-steps logic that _run_job normally applies.
     background_tasks.add_task(_run_job, job_id, req, previous_result, True)
 
     return {
-        "ok":          True,
-        "job_id":      job_id,
-        "status":      "queued",
-        "rerun_steps": steps_to_run,
-        "status_url":  f"/api/pipeline/status/{job_id}",
+        "ok":           True,
+        "job_id":       job_id,
+        "status":       "queued",
+        "rerun_steps":  steps_to_run,
+        "skipped_done": skipped_done,
+        "status_url":   f"/api/pipeline/status/{job_id}",
     }
 
 
@@ -1034,6 +1386,17 @@ async def admin_retry_job(job_id: str, background_tasks: BackgroundTasks) -> dic
 
     # Tell the user which steps will be re-run
     failed = _failed_steps(previous_result)
+
+    # If the job already succeeded and there is nothing to retry, don't re-run
+    # every step from scratch — that would waste credits and overwrite assets.
+    if previous_result and not failed:
+        return {
+            "ok":            True,
+            "job_id":        job_id,
+            "status":        "skipped",
+            "retrying_steps": [],
+            "message":       "No failed / running / pending steps to retry. Use /admin/jobs/{job_id}/rerun to regenerate specific steps.",
+        }
 
     await reset_for_manual_retry(job_id)
     background_tasks.add_task(_run_job, job_id, req, previous_result)
