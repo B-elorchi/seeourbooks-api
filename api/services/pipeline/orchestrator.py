@@ -2352,8 +2352,8 @@ async def run_pipeline(
                 "audio_en_url": chapter_audio.get(ch["index"]) if lang == "en" else chapter_audio_translated.get(ch["index"]),
                 "audio_ar_url": chapter_audio_translated.get(ch["index"]) if lang == "en" else chapter_audio.get(ch["index"]),
                 "mindmap_url":    (chapter_mindmap.get(ch["index"]) or {}).get("url"),
-                "mindmap_en_url": (chapter_mindmap.get(ch["index"]) if lang == "en" else chapter_mindmap_translated.get(ch["index"]) or {}).get("url"),
-                "mindmap_ar_url": (chapter_mindmap_translated.get(ch["index"]) if lang == "en" else chapter_mindmap.get(ch["index"]) or {}).get("url"),
+                "mindmap_en_url": ((chapter_mindmap.get(ch["index"]) if lang == "en" else chapter_mindmap_translated.get(ch["index"])) or {}).get("url"),
+                "mindmap_ar_url": ((chapter_mindmap_translated.get(ch["index"]) if lang == "en" else chapter_mindmap.get(ch["index"])) or {}).get("url"),
             }
             for ch in chapter_results
         ],
