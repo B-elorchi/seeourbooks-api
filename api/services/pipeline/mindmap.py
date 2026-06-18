@@ -168,42 +168,75 @@ async def generate_json_mindmap(title: str, summary: str, language: str, model: 
 
 def _repair_truncated_json(text: str) -> str | None:
     """
-    Attempt to repair truncated JSON by closing unclosed brackets/braces.
-    Returns repaired string or None if cannot repair.
+    Repair JSON truncated mid-structure (the model hit a token cap or stopped).
+
+    Strategy: scan once, tracking string state and the open-bracket stack, and
+    remember the index right after the last *complete* value (a closed string,
+    `}` or `]`). Then cut back to that point — dropping any half-written token
+    like `"sub_nodes": ["a", "b` or a dangling `"category":` — strip a trailing
+    separator (`,`/`:`) that would be illegal before a close, and append the
+    brackets still open. This handles trailing commas and partial elements that
+    naive bracket-counting could not, so a clipped mind map still parses.
+
+    Returns the repaired string, or None if nothing is completable / not needed.
     """
-    # Count open/close braces and brackets
-    open_braces = text.count('{') - text.count('}')
-    open_brackets = text.count('[') - text.count(']')
-    
-    # If it looks complete, don't modify
-    if open_braces <= 0 and open_brackets <= 0:
+    in_string = False
+    escape = False
+    last_safe = -1            # index (exclusive) just past the last complete value
+
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+                last_safe = i + 1     # a complete string (key or value) ends here
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in '{[':
+            pass                      # opening — not itself a complete value
+        elif ch in '}]':
+            last_safe = i + 1         # a complete object/array ends here
+
+    if last_safe <= 0:
+        return None                   # nothing complete to salvage
+
+    # Cut to the last complete value and drop any trailing separator/whitespace.
+    candidate = text[:last_safe].rstrip()
+    while candidate and candidate[-1] in ',:':
+        candidate = candidate[:-1].rstrip()
+    if not candidate:
         return None
-    
-    repaired = text
-    
-    # Close strings that are left open (odd number of unescaped quotes)
-    # Simple heuristic: count quotes not preceded by backslash
-    quote_count = 0
-    i = 0
-    while i < len(repaired):
-        if repaired[i] == '"' and (i == 0 or repaired[i-1] != '\\'):
-            quote_count += 1
-        i += 1
-    
-    # If odd number of quotes, close the last string
-    if quote_count % 2 == 1:
-        # Find the last unclosed quote and close it
-        repaired = repaired.rstrip() + '"'
-    
-    # Close brackets first (they're inside braces usually)
-    for _ in range(open_brackets):
-        repaired = repaired.rstrip() + ']'
-    
-    # Close braces
-    for _ in range(open_braces):
-        repaired = repaired.rstrip() + '}'
-    
-    return repaired
+
+    # Recompute the still-open brackets on the trimmed candidate, then close them.
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in candidate:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == '{':
+            stack.append('}')
+        elif ch == '[':
+            stack.append(']')
+        elif ch in '}]' and stack:
+            stack.pop()
+
+    if not stack:
+        return None                   # already balanced — no repair needed
+
+    return candidate + ''.join(reversed(stack))
 
 
 def _parse_json_mindmap(raw: str) -> dict:
