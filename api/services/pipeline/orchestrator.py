@@ -621,6 +621,7 @@ async def run_pipeline(
     job_id: str | None = None,
     previous_result: dict | str | None = None,
     force_regenerate_summary: bool = False,
+    forced_steps: set[str] | None = None,
 ) -> dict:
     """
     Execute the pipeline and return the full result dict.
@@ -629,10 +630,15 @@ async def run_pipeline(
     Phase 2  — cover · audio_full · audio_chapters · mindmap · mindmap_chapters  (parallel)
     Phase 3  — alt_text · video  (parallel, depend on Phase-2 outputs)
     Phase 4  — inject_epub (runs LAST, after all other steps complete)
+
+    forced_steps — steps the user explicitly asked to (re)generate. A step that
+    already succeeded in `previous_result` is reused as-is UNLESS it is listed
+    here, so completed work (e.g. a good cover) is never silently regenerated.
     """
 
     started = time.time()
     cfg     = await get_all_config()
+    forced_steps = forced_steps or set()
     
     # Parse previous_result for dependency resolution
     _prev_parsed = None
@@ -895,6 +901,23 @@ async def run_pipeline(
         step_status[name] = "skipped"
         errors.pop(name, None)
         await _persist_step_result(job_id, name, "skipped")
+
+    _DONE_SENTINEL = object()
+
+    def _already_done(name: str, asset=_DONE_SENTINEL) -> bool:
+        """
+        True when `name` already succeeded in a previous run and the user did
+        NOT explicitly force it this time — so we keep the existing output
+        instead of regenerating it. When an `asset` handle is passed, it must
+        also be truthy (guards against a 'done' status with a missing URL).
+        """
+        if name in forced_steps:
+            return False
+        if step_status.get(name) != "done":
+            return False
+        if asset is not _DONE_SENTINEL and not asset:
+            return False
+        return True
 
     # ── Production catalog enrichment ─────────────────────────────────────────
     # Treat a title that is just the book_id as missing — some callers send the
@@ -1322,7 +1345,18 @@ async def run_pipeline(
         # can be generated.
         # ═════════════════════════════════════════════════════════════════════
         translate_step_requested = "translate" in steps
-        if (translate_enabled or translate_step_requested) and full_summary and not audio_blocked:
+        # Reuse an existing translation instead of regenerating it, unless the
+        # user explicitly forced translate OR the summary was (re)generated this
+        # pass (in which case the old translation is stale).
+        _translate_already_done = (
+            "translate" not in forced_steps
+            and "summarize" not in steps
+            and bool(translated_summary)
+        )
+        if _translate_already_done and translate_step_requested:
+            step_status["translate"] = "done"
+            log.info("translate already done — reusing existing translation (not forced)")
+        if (translate_enabled or translate_step_requested) and full_summary and not audio_blocked and not _translate_already_done:
             if translate_step_requested:
                 step_status["translate"] = "running"
                 set_step("translate")
@@ -1396,6 +1430,9 @@ async def run_pipeline(
             nonlocal cover_url
             if "cover" not in steps:
                 return
+            if _already_done("cover", cover_url):
+                log.info("cover already done — reusing existing image (not forced)")
+                return
             if not cover_enabled:
                 await _skip_step("cover")
                 return
@@ -1440,6 +1477,9 @@ async def run_pipeline(
         async def _do_audio_full() -> None:
             nonlocal full_audio, full_audio_path, translated_audio
             if "audio_full" not in steps:
+                return
+            if _already_done("audio_full", full_audio):
+                log.info("audio_full already done — reusing existing audio (not forced)")
                 return
             if not tts_enabled or not full_summary:
                 await _skip_step("audio_full")
@@ -1498,6 +1538,9 @@ async def run_pipeline(
         async def _do_audio_chapters() -> None:
             nonlocal chapter_audio, chapter_results, chapter_audio_translated
             if "audio_chapters" not in steps:
+                return
+            if _already_done("audio_chapters"):
+                log.info("audio_chapters already done — reusing existing audio (not forced)")
                 return
             if not tts_enabled or not chapter_results:
                 await _skip_step("audio_chapters")
@@ -1606,6 +1649,9 @@ async def run_pipeline(
             nonlocal translated_audio
             if "audio_full_translate" not in steps:
                 return
+            if _already_done("audio_full_translate", translated_audio):
+                log.info("audio_full_translate already done — reusing existing audio (not forced)")
+                return
             if not tts_enabled or not translated_summary or not translated_lang:
                 await _skip_step("audio_full_translate")
                 return
@@ -1662,6 +1708,9 @@ async def run_pipeline(
         async def _do_audio_chapters_translate() -> None:
             nonlocal chapter_audio_translated, chapter_results
             if "audio_chapters_translate" not in steps:
+                return
+            if _already_done("audio_chapters_translate"):
+                log.info("audio_chapters_translate already done — reusing existing audio (not forced)")
                 return
             if not tts_enabled or not chapter_results or not translated_summary or not translated_lang:
                 await _skip_step("audio_chapters_translate")
@@ -1748,6 +1797,9 @@ async def run_pipeline(
             nonlocal translated_mindmap_url, translated_mindmap_data, translated_mindmap_path_saved
             if "mindmap" not in steps:
                 return
+            if _already_done("mindmap", mindmap_url):
+                log.info("mindmap already done — reusing existing mindmap (not forced)")
+                return
             if not mindmap_enabled or not full_summary:
                 await _skip_step("mindmap")
                 return
@@ -1791,6 +1843,9 @@ async def run_pipeline(
         async def _do_mindmap_chapters() -> None:
             nonlocal chapter_mindmap, chapter_results, chapter_mindmap_translated
             if "mindmap_chapters" not in steps:
+                return
+            if _already_done("mindmap_chapters"):
+                log.info("mindmap_chapters already done — reusing existing mindmaps (not forced)")
                 return
             if not mindmap_enabled or not chapter_results:
                 await _skip_step("mindmap_chapters")
@@ -1894,6 +1949,9 @@ async def run_pipeline(
             nonlocal translated_mindmap_url, translated_mindmap_data, translated_mindmap_path_saved
             if "mindmap_translate" not in steps:
                 return
+            if _already_done("mindmap_translate", translated_mindmap_url):
+                log.info("mindmap_translate already done — reusing existing mindmap (not forced)")
+                return
             if not mindmap_enabled or not translated_summary or not translated_lang:
                 await _skip_step("mindmap_translate")
                 return
@@ -1938,6 +1996,9 @@ async def run_pipeline(
         async def _do_mindmap_chapters_translate() -> None:
             nonlocal chapter_mindmap_translated, chapter_results
             if "mindmap_chapters_translate" not in steps:
+                return
+            if _already_done("mindmap_chapters_translate"):
+                log.info("mindmap_chapters_translate already done — reusing existing mindmaps (not forced)")
                 return
             if not mindmap_enabled or not chapter_results or not translated_summary or not translated_lang:
                 await _skip_step("mindmap_chapters_translate")
@@ -2050,6 +2111,9 @@ async def run_pipeline(
             nonlocal alt_text
             if "alt_text" not in steps:
                 return
+            if _already_done("alt_text", alt_text):
+                log.info("alt_text already done — reusing existing (not forced)")
+                return
             if not alttext_enabled or not cover_url or not os.path.exists(cover_path_saved):
                 await _skip_step("alt_text")
                 return
@@ -2072,6 +2136,9 @@ async def run_pipeline(
         async def _do_video() -> None:
             nonlocal video_url, video_meta
             if "video" not in steps:
+                return
+            if _already_done("video", video_url):
+                log.info("video already done — reusing existing video (not forced)")
                 return
             if not video_enabled or not full_summary:
                 await _skip_step("video")
@@ -2117,6 +2184,9 @@ async def run_pipeline(
             log.info("_do_inject_epub called: inject_epub in steps=%s, epub_enabled=%s, has_full_summary=%s", 
                      "inject_epub" in steps, epub_enabled, bool(full_summary))
             if "inject_epub" not in steps:
+                return
+            if _already_done("inject_epub", epub_url):
+                log.info("inject_epub already done — reusing existing EPUB (not forced)")
                 return
             if not epub_enabled or not full_summary:
                 log.info("_do_inject_epub skipped: steps=%s, epub_enabled=%s, full_summary=%s",

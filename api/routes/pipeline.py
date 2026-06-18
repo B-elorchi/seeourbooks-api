@@ -255,11 +255,16 @@ async def _run_job(
     # orchestrator to skip the catalog-cached summary and regenerate from scratch.
     _force_regen_summary = force_steps and "summarize" in (req.steps or [])
 
+    # Steps the user explicitly forced this run. Only these may regenerate a step
+    # that already succeeded; every other already-"done" step is reused as-is.
+    _forced_steps = set(req.steps or []) if force_steps else set()
+
     await set_running(job_id)
     try:
         result = await run_pipeline(
             req, job_id=job_id, previous_result=previous_result,
             force_regenerate_summary=_force_regen_summary,
+            forced_steps=_forced_steps,
         )
 
         # Merge new outputs with the previous partial result (if any)
