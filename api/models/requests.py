@@ -14,6 +14,7 @@ VALID_STEPS = {
 }
 
 _LENGTH_PRESETS = {"small", "medium", "large", "custom"}
+_VALID_AUDIO_STYLES = {"single", "multi", "podcast", "audiobook", "news", "bedtime", "custom"}
 
 
 class SumReq(BaseModel):
@@ -34,6 +35,7 @@ class PipelineOptions(BaseModel):
     style:  str = "narrative"   # narrative | bullets | academic
     length_preset: str | None = None   # small | medium | large | custom
     max_chars:     int | None = None   # used when length_preset == "custom"
+    audio_style:   str | None = None   # single | multi | podcast | audiobook | news | bedtime | custom
 
     @field_validator("length_preset")
     @classmethod
@@ -45,6 +47,19 @@ class PipelineOptions(BaseModel):
             raise ValueError(
                 f"Invalid length_preset '{v}'. "
                 f"Valid presets are: {sorted(_LENGTH_PRESETS)}."
+            )
+        return v
+
+    @field_validator("audio_style")
+    @classmethod
+    def _check_audio_style(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip().lower()
+        if v not in _VALID_AUDIO_STYLES:
+            raise ValueError(
+                f"Invalid audio_style '{v}'. "
+                f"Valid styles are: {sorted(_VALID_AUDIO_STYLES)}."
             )
         return v
 

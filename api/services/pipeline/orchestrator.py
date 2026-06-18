@@ -824,6 +824,15 @@ async def run_pipeline(
         errors.pop(name, None)
         await _persist_step_result(job_id, name, "skipped")
 
+    # Apply admin-level step toggles: disabled steps are removed from the run
+    # set and explicitly marked skipped (this also clears stale errors on rerun).
+    for _s in list(steps):
+        if not step_enabled.get(_s, True):
+            await _skip_step(_s)
+            steps.discard(_s)
+    if steps:
+        log.info("Job %s: enabled steps after admin toggles: %s", job_id, sorted(steps))
+
     # ── Production catalog enrichment ─────────────────────────────────────────
     # Treat a title that is just the book_id as missing — some callers send the
     # id in the title field, which would otherwise get stamped onto the cover.
@@ -900,6 +909,25 @@ async def run_pipeline(
     audio_proc_enabled = cfg.get("PIPELINE_STEP_AUDIO_PROCESSING", "true") == "true"
     base_url         = cfg.get("BOOK_FILES_BASE_URL") or settings.BOOK_FILES_BASE_URL
     video_provider   = cfg.get("VIDEO_PROVIDER") or settings.VIDEO_PROVIDER
+
+    # Per-step on/off toggles from Admin → Settings → Pipeline Steps.
+    # A step disabled here is removed from the run set and marked skipped.
+    step_enabled: dict[str, bool] = {
+        "summarize":                  cfg.get("PIPELINE_STEP_SUMMARIZE", "true") == "true",
+        "translate":                  cfg.get("PIPELINE_STEP_TRANSLATE", "true") == "true",
+        "audio_full":                 (cfg.get("PIPELINE_STEP_AUDIO_FULL", "true") == "true") and tts_enabled,
+        "audio_chapters":             (cfg.get("PIPELINE_STEP_AUDIO_CHAPTERS", "true") == "true") and tts_enabled,
+        "audio_full_translate":       (cfg.get("PIPELINE_STEP_AUDIO_FULL_TRANSLATE", "true") == "true") and tts_enabled,
+        "audio_chapters_translate":   (cfg.get("PIPELINE_STEP_AUDIO_CHAPTERS_TRANSLATE", "true") == "true") and tts_enabled,
+        "cover":                      (cfg.get("PIPELINE_STEP_COVER", "true") == "true") and cover_enabled,
+        "alt_text":                   (cfg.get("PIPELINE_STEP_ALTTEXT", "true") == "true") and alttext_enabled,
+        "mindmap":                    (cfg.get("PIPELINE_STEP_MINDMAP", "true") == "true") and mindmap_enabled,
+        "mindmap_chapters":           (cfg.get("PIPELINE_STEP_MINDMAP", "true") == "true") and mindmap_enabled,
+        "mindmap_translate":          (cfg.get("PIPELINE_STEP_MINDMAP_TRANSLATE", "true") == "true") and mindmap_enabled,
+        "mindmap_chapters_translate": (cfg.get("PIPELINE_STEP_MINDMAP_CHAPTERS_TRANSLATE", "true") == "true") and mindmap_enabled,
+        "inject_epub":                (cfg.get("PIPELINE_STEP_INJECT_EPUB", "true") == "true") and epub_enabled,
+        "video":                      (cfg.get("PIPELINE_STEP_VIDEO", "true") == "true") and video_enabled,
+    }
 
     # Per-language summary length + chapter-summary length overrides (0 = use preset)
     _lang_up         = (req.language or "en").upper()
@@ -1282,7 +1310,7 @@ async def run_pipeline(
             try:
                 raw  = os.path.join(tmp, "audio_raw.mp3")
                 proc = os.path.join(tmp, "audio.mp3")
-                await synthesize(full_summary, req.language, raw, cfg)
+                await synthesize(full_summary, req.language, raw, cfg, audio_style=req.options.audio_style)
                 if audio_proc_enabled:
                     loop = asyncio.get_event_loop()
                     meta = await loop.run_in_executor(
@@ -1352,7 +1380,7 @@ async def run_pipeline(
                 try:
                     ch_raw  = os.path.join(tmp, f"ch{ch['index']}_raw.mp3")
                     ch_proc = os.path.join(tmp, f"ch{ch['index']}.mp3")
-                    await synthesize(ch["summary"], req.language, ch_raw, cfg)
+                    await synthesize(ch["summary"], req.language, ch_raw, cfg, audio_style=req.options.audio_style)
                     if audio_proc_enabled:
                         loop = asyncio.get_event_loop()
                         await loop.run_in_executor(
@@ -1435,7 +1463,7 @@ async def run_pipeline(
             try:
                 t_raw  = os.path.join(tmp, "audio_t_raw.mp3")
                 t_proc = os.path.join(tmp, "audio_t.mp3")
-                await synthesize(translated_summary, translated_lang, t_raw, cfg)
+                await synthesize(translated_summary, translated_lang, t_raw, cfg, audio_style=req.options.audio_style)
                 if audio_proc_enabled:
                     loop = asyncio.get_event_loop()
                     t_meta = await loop.run_in_executor(
@@ -1499,7 +1527,7 @@ async def run_pipeline(
                 try:
                     ch_t_raw  = os.path.join(tmp, f"ch{ch['index']}_{translated_lang}_raw.mp3")
                     ch_t_proc = os.path.join(tmp, f"ch{ch['index']}_{translated_lang}.mp3")
-                    await synthesize(ch["translated_summary"], translated_lang, ch_t_raw, cfg)
+                    await synthesize(ch["translated_summary"], translated_lang, ch_t_raw, cfg, audio_style=req.options.audio_style)
                     if audio_proc_enabled:
                         loop = asyncio.get_event_loop()
                         await loop.run_in_executor(

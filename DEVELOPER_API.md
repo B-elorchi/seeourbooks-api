@@ -21,12 +21,33 @@ One call does everything: it looks up the book, downloads + chunks the source EP
 ### Request body
 
 ```json
+POST /api/v2/pipeline/run
 {
   "book_id": "84",
   "language": "en",
   "source": "catalog",
-  "steps": [],
-  "options": { "length": "10min", "style": "narrative" }
+  "steps": [
+    "summarize",
+    "translate",
+    "audio_full",
+    "audio_chapters",
+    "audio_full_translate",
+    "audio_chapters_translate",
+    "cover",
+    "alt_text",
+    "mindmap",
+    "mindmap_chapters",
+    "mindmap_translate",
+    "mindmap_chapters_translate",
+    "inject_epub",
+    "video"
+  ],
+  "options": {
+    "length": "10min",
+    "style": "narrative",
+    "length_preset": "medium",
+    "audio_style": "single"
+  }
 }
 ```
 
@@ -38,8 +59,11 @@ One call does everything: it looks up the book, downloads + chunks the source EP
 | `steps` | – | `[]` = run **all** steps. Or pick a subset (see step list below). Dependencies are auto-added. |
 | `options.length` | – | `"3min"` \| `"5min"` \| `"10min"` \| `"15min"`. |
 | `options.style` | – | `"narrative"` \| `"bullets"` \| `"academic"`. |
+| `options.length_preset` | – | `"small"` \| `"medium"` \| `"large"` \| `"custom"`. Overrides `options.length` char budgets. |
+| `options.max_chars` | – | Required when `length_preset="custom"`. Hard cap on summary characters. |
+| `options.audio_style` | – | `"single"` \| `"multi"` \| `"podcast"` \| `"audiobook"` \| `"news"` \| `"bedtime"` \| `"custom"`. Controls Gemini TTS delivery style. |
 
-> Note: the final summary length is also governed by an admin setting (default **4000 words**). `options.length` is the fallback when that admin override is 0.
+> Note: the final summary length is governed by `length_preset`/`max_chars` first, then by the legacy admin word overrides, then by `options.length`.
 
 ### Response — `202 Accepted`
 
@@ -204,13 +228,18 @@ When finished, the full output is the `result` object in the status response. Yo
 
 | Step | Produces | Depends on |
 |------|----------|-----------|
-| `summarize` | Full + per-chapter summaries (and translation to the other language) | — |
+| `summarize` | Full + per-chapter summaries | — |
+| `translate` | Summary translated to the other language (EN↔AR) | `summarize` |
 | `cover` | AI cover image | — |
 | `alt_text` | Cover alt text (accessibility/SEO) | `cover` |
-| `audio_full` | One MP3 of the full summary (+ target-language MP3 if enabled) | `summarize` |
+| `audio_full` | One MP3 of the full summary | `summarize` |
 | `audio_chapters` | One MP3 per chapter | `summarize` |
+| `audio_full_translate` | MP3 of the translated full summary | `translate` |
+| `audio_chapters_translate` | MP3 per chapter from the translated summary | `translate`, `audio_chapters` |
 | `mindmap` | Book mind map (SVG/JSON) | `summarize` |
 | `mindmap_chapters` | Mind map per chapter | `summarize` |
+| `mindmap_translate` | Mind map from the translated summary | `translate` |
+| `mindmap_chapters_translate` | Mind map per chapter from the translated summary | `translate`, `mindmap_chapters` |
 | `inject_epub` | Enriched EPUB (cover + summary + per-chapter insights) | `summarize` |
 | `video` | Summary video | `summarize`, `audio_full` |
 
@@ -228,7 +257,18 @@ Send `"steps": []` to run them all. To run just a few, e.g. `"steps": ["summariz
 # 1. start
 curl -X POST https://<host>/api/v2/pipeline/run \
   -H "Content-Type: application/json" \
-  -d '{"book_id":"84","language":"en","options":{"length":"10min","style":"narrative"}}'
+  -d '{
+    "book_id":"84",
+    "language":"en",
+    "source":"catalog",
+    "steps":[],
+    "options":{
+      "length":"10min",
+      "style":"narrative",
+      "length_preset":"medium",
+      "audio_style":"podcast"
+    }
+  }'
 
 # 2. poll  (repeat until status is done/partial/failed)
 curl https://<host>/api/pipeline/status/<job_id>
@@ -249,7 +289,9 @@ const start = await fetch(`${host}/api/v2/pipeline/run`, {
   body: JSON.stringify({
     book_id: "84",
     language: "en",
-    options: { length: "10min", style: "narrative" },
+    source: "catalog",
+    steps: [],
+    options: { length: "10min", style: "narrative", length_preset: "medium", audio_style: "podcast" },
   }),
 }).then(r => r.json());
 

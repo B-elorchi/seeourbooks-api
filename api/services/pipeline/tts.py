@@ -68,6 +68,79 @@ def _is_english_only_voice(voice: str) -> bool:
     return any(voice.startswith(p) for p in _DEEPGRAM_ENGLISH_VOICE_PREFIXES)
 
 
+_VALID_AUDIO_STYLES = {"single", "multi", "podcast", "audiobook", "news", "bedtime", "custom"}
+
+
+def _gemini_voice_name(voice: str | None, fallback: str = "Kore") -> str:
+    """Return a valid Gemini voice name, falling back if the input is missing/invalid."""
+    voice = (voice or fallback).strip()
+    if voice not in _OPENROUTER_GEMINI_VOICES:
+        log.warning("Invalid Gemini voice %r; falling back to %r.", voice, fallback)
+        return fallback
+    return voice
+
+
+def _resolve_speaker_voices(cfg: dict, language: str) -> tuple[str, str]:
+    """Resolve Speaker 1 / Speaker 2 Gemini voices (with optional per-language overrides)."""
+    lang = language.upper()
+    v1 = cfg.get(f"GEMINI_TTS_SPEAKER1_VOICE_{lang}") or cfg.get("GEMINI_TTS_SPEAKER1_VOICE") or "Kore"
+    v2 = cfg.get(f"GEMINI_TTS_SPEAKER2_VOICE_{lang}") or cfg.get("GEMINI_TTS_SPEAKER2_VOICE") or "Puck"
+    return _gemini_voice_name(v1, "Kore"), _gemini_voice_name(v2, "Puck")
+
+
+def _apply_audio_style(text: str, style: str | None, cfg: dict) -> tuple[str, bool]:
+    """
+    Apply a Gemini TTS style/profile to the transcript.
+
+    Returns (styled_text, use_multi_speaker).  Multi-speaker styles rewrite the
+    text as alternating Speaker1 / Speaker2 lines; other styles may prepend a
+    natural-language direction prompt.
+
+    Style control is prompt-based in Gemini TTS — there is no dedicated API
+    field for pace/tone/profiles.  See:
+    https://ai.google.dev/gemini-api/docs/speech-generation
+    """
+    style = (style or cfg.get("GEMINI_TTS_AUDIO_STYLE") or "single").strip().lower()
+    if style not in _VALID_AUDIO_STYLES:
+        style = "single"
+
+    # Custom style: admin provides the full direction prompt.
+    if style == "custom":
+        prompt = (cfg.get("GEMINI_TTS_STYLE_PROMPT") or "").strip()
+        return (f"{prompt}\n\n{text}" if prompt else text), False
+
+    # Multi-speaker / podcast: alternate sentences between two speakers.
+    if style in ("multi", "podcast"):
+        s1 = (cfg.get("GEMINI_TTS_SPEAKER1_NAME") or "Speaker1").strip()
+        s2 = (cfg.get("GEMINI_TTS_SPEAKER2_NAME") or "Speaker2").strip()
+        intro = ""
+        if style == "podcast":
+            intro = f"TTS the following podcast episode between {s1} and {s2}.\n\n"
+        else:
+            intro = f"TTS the following conversation between {s1} and {s2}.\n\n"
+        sentences = [s.strip() for s in _SENTENCE_BOUNDARY.split(text) if s.strip()]
+        if not sentences:
+            return text, True
+        lines = []
+        for i, sent in enumerate(sentences):
+            speaker = s1 if i % 2 == 0 else s2
+            lines.append(f"{speaker}: {sent}")
+        return intro + "\n".join(lines), True
+
+    # Single-speaker styles: prepend a direction prompt.
+    prompts = {
+        "audiobook": "Read the following text in a calm, immersive audiobook narration style.",
+        "news":      "Read the following text as a professional news broadcast.",
+        "bedtime":   "Read the following text in a soothing, gentle bedtime story style.",
+    }
+    prompt = prompts.get(style, "")
+    # Allow admins to override or extend any style prompt.
+    custom_prompt = (cfg.get("GEMINI_TTS_STYLE_PROMPT") or "").strip()
+    if custom_prompt:
+        prompt = custom_prompt
+    return (f"{prompt}\n\n{text}" if prompt else text), False
+
+
 # Sentence-ending punctuation in EN / AR / general — match end-of-sentence so we
 # can split long text on natural boundaries.
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?؟…])\s+")
@@ -135,6 +208,7 @@ async def synthesize(
     language: str,
     output_path: str,
     cfg: dict | None = None,
+    audio_style: str | None = None,
 ) -> str:
     """
     Convert text to MP3 and save to output_path. Returns output_path.
@@ -164,6 +238,21 @@ async def synthesize(
         settings.TTS_VOICE_EN if language == "en" else settings.TTS_VOICE_AR
     )
 
+    # ── Gemini TTS style / profile ─────────────────────────────────────────────
+    # Resolve the requested audio style (request option → admin config → single).
+    # Multi-speaker styles rewrite the transcript as alternating speaker lines;
+    # single-speaker styles may prepend a natural-language direction prompt.
+    # These styles are only sent to Gemini-native or OpenRouter-Google models;
+    # other providers receive plain text so prompts are not read aloud.
+    is_gemini_tts = provider == "gemini" or (
+        provider == "openrouter"
+        and (cfg.get("OPENROUTER_TTS_MODEL") or settings.OPENROUTER_TTS_MODEL).lower().startswith("google/")
+    )
+    effective_style = "single"
+    if is_gemini_tts:
+        effective_style = (audio_style or cfg.get("GEMINI_TTS_AUDIO_STYLE") or "single").strip().lower()
+    styled_text, is_multi_style = _apply_audio_style(text, effective_style, cfg)
+
     # ── Warning: Deepgram Aura voices are English-only ───────────────────────
     # Sending Arabic text to an aura-* voice produces garbled audio because
     # these models have no Arabic phoneme training. We log a warning but still
@@ -178,7 +267,7 @@ async def synthesize(
     # Provider-specific char budget — Deepgram is the strictest at ~1500 chars/req.
     max_chars = _PROVIDER_MAX_CHARS.get(provider, _DEFAULT_MAX_CHARS)
 
-    chunks = _split_text_for_tts(text, max_chars=max_chars)
+    chunks = _split_text_for_tts(styled_text, max_chars=max_chars)
     if not chunks:
         raise ValueError("synthesize() called with empty text")
 
@@ -191,14 +280,14 @@ async def synthesize(
         )
 
     log.info(
-        "TTS: provider=%s text=%d chars → %d chunk(s) (limit %d/chunk)",
-        provider, len(text), len(chunks), max_chars,
+        "TTS: provider=%s style=%s multi=%s text=%d chars → %d chunk(s) (limit %d/chunk)",
+        provider, effective_style, is_multi_style, len(styled_text), len(chunks), max_chars,
     )
 
     # ── Fast path: single chunk fits in one call ─────────────────────────────
     if len(chunks) == 1:
-        await _dispatch_tts(chunks[0], provider, voice, language, cfg, output_path)
-        await log_tts_usage(provider=provider, model=voice, characters=len(text))
+        await _dispatch_tts(chunks[0], provider, voice, language, cfg, output_path, audio_style=effective_style)
+        await log_tts_usage(provider=provider, model=voice, characters=len(styled_text))
         return output_path
 
     # ── Slow path: synthesize each chunk to a part file, then concat ─────────
@@ -206,7 +295,7 @@ async def synthesize(
     try:
         for i, chunk in enumerate(chunks):
             part = f"{output_path}.part{i:03d}.mp3"
-            await _dispatch_tts(chunk, provider, voice, language, cfg, part)
+            await _dispatch_tts(chunk, provider, voice, language, cfg, part, audio_style=effective_style)
             part_paths.append(part)
 
         with open(output_path, "wb") as dst:
@@ -220,7 +309,7 @@ async def synthesize(
             except OSError:
                 pass
 
-    await log_tts_usage(provider=provider, model=voice, characters=len(text))
+    await log_tts_usage(provider=provider, model=voice, characters=len(styled_text))
     return output_path
 
 
@@ -231,6 +320,7 @@ async def _dispatch_tts(
     language: str,
     cfg: dict,
     output_path: str,
+    audio_style: str | None = None,
 ) -> None:
     """Route a single (chunk-sized) TTS request to the chosen provider."""
     if provider == "deepgram":
@@ -264,7 +354,7 @@ async def _dispatch_tts(
         gemini_voice = cfg.get("GEMINI_TTS_VOICE") or settings.GEMINI_TTS_VOICE
         # Always use the Gemini-specific voice — ignore the generic TTS_VOICE_*
         # which may hold a Cartesia/ElevenLabs UUID incompatible with Gemini.
-        await _gemini(text, gemini_voice, language, gemini_model, output_path)
+        await _gemini(text, gemini_voice, language, gemini_model, output_path, cfg=cfg, audio_style=audio_style)
     elif provider == "openrouter":
         if not settings.OPENROUTER_API_KEY:
             raise ValueError(
@@ -280,7 +370,7 @@ async def _dispatch_tts(
             or cfg.get("OPENROUTER_TTS_VOICE")
             or settings.OPENROUTER_TTS_VOICE
         )
-        await _openrouter_tts(text, or_voice, language, or_model, output_path)
+        await _openrouter_tts(text, or_voice, language, or_model, output_path, cfg=cfg, audio_style=audio_style)
     else:
         raise ValueError(f"Unknown TTS provider: {provider!r}")
 
@@ -418,7 +508,15 @@ async def _cartesia(text: str, voice: str, language: str, cfg: dict, output_path
         f.write(r.content)
 
 
-async def _gemini(text: str, voice: str, language: str, model: str, output_path: str) -> None:
+async def _gemini(
+    text: str,
+    voice: str,
+    language: str,
+    model: str,
+    output_path: str,
+    cfg: dict | None = None,
+    audio_style: str | None = None,
+) -> None:
     """
     Google Gemini TTS via the native Gemini API (generativelanguage.googleapis.com).
 
@@ -428,10 +526,14 @@ async def _gemini(text: str, voice: str, language: str, model: str, output_path:
     Voices: Kore, Charon, Puck, Fenrir, Aoede, Leda, Orus, Zephyr (and more).
     See https://ai.google.dev/gemini-api/docs/speech-generation for the full list.
 
+    Supports single-speaker styles (audiobook, news, bedtime, custom prompt) and
+    multi-speaker styles (multi, podcast) via multiSpeakerVoiceConfig.
+
     Requires GEMINI_API_KEY to be set. Falls back to OPENROUTER_API_KEY if
     GEMINI_API_KEY is not available (for backward compatibility).
     """
-    chosen_voice = voice or "Kore"   # Kore is the default Gemini voice
+    cfg = cfg or {}
+    chosen_voice = _gemini_voice_name(voice, "Kore")
 
     # Use GEMINI_API_KEY if available, otherwise fall back to OPENROUTER_API_KEY
     api_key = settings.GEMINI_API_KEY or settings.OPENROUTER_API_KEY
@@ -444,6 +546,41 @@ async def _gemini(text: str, voice: str, language: str, model: str, output_path:
     # Normalize model name — strip 'google/' prefix if present
     gemini_model = model.split("/", 1)[1] if "/" in model else model
 
+    # Build speechConfig: single-speaker (prebuiltVoiceConfig) or
+    # multi-speaker (multiSpeakerVoiceConfig) depending on the style.
+    style = (audio_style or cfg.get("GEMINI_TTS_AUDIO_STYLE") or "single").strip().lower()
+    is_multi = style in ("multi", "podcast")
+    if is_multi:
+        s1_name, s2_name = (
+            (cfg.get("GEMINI_TTS_SPEAKER1_NAME") or "Speaker1").strip(),
+            (cfg.get("GEMINI_TTS_SPEAKER2_NAME") or "Speaker2").strip(),
+        )
+        s1_voice, s2_voice = _resolve_speaker_voices(cfg, language)
+        speech_config = {
+            "multiSpeakerVoiceConfig": {
+                "speakerVoiceConfigs": [
+                    {
+                        "speaker": s1_name,
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {"voiceName": s1_voice}
+                        },
+                    },
+                    {
+                        "speaker": s2_name,
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {"voiceName": s2_voice}
+                        },
+                    },
+                ]
+            }
+        }
+    else:
+        speech_config = {
+            "voiceConfig": {
+                "prebuiltVoiceConfig": {"voiceName": chosen_voice}
+            }
+        }
+
     payload = {
         "contents": [
             {
@@ -454,13 +591,7 @@ async def _gemini(text: str, voice: str, language: str, model: str, output_path:
         ],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
-            "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {
-                        "voiceName": chosen_voice,
-                    }
-                }
-            },
+            "speechConfig": speech_config,
         },
     }
 
@@ -474,7 +605,7 @@ async def _gemini(text: str, voice: str, language: str, model: str, output_path:
         if r.status_code >= 400:
             raise RuntimeError(
                 f"Gemini TTS returned {r.status_code}: {r.text[:500]} "
-                f"(model={gemini_model}, voice={chosen_voice}, language={language})"
+                f"(model={gemini_model}, style={style}, voice={chosen_voice}, language={language})"
             )
         data = r.json()
 
@@ -614,7 +745,15 @@ def _detect_mime_type(data: bytes) -> str:
     return "audio/mpeg"
 
 
-async def _openrouter_tts(text: str, voice: str, language: str, model: str, output_path: str) -> None:
+async def _openrouter_tts(
+    text: str,
+    voice: str,
+    language: str,
+    model: str,
+    output_path: str,
+    cfg: dict | None = None,
+    audio_style: str | None = None,
+) -> None:
     """
     TTS via OpenRouter's /audio/speech endpoint.
 
