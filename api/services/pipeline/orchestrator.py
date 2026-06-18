@@ -1356,12 +1356,19 @@ async def run_pipeline(
         # Translate per-chapter summaries when the translate step is requested.
         if translate_step_requested and translated_summary and chapter_results:
             try:
+                # Bound concurrency — firing one translate call per chapter all at
+                # once (200+ on a big book) hammers the provider's rate limit and
+                # the resulting 429 retry-storm can stall the step for many minutes.
+                tr_conc = max(1, int(cfg.get("TRANSLATE_CONCURRENCY", "8")))
+                tr_sem  = asyncio.Semaphore(tr_conc)
+
                 async def _translate_chapter(ch: dict) -> None:
                     if not ch.get("summary"):
                         return
-                    tr = await translate_summary(
-                        ch["summary"], req.language, target_lang, model=translate_model,
-                    )
+                    async with tr_sem:
+                        tr = await translate_summary(
+                            ch["summary"], req.language, target_lang, model=translate_model,
+                        )
                     if tr:
                         ch["translated_summary"] = tr
 
@@ -1510,46 +1517,58 @@ async def run_pipeline(
             await _checkpoint()
             ch_errors = 0
             ch_processed = 0
-            ch_skipped_no_summary = 0
-            
+
             # Create a map to update chapter_results by index
             audio_key = f"audio_{req.language}"
-            
-            for ch in chapter_results:
-                if not ch.get("summary"):
-                    ch_skipped_no_summary += 1
-                    log.warning("Chapter %d has no summary, skipping audio generation", ch["index"])
-                    continue
-                try:
-                    ch_raw  = os.path.join(tmp, f"ch{ch['index']}_raw.mp3")
-                    ch_proc = os.path.join(tmp, f"ch{ch['index']}.mp3")
-                    await synthesize(ch["summary"], req.language, ch_raw, cfg, audio_style=req.options.audio_style)
-                    if audio_proc_enabled:
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(
-                            None, process_audio, ch_raw, ch_proc,
-                            ch["title"], req.author or "",
-                        )
-                        src = ch_proc
-                    else:
-                        src = ch_raw
-                    from api.services.pipeline.watermark import stamp_audio as _sa  # noqa: PLC0415
-                    _sa(src, cfg)
-                    idx = ch["index"]
-                    k   = f"books/{req.book_id}/chapters/ch_{idx:02d}_{req.language}.mp3"
-                    audio_url = upload_file(src, k, CONTENT_TYPES[".mp3"])
-                    chapter_audio[idx] = audio_url
-                    
-                    # Update chapter_results with audio URL for dashboard display
-                    ch[audio_key] = audio_url
-                    
+
+            chapters_with_summary = [ch for ch in chapter_results if ch.get("summary")]
+            ch_skipped_no_summary = len(chapter_results) - len(chapters_with_summary)
+            if ch_skipped_no_summary > 0:
+                log.warning("%d chapters skipped for audio: no summaries available", ch_skipped_no_summary)
+
+            # Run chapter TTS in parallel (bounded) — a 200-chapter book was
+            # taking 30+ min when this loop was sequential.
+            audio_conc = max(1, int(cfg.get("AUDIO_CONCURRENCY", "4")))
+            audio_sem  = asyncio.Semaphore(audio_conc)
+
+            async def _one_chapter_audio(ch: dict) -> tuple[int, str | None, str | None]:
+                idx = ch["index"]
+                async with audio_sem:
+                    try:
+                        ch_raw  = os.path.join(tmp, f"ch{idx}_raw.mp3")
+                        ch_proc = os.path.join(tmp, f"ch{idx}.mp3")
+                        await synthesize(ch["summary"], req.language, ch_raw, cfg, audio_style=req.options.audio_style)
+                        if audio_proc_enabled:
+                            loop = asyncio.get_event_loop()
+                            await loop.run_in_executor(
+                                None, process_audio, ch_raw, ch_proc,
+                                ch["title"], req.author or "",
+                            )
+                            src = ch_proc
+                        else:
+                            src = ch_raw
+                        from api.services.pipeline.watermark import stamp_audio as _sa  # noqa: PLC0415
+                        _sa(src, cfg)
+                        k = f"books/{req.book_id}/chapters/ch_{idx:02d}_{req.language}.mp3"
+                        audio_url = upload_file(src, k, CONTENT_TYPES[".mp3"])
+                        chapter_audio[idx] = audio_url
+                        ch[audio_key] = audio_url   # for dashboard display
+                        await _checkpoint()         # live progress (also detects cancel)
+                        return idx, audio_url, None
+                    except JobCancelledError:
+                        raise
+                    except Exception as e:
+                        return idx, None, str(e)
+
+            _audio_results = await asyncio.gather(
+                *[_one_chapter_audio(ch) for ch in chapters_with_summary]
+            )
+            for idx, audio_url, err in _audio_results:
+                if audio_url:
                     ch_processed += 1
-                    await _checkpoint()   # checkpoint per chapter so progress is visible
-                except JobCancelledError:
-                    raise
-                except Exception as e:
+                if err is not None:
                     ch_errors += 1
-                    errors[f"audio_chapter_{ch['index']}"] = str(e)
+                    errors[f"audio_chapter_{idx}"] = err
 
             # Calculate status based on actual processing, not just chapter count
             if ch_errors > 0 and ch_processed == 0:
@@ -1664,36 +1683,49 @@ async def run_pipeline(
             ch_processed = 0
             target_audio_key = f"audio_{translated_lang}"
 
-            for ch in chapter_results:
-                if not ch.get("translated_summary"):
-                    continue
-                try:
-                    ch_t_raw  = os.path.join(tmp, f"ch{ch['index']}_{translated_lang}_raw.mp3")
-                    ch_t_proc = os.path.join(tmp, f"ch{ch['index']}_{translated_lang}.mp3")
-                    await synthesize(ch["translated_summary"], translated_lang, ch_t_raw, cfg, audio_style=req.options.audio_style)
-                    if audio_proc_enabled:
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(
-                            None, process_audio, ch_t_raw, ch_t_proc,
-                            ch["title"], req.author or "",
-                        )
-                        src = ch_t_proc
-                    else:
-                        src = ch_t_raw
-                    from api.services.pipeline.watermark import stamp_audio as _sa_t  # noqa: PLC0415
-                    _sa_t(src, cfg)
-                    idx = ch["index"]
-                    k   = f"books/{req.book_id}/chapters/ch_{idx:02d}_{translated_lang}.mp3"
-                    audio_url = upload_file(src, k, CONTENT_TYPES[".mp3"])
-                    chapter_audio_translated[idx] = audio_url
-                    ch[target_audio_key] = audio_url
+            chapters_with_translated = [ch for ch in chapter_results if ch.get("translated_summary")]
+
+            audio_conc = max(1, int(cfg.get("AUDIO_CONCURRENCY", "4")))
+            audio_sem  = asyncio.Semaphore(audio_conc)
+
+            async def _one_chapter_audio_t(ch: dict) -> tuple[int, str | None, str | None]:
+                idx = ch["index"]
+                async with audio_sem:
+                    try:
+                        ch_t_raw  = os.path.join(tmp, f"ch{idx}_{translated_lang}_raw.mp3")
+                        ch_t_proc = os.path.join(tmp, f"ch{idx}_{translated_lang}.mp3")
+                        await synthesize(ch["translated_summary"], translated_lang, ch_t_raw, cfg, audio_style=req.options.audio_style)
+                        if audio_proc_enabled:
+                            loop = asyncio.get_event_loop()
+                            await loop.run_in_executor(
+                                None, process_audio, ch_t_raw, ch_t_proc,
+                                ch["title"], req.author or "",
+                            )
+                            src = ch_t_proc
+                        else:
+                            src = ch_t_raw
+                        from api.services.pipeline.watermark import stamp_audio as _sa_t  # noqa: PLC0415
+                        _sa_t(src, cfg)
+                        k = f"books/{req.book_id}/chapters/ch_{idx:02d}_{translated_lang}.mp3"
+                        audio_url = upload_file(src, k, CONTENT_TYPES[".mp3"])
+                        chapter_audio_translated[idx] = audio_url
+                        ch[target_audio_key] = audio_url
+                        await _checkpoint()
+                        return idx, audio_url, None
+                    except JobCancelledError:
+                        raise
+                    except Exception as e:
+                        return idx, None, str(e)
+
+            _t_results = await asyncio.gather(
+                *[_one_chapter_audio_t(ch) for ch in chapters_with_translated]
+            )
+            for idx, audio_url, err in _t_results:
+                if audio_url:
                     ch_processed += 1
-                    await _checkpoint()
-                except JobCancelledError:
-                    raise
-                except Exception as e:
+                if err is not None:
                     ch_errors += 1
-                    errors[f"audio_chapter_{ch['index']}_{translated_lang}"] = str(e)
+                    errors[f"audio_chapter_{idx}_{translated_lang}"] = err
 
             if ch_errors > 0 and ch_processed == 0:
                 step_status["audio_chapters_translate"] = "failed"
@@ -2089,6 +2121,17 @@ async def run_pipeline(
             if not epub_enabled or not full_summary:
                 log.info("_do_inject_epub skipped: steps=%s, epub_enabled=%s, full_summary=%s",
                          steps, epub_enabled, bool(full_summary))
+                await _skip_step("inject_epub")
+                return
+            # Don't bake an incomplete/low-quality book into the downloadable EPUB.
+            # Same gate as audio: skip when the summary failed QA or some chapters
+            # are still missing (summarize = partial). The EPUB will be built on a
+            # later retry once the summary is complete and passes quality.
+            if audio_blocked:
+                log.info(
+                    "_do_inject_epub skipped: audio_blocked (summary failed QA or "
+                    "chapters incomplete) — EPUB not built from incomplete content",
+                )
                 await _skip_step("inject_epub")
                 return
             step_status["inject_epub"] = "running"

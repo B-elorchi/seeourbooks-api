@@ -6,8 +6,9 @@ from datetime import datetime, timedelta, timezone
 import uuid
 
 from api.services.db import find, insert, update, delete
+from api.services.config.runtime import get_config_value
 
-MAX_RETRIES = 5  # 5 retries for better reliability
+MAX_RETRIES = 8  # auto-retry attempts after first failure (QA + network + model errors)
 
 # In-memory set of job IDs requested to cancel.
 # Checked by the orchestrator after every checkpoint (between steps).
@@ -24,13 +25,14 @@ async def create_job(book_id: str, input_data: dict, user_id: str | None = None)
     # is declared `TEXT PRIMARY KEY` with no DEFAULT — inserting without an
     # explicit id triggers a NOT NULL violation and PostgREST returns 400.
     job_id = uuid.uuid4().hex
+    max_ret = int(await get_config_value("PIPELINE_MAX_RETRIES", str(MAX_RETRIES)))
     data: dict = {
         "id":          job_id,
         "book_id":     book_id,
         "status":      "queued",
         "input":       input_data,
         "retry_count": 0,
-        "max_retries": MAX_RETRIES,
+        "max_retries": max_ret,
     }
     if user_id:
         data["user_id"] = user_id

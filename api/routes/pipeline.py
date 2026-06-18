@@ -226,13 +226,23 @@ async def _run_job(
     # narrow req.steps to only the failed ones (standard auto-retry behaviour).
     if not force_steps:
         failed = _failed_steps(previous_result)
+        # Never auto-retry a step the caller didn't ask for. When the request
+        # specifies an explicit step list, a stale "failed"/"partial" status
+        # carried over from an OLDER full run (e.g. audio_chapters) can leak in
+        # via the merged previous_result — restrict retries to the requested set
+        # so we don't regenerate steps that were intentionally excluded.
+        requested = req.steps or []
+        if requested:
+            _allowed = set(requested)
+            failed = [s for s in failed if s in _allowed]
         # When the previous run's summary QA score was below threshold, the
         # summarize step was "done" (summary was generated) but the result was
         # not good enough.  Force summarize to re-run so a better summary is
         # generated — otherwise the same low-coverage summary loops forever.
+        # Only do this when summarize was actually requested (or running all).
         _prev_dict = previous_result if isinstance(previous_result, dict) else {}
         if (_prev_dict.get("summary_qa") or {}).get("passed") is False:
-            if "summarize" not in (failed or []):
+            if (not requested or "summarize" in requested) and "summarize" not in (failed or []):
                 failed = ["summarize"] + (failed or [])
         if failed:
             req = req.model_copy(update={"steps": failed})

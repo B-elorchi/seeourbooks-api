@@ -110,9 +110,17 @@ def _defaults() -> dict[str, str]:
         # for cost efficiency. Supports OpenRouter prefix (openai/gpt-4.1-mini)
         # or native Anthropic models (claude-haiku-4-5-20251001).
         "MODEL_CHUNK":                    settings.MODEL_CHUNK,
-        # Concurrency knobs for the parallelised steps.
+        # Concurrency knobs for the parallelised steps. Big multi-chapter books
+        # (e.g. the CIA World Factbook, ~200 chapters) are dominated by these.
         "HAIKU_CONCURRENCY":             "10",
-        "MINDMAP_CONCURRENCY":           "4",
+        "MINDMAP_CONCURRENCY":           "6",
+        # Parallel chapter TTS jobs at once.
+        "AUDIO_CONCURRENCY":             "4",
+        # Parallel per-chapter translation calls. Unbounded fan-out used to trip
+        # provider rate limits and stall the translate step for many minutes.
+        "TRANSLATE_CONCURRENCY":         "8",
+        # Max auto-retry attempts per job (applies to QA re-runs, network errors, etc.)
+        "PIPELINE_MAX_RETRIES":          "8",
         # ── Chunking & summary length knobs (per language) ───────────────────
         # Words per ingest chunk. Bigger = fewer chunks (cheaper, less granular).
         "CHUNK_WORDS_EN":                str(settings.CHUNK_SIZE_WORDS),
