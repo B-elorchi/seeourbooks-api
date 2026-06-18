@@ -5,8 +5,9 @@ Supports two formats controlled by MINDMAP_FORMAT setting:
   - "json": AI generates structured JSON with center_node + branches
 
 Renderer chain for Mermaid (tried in order):
-  1. mermaid.ink  — primary, fast, no rate limit
-  2. kroki.io     — fallback, reliable, different infrastructure
+  1. kroki.io     — primary, reliable, no rate limit
+  2. mermaid.ink  — fallback (more lenient renderer; handles Arabic/RTL labels
+                    and special chars that kroki's stricter parser 400s on)
 
 Model is configurable via MODEL_MINDMAP — supports any chat model,
 including OpenRouter prefixed names (e.g. "openai/gpt-4.1-mini").
@@ -280,6 +281,9 @@ async def render_mermaid_svg(mermaid_code: str, output_path: str) -> str:
     Fallback: mermaid.ink (tried if kroki.io fails with a server/network error)
     """
     # ── Primary: kroki.io ─────────────────────────────────────────────────────
+    # Fall back to mermaid.ink on ANY kroki failure. kroki's parser is stricter
+    # than mermaid.ink's real Mermaid renderer, so diagrams it 400s on (notably
+    # Arabic / RTL labels and special characters) frequently render fine there.
     kroki_exc: Exception | None = None
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -294,14 +298,7 @@ async def render_mermaid_svg(mermaid_code: str, output_path: str) -> str:
         return output_path
     except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.RequestError) as exc:
         kroki_exc = exc
-        is_server_error = (
-            isinstance(exc, httpx.HTTPStatusError)
-            and exc.response.status_code >= 500
-        )
-        if not (is_server_error or isinstance(exc, (httpx.TimeoutException, httpx.RequestError))):
-            # 4xx = bad diagram syntax — no point retrying with mermaid.ink
-            raise
-        log.warning("kroki.io unavailable (%s) — falling back to mermaid.ink", exc)
+        log.warning("kroki.io render failed (%s) — falling back to mermaid.ink", exc)
 
     # ── Fallback: mermaid.ink ─────────────────────────────────────────────────
     encoded = base64.urlsafe_b64encode(mermaid_code.encode()).decode()
