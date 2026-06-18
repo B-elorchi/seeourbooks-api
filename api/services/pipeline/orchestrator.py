@@ -824,15 +824,6 @@ async def run_pipeline(
         errors.pop(name, None)
         await _persist_step_result(job_id, name, "skipped")
 
-    # Apply admin-level step toggles: disabled steps are removed from the run
-    # set and explicitly marked skipped (this also clears stale errors on rerun).
-    for _s in list(steps):
-        if not step_enabled.get(_s, True):
-            await _skip_step(_s)
-            steps.discard(_s)
-    if steps:
-        log.info("Job %s: enabled steps after admin toggles: %s", job_id, sorted(steps))
-
     # ── Production catalog enrichment ─────────────────────────────────────────
     # Treat a title that is just the book_id as missing — some callers send the
     # id in the title field, which would otherwise get stamped onto the cover.
@@ -928,6 +919,15 @@ async def run_pipeline(
         "inject_epub":                (cfg.get("PIPELINE_STEP_INJECT_EPUB", "true") == "true") and epub_enabled,
         "video":                      (cfg.get("PIPELINE_STEP_VIDEO", "true") == "true") and video_enabled,
     }
+
+    # Apply admin-level step toggles: disabled steps are removed from the run
+    # set and explicitly marked skipped (this also clears stale errors on rerun).
+    for _s in list(steps):
+        if not step_enabled.get(_s, True):
+            await _skip_step(_s)
+            steps.discard(_s)
+    if steps:
+        log.info("Job %s: enabled steps after admin toggles: %s", job_id, sorted(steps))
 
     # Per-language summary length + chapter-summary length overrides (0 = use preset)
     _lang_up         = (req.language or "en").upper()
