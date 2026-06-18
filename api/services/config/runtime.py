@@ -111,7 +111,7 @@ def _defaults() -> dict[str, str]:
         # or native Anthropic models (claude-haiku-4-5-20251001).
         "MODEL_CHUNK":                    settings.MODEL_CHUNK,
         # Concurrency knobs for the parallelised steps.
-        "HAIKU_CONCURRENCY":             "6",
+        "HAIKU_CONCURRENCY":             "10",
         "MINDMAP_CONCURRENCY":           "4",
         # ── Chunking & summary length knobs (per language) ───────────────────
         # Words per ingest chunk. Bigger = fewer chunks (cheaper, less granular).

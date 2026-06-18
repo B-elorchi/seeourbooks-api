@@ -24,7 +24,10 @@ def _build_prompt(chunk_summaries: list[str], length: str, style: str, language:
         f"of ~{length} (~{target} words).\n"
         f"Style: {STYLE_MAP.get(style, 'narrative prose')}.\n"
         f"Based on these section summaries:\n\n{combined}\n\n"
-        f"Write the complete summary in {lang_name}. Target: ~{target} words."
+        f"Write the complete summary in {lang_name}. Target: ~{target} words.\n"
+        f"IMPORTANT: Output ONLY the summary itself — no preamble, no introduction, "
+        f"no 'Of course' or 'Here is', no script markers, no horizontal rules, "
+        f"no closing remarks. Start directly with the first sentence of the summary."
         f"{tashkeel}"
     )
 

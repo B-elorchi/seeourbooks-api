@@ -47,6 +47,60 @@ from api.services.pipeline.storage import upload_file, CONTENT_TYPES
 from api.jobs.store import is_cancelled, get_step_results
 from api.services.db import insert as db_insert
 
+import re as _re
+
+# ── Summary preamble stripper ─────────────────────────────────────────────────
+# AI models sometimes add conversational openers ("Of course. Here is…") and
+# script markers ("(Start of Audio Script)") before the actual summary text.
+# This function removes them so the stored/displayed summary is clean.
+_PREAMBLE_RE = _re.compile(
+    r"^\s*("
+    r"of course[.,\s]|certainly[.,\s]|sure[.,\s]|"
+    r"here is |here's |below is |the following is |"
+    r"i('ve| have) (created|written|prepared)|"
+    r"as requested[.,\s]|"
+    r"welcome[.,\s].*?presentation"
+    r")",
+    _re.IGNORECASE,
+)
+_SCRIPT_MARKER_RE = _re.compile(
+    r"^\s*\(?\s*(start|end)\s+of\s+(audio\s+)?script\s*\)?\s*$",
+    _re.IGNORECASE,
+)
+
+
+def _clean_summary(text: str) -> str:
+    """Strip AI conversational preamble and script markers from a summary."""
+    lines = text.splitlines()
+    # Drop leading lines that are preamble, horizontal rules, or script markers
+    while lines:
+        stripped = lines[0].strip()
+        if not stripped:
+            lines.pop(0)
+            continue
+        if stripped in ("***", "---", "___", "* * *"):
+            lines.pop(0)
+            continue
+        if _SCRIPT_MARKER_RE.match(stripped):
+            lines.pop(0)
+            continue
+        if _PREAMBLE_RE.match(stripped):
+            lines.pop(0)
+            continue
+        break
+    # Drop trailing script markers / horizontal rules
+    while lines:
+        stripped = lines[-1].strip()
+        if not stripped or stripped in ("***", "---", "___", "* * *"):
+            lines.pop()
+            continue
+        if _SCRIPT_MARKER_RE.match(stripped):
+            lines.pop()
+            continue
+        break
+    return "\n".join(lines).strip()
+
+
 # Single source of truth lives in api/models/requests.py
 ALL_STEPS = VALID_STEPS
 
@@ -1155,6 +1209,7 @@ async def run_pipeline(
                             model=model_haiku,
                             max_words=summary_max_words or None,
                         )
+                        full_summary = _clean_summary(full_summary)
                         sentences = [s.strip() for s in full_summary.replace(".\n", ". ").split(". ") if s.strip()]
                         quick_summary = ". ".join(sentences[:2]) + "." if sentences else full_summary[:200]
 

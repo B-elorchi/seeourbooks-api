@@ -276,34 +276,13 @@ async def render_mermaid_svg(mermaid_code: str, output_path: str) -> str:
     """
     Render Mermaid code to SVG and save to output_path.
 
-    Tries mermaid.ink first (up to 2 attempts), then falls back to
-    kroki.io if mermaid.ink is unavailable (503 / 5xx / timeout).
+    Primary: kroki.io  (reliable, no rate limit)
+    Fallback: mermaid.ink (tried if kroki.io fails with a server/network error)
     """
-    encoded = base64.urlsafe_b64encode(mermaid_code.encode()).decode()
-
-    # ── Attempt 1: mermaid.ink (fail-fast — one try only) ────────────────────
-    last_exc: Exception | None = None
+    # ── Primary: kroki.io ─────────────────────────────────────────────────────
+    kroki_exc: Exception | None = None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(f"https://mermaid.ink/svg/{encoded}")
-            r.raise_for_status()
-        with open(output_path, "wb") as f:
-            f.write(r.content)
-        return output_path
-    except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.RequestError) as exc:
-        last_exc = exc
-        is_server_error = (
-            isinstance(exc, httpx.HTTPStatusError)
-            and exc.response.status_code >= 500
-        )
-        if not (is_server_error or isinstance(exc, (httpx.TimeoutException, httpx.RequestError))):
-            # 4xx errors (bad diagram syntax) — no point falling back
-            raise
-
-    # ── Fallback: kroki.io ────────────────────────────────────────────────────
-    log.warning("mermaid.ink unavailable (%s) — falling back to kroki.io", last_exc)
-    try:
-        async with httpx.AsyncClient(timeout=45) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 "https://kroki.io/mermaid/svg",
                 content=mermaid_code.encode(),
@@ -312,11 +291,30 @@ async def render_mermaid_svg(mermaid_code: str, output_path: str) -> str:
             r.raise_for_status()
         with open(output_path, "wb") as f:
             f.write(r.content)
-        log.info("Mind map rendered via kroki.io fallback")
         return output_path
-    except Exception as kroki_exc:
-        # Both renderers failed — raise original error with context
+    except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.RequestError) as exc:
+        kroki_exc = exc
+        is_server_error = (
+            isinstance(exc, httpx.HTTPStatusError)
+            and exc.response.status_code >= 500
+        )
+        if not (is_server_error or isinstance(exc, (httpx.TimeoutException, httpx.RequestError))):
+            # 4xx = bad diagram syntax — no point retrying with mermaid.ink
+            raise
+        log.warning("kroki.io unavailable (%s) — falling back to mermaid.ink", exc)
+
+    # ── Fallback: mermaid.ink ─────────────────────────────────────────────────
+    encoded = base64.urlsafe_b64encode(mermaid_code.encode()).decode()
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(f"https://mermaid.ink/svg/{encoded}")
+            r.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(r.content)
+        log.info("Mind map rendered via mermaid.ink fallback")
+        return output_path
+    except Exception as ink_exc:
         raise RuntimeError(
-            f"Mind map rendering failed on both mermaid.ink and kroki.io. "
-            f"mermaid.ink: {last_exc}  |  kroki.io: {kroki_exc}"
-        ) from kroki_exc
+            f"Mind map rendering failed on both kroki.io and mermaid.ink. "
+            f"kroki.io: {kroki_exc}  |  mermaid.ink: {ink_exc}"
+        ) from ink_exc
