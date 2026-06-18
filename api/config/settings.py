@@ -18,9 +18,9 @@ class Settings(BaseSettings):
 
     # ── Anthropic ─────────────────────────────────────────────────────────────
     ANTHROPIC_API_KEY: str = ""
-    MODEL_HAIKU:  str = "claude-haiku-4-5-20251001"
-    MODEL_SONNET: str = "claude-sonnet-4-6"
-    MODEL_OPUS:   str = "claude-opus-4-7"
+    MODEL_HAIKU:  str = "anthropic/claude-haiku-4-5"
+    MODEL_SONNET: str = "anthropic/claude-sonnet-4-5"
+    MODEL_OPUS:   str = "anthropic/claude-opus-4-5"
     # Per-chunk summary model (Pass 1). Defaults to OpenRouter GPT-4.1-mini for cost efficiency.
     # Supports OpenRouter prefix (e.g., "openai/gpt-4.1-mini") or native Anthropic models.
     MODEL_CHUNK:  str = "openai/gpt-4.1-mini"

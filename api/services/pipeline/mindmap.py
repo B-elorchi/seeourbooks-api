@@ -281,28 +281,23 @@ async def render_mermaid_svg(mermaid_code: str, output_path: str) -> str:
     """
     encoded = base64.urlsafe_b64encode(mermaid_code.encode()).decode()
 
-    # ── Attempt 1 & 2: mermaid.ink ───────────────────────────────────────────
+    # ── Attempt 1: mermaid.ink (fail-fast — one try only) ────────────────────
     last_exc: Exception | None = None
-    for attempt in range(2):
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.get(f"https://mermaid.ink/svg/{encoded}")
-                r.raise_for_status()
-            with open(output_path, "wb") as f:
-                f.write(r.content)
-            return output_path
-        except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.RequestError) as exc:
-            last_exc = exc
-            is_server_error = (
-                isinstance(exc, httpx.HTTPStatusError)
-                and exc.response.status_code >= 500
-            )
-            if is_server_error or isinstance(exc, (httpx.TimeoutException, httpx.RequestError)):
-                if attempt == 0:
-                    log.warning("mermaid.ink attempt 1 failed (%s), retrying in 3s…", exc)
-                    await asyncio.sleep(3)
-                continue
-            # 4xx errors (bad diagram syntax) — no point retrying
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(f"https://mermaid.ink/svg/{encoded}")
+            r.raise_for_status()
+        with open(output_path, "wb") as f:
+            f.write(r.content)
+        return output_path
+    except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.RequestError) as exc:
+        last_exc = exc
+        is_server_error = (
+            isinstance(exc, httpx.HTTPStatusError)
+            and exc.response.status_code >= 500
+        )
+        if not (is_server_error or isinstance(exc, (httpx.TimeoutException, httpx.RequestError))):
+            # 4xx errors (bad diagram syntax) — no point falling back
             raise
 
     # ── Fallback: kroki.io ────────────────────────────────────────────────────

@@ -115,6 +115,12 @@ _RECOVERABLE_KEYWORDS: tuple[str, ...] = (
     "service unavailable", "temporarily unavailable",
     "bad gateway", "gateway timeout",
     "name or service not known",
+    # Malformed / truncated API response body — e.g. provider returned an HTML
+    # error page instead of JSON.  The OpenAI SDK surfaces this as a
+    # json.JSONDecodeError whose message starts with "Expecting value".
+    "expecting value",
+    "json decode",
+    "invalid json",
 )
 
 # HTTP status codes considered recoverable when we can extract them.
