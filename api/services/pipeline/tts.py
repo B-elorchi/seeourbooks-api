@@ -24,6 +24,11 @@ import logging
 import os
 import re
 import httpx
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+def _is_uuid(v: str | None) -> bool:
+    return bool(v and _UUID_RE.match(v))
 from api.config.settings import settings
 from api.services.usage_logger import log_tts_usage
 from api.services.openrouter_keys import (
@@ -383,7 +388,31 @@ async def _dispatch_tts(
                 "CARTESIA_API_KEY is not set. Add it to your .env file "
                 "or switch the TTS provider to 'elevenlabs' in Admin → Providers → Text-to-Speech."
             )
-        await _cartesia(text, voice, language, cfg, output_path)
+        # If no Cartesia voice is configured for this language, fall back to
+        # OpenRouter TTS when an OpenRouter key is available.  This prevents a
+        # missing AR voice from failing the whole translated-audio step.
+        _cartesia_voice = (
+            cfg.get(f"CARTESIA_VOICE_{language.upper()}")
+            or voice
+            or cfg.get("CARTESIA_VOICE_EN")
+            or settings.CARTESIA_VOICE_EN
+            or settings.CARTESIA_VOICE_AR
+        )
+        if not _is_uuid(_cartesia_voice) and get_openrouter_key():
+            log.warning(
+                "Cartesia voice missing for language %r (value=%r); falling back to OpenRouter TTS.",
+                language, _cartesia_voice,
+            )
+            or_model = cfg.get("OPENROUTER_TTS_MODEL") or settings.OPENROUTER_TTS_MODEL
+            lang_voice_key = f"OPENROUTER_TTS_VOICE_{language.upper()}"
+            or_voice = (
+                cfg.get(lang_voice_key)
+                or cfg.get("OPENROUTER_TTS_VOICE")
+                or settings.OPENROUTER_TTS_VOICE
+            )
+            await _openrouter_tts(text, or_voice, language, or_model, output_path, cfg=cfg, audio_style=audio_style)
+        else:
+            await _cartesia(text, voice, language, cfg, output_path)
     elif provider == "gemini":
         if not (settings.GEMINI_API_KEY or settings.OPENROUTER_API_KEY):
             raise ValueError(
@@ -499,21 +528,28 @@ async def _cartesia(text: str, voice: str, language: str, cfg: dict, output_path
     """
     model = cfg.get("CARTESIA_MODEL") or settings.CARTESIA_MODEL
 
-    # Prefer the dedicated Cartesia voice id for this language, then fall back to
-    # the generic TTS_VOICE_* value passed in.
+    # Prefer the dedicated Cartesia voice id for this language, then fall back
+    # to the generic TTS_VOICE_* value, then to a configured English voice (many
+    # Cartesia voices are multilingual and can handle Arabic/others), then to
+    # the settings default.
     _vkey = f"CARTESIA_VOICE_{language.upper()}"
-    voice = cfg.get(_vkey) or voice
+    voice = (
+        cfg.get(_vkey)
+        or voice
+        or cfg.get("CARTESIA_VOICE_EN")
+        or settings.CARTESIA_VOICE_EN
+        or settings.CARTESIA_VOICE_AR
+    )
 
     # Guard: voice must be a UUID, not a model name.
     # "sonic-2024-10-19" is the MODEL id — passing it as a voice id returns 400.
-    import re
-    _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
-    if not _UUID_RE.match(voice or ""):
+    if not _is_uuid(voice):
         raise ValueError(
-            f"Cartesia voice value '{voice}' is not a valid voice UUID. "
+            f"Cartesia voice value '{voice}' is not a valid voice UUID for language '{language}'. "
             f"Voice IDs look like 'a0e99841-438c-4a64-b679-ae501e7d6091'. "
-            f"Find yours at https://play.cartesia.ai/voices, then set "
-            f"{_vkey} in Admin → Providers → Text-to-Speech."
+            f"Find a voice at https://play.cartesia.ai/voices, then set "
+            f"{_vkey} (or CARTESIA_VOICE_EN as a multilingual fallback) in "
+            f"Admin → Providers → Text-to-Speech."
         )
 
     payload = {
@@ -837,7 +873,9 @@ async def _openrouter_tts(
         payload["response_format"] = "pcm"
 
     last_error: Exception | None = None
-    max_attempts = max(3, openrouter_key_count() + 1)
+    key_count = openrouter_key_count()
+    # With only one key, retrying the same key on a credit error is pointless.
+    max_attempts = max(1, key_count)
 
     async with httpx.AsyncClient(timeout=180) as client:
         for attempt in range(max_attempts):
@@ -877,7 +915,8 @@ async def _openrouter_tts(
         else:
             raise last_error or RuntimeError(
                 f"OpenRouter TTS failed on all configured keys "
-                f"(model={model}, voice={chosen_voice}, language={language})"
+                f"(model={model}, voice={chosen_voice}, language={language}). "
+                f"Add OPENROUTER_API_KEY_2 / OPENROUTER_API_KEY_3 to your .env to enable automatic fallback."
             )
 
     content = r.content

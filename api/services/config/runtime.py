@@ -236,6 +236,17 @@ _cache_ts: float = 0.0
 _CACHE_TTL = 60.0   # seconds
 
 
+async def _load_config() -> dict[str, str]:
+    """Fetch merged config from DB + defaults."""
+    defaults = _defaults()
+    try:
+        rows = await find("provider_config", select="key, value")
+        db   = {r["key"]: r["value"] for r in rows}
+        return {**defaults, **db}
+    except Exception:
+        return defaults   # graceful fallback — table may not exist yet
+
+
 async def get_all_config() -> dict[str, str]:
     """Return merged config: Supabase overrides on top of defaults."""
     global _cache, _cache_ts
@@ -243,15 +254,16 @@ async def get_all_config() -> dict[str, str]:
     if _cache and (time.time() - _cache_ts) < _CACHE_TTL:
         return _cache
 
-    defaults = _defaults()
-    try:
-        rows = await find("provider_config", select="key, value")
-        db   = {r["key"]: r["value"] for r in rows}
-        merged = {**defaults, **db}
-    except Exception:
-        merged = defaults   # graceful fallback — table may not exist yet
+    _cache = await _load_config()
+    _cache_ts = time.time()
+    return _cache
 
-    _cache = merged
+
+async def refresh_config_cache() -> dict[str, str]:
+    """Force a fresh config read from the database.  Used by admin retry/rerun
+    so a job immediately picks up any new model/provider settings."""
+    global _cache, _cache_ts
+    _cache = await _load_config()
     _cache_ts = time.time()
     return _cache
 

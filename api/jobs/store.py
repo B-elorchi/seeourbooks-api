@@ -1,7 +1,8 @@
 """
 Pipeline job store — backed by either Supabase or Postgres (see DB_BACKEND).
-All functions use the unified db interface: find / insert / upsert / update.
+All functions use the unified db interface: find / insert / upsert / update / delete.
 """
+from datetime import datetime, timedelta, timezone
 import uuid
 
 from api.services.db import find, insert, update, delete
@@ -148,3 +149,37 @@ async def delete_job(job_id: str) -> None:
     _cancelled_jobs.discard(job_id)
     await delete("pipeline_step_results", {"job_id": job_id})
     await delete("pipeline_jobs", {"id": job_id})
+
+
+async def timeout_stuck_jobs(max_age_minutes: int = 60) -> list[str]:
+    """
+    Mark jobs that have been 'running' for longer than `max_age_minutes` as failed.
+    Returns the list of timed-out job IDs.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max(1, max_age_minutes))
+    try:
+        rows = await find(
+            "pipeline_jobs",
+            filters={"status": "running", "updated_at": ("lte", cutoff.isoformat())},
+            select="id",
+            limit=1000,
+        )
+    except Exception:
+        return []
+
+    timed_out: list[str] = []
+    for r in rows:
+        jid = r.get("id")
+        if not jid:
+            continue
+        await update(
+            "pipeline_jobs",
+            {"id": jid},
+            {
+                "status": "failed",
+                "error_msg": f"Timed out after running for more than {max_age_minutes} minutes",
+            },
+        )
+        timed_out.append(jid)
+
+    return timed_out

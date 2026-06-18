@@ -280,11 +280,18 @@ async def _generate_gemini_openrouter(model: str, prompt: str, output_path: str)
     Rotates to the next configured OpenRouter key on credit/limit errors
     (HTTP 402/403/429) so a single exhausted key doesn't fail the cover step.
     """
+    # Gemini image models have a shared 32768-token context window.  The API
+    # counts max_tokens as requested output tokens, so input + max_tokens must
+    # fit inside the window.  Reserve ~512 tokens of headroom for the prompt
+    # (actual token count is approximated as chars // 4) and any API overhead.
+    prompt_tokens = max(1, len(prompt) // 4)
+    max_image_tokens = max(1024, 32768 - prompt_tokens - 512)
+
     payload: dict = {
         "model":      model,
         "messages":   [{"role": "user", "content": prompt}],
         "modalities": ["image", "text"],   # ← tells OpenRouter we want image output
-        "max_tokens": 32768,
+        "max_tokens": max_image_tokens,
     }
     # Some models can be told to skip reasoning and emit the image directly;
     # others (e.g. gemini-3-pro-image-preview) mandate reasoning and 400 if we
@@ -294,7 +301,9 @@ async def _generate_gemini_openrouter(model: str, prompt: str, output_path: str)
         payload["reasoning"] = {"enabled": False}
 
     last_error: Exception | None = None
-    max_attempts = max(3, openrouter_key_count() + 1)  # try each configured key at least once
+    key_count = openrouter_key_count()
+    # With only one key, retrying the same key on a credit error is pointless.
+    max_attempts = max(1, key_count)
 
     async with httpx.AsyncClient(timeout=120) as http:
         for attempt in range(max_attempts):
@@ -351,7 +360,8 @@ async def _generate_gemini_openrouter(model: str, prompt: str, output_path: str)
         else:
             # Exhausted all keys.
             raise last_error or RuntimeError(
-                f"OpenRouter image request for {model} failed on all configured keys."
+                f"OpenRouter image request for {model} failed on all configured keys. "
+                f"Add OPENROUTER_API_KEY_2 / OPENROUTER_API_KEY_3 to your .env to enable automatic fallback."
             )
 
     try:
@@ -381,7 +391,9 @@ async def _generate_openrouter(model: str, prompt: str, size: str, output_path: 
     Rotates to the next configured OpenRouter key on credit/limit errors.
     """
     last_error: Exception | None = None
-    max_attempts = max(3, openrouter_key_count() + 1)
+    key_count = openrouter_key_count()
+    # With only one key, retrying the same key on a credit error is pointless.
+    max_attempts = max(1, key_count)
 
     for attempt in range(max_attempts):
         key = get_openrouter_key()
@@ -418,7 +430,8 @@ async def _generate_openrouter(model: str, prompt: str, size: str, output_path: 
         return
 
     raise last_error or RuntimeError(
-        f"OpenRouter image request for {model} failed on all configured keys."
+        f"OpenRouter image request for {model} failed on all configured keys. "
+        f"Add OPENROUTER_API_KEY_2 / OPENROUTER_API_KEY_3 to your .env to enable automatic fallback."
     )
 
 

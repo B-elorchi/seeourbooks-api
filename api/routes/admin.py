@@ -26,9 +26,9 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
 from api.auth import require_admin
-from api.services.config.runtime import get_all_config, set_config_key
+from api.services.config.runtime import get_all_config, set_config_key, refresh_config_cache
 from api.services.db import find, insert, upsert
-from api.jobs.store import get_job, reset_for_manual_retry, delete_job
+from api.jobs.store import get_job, reset_for_manual_retry, delete_job, timeout_stuck_jobs
 from api.models.requests import PipelineReq
 
 log = logging.getLogger(__name__)
@@ -1230,6 +1230,127 @@ async def admin_costs_users(days: int = 0, limit: int = 100, offset: int = 0) ->
     return {"days": days, "limit": limit, "offset": offset, "rows": rows}
 
 
+@router.get("/costs/books/{book_id}")
+async def admin_book_cost_details(book_id: str, days: int = 0) -> dict:
+    """
+    Per-step / per-model cost breakdown for a single book.
+
+    - days=0 (default) → all-time usage for this book.
+    - days>0           → usage from the last N days only.
+    """
+    try:
+        jobs = await find(
+            "pipeline_jobs",
+            filters={"book_id": book_id},
+            select="id",
+            limit=5000,
+        )
+    except Exception as exc:
+        log.warning("admin_book_cost_details: DB unreachable — %s", exc)
+        return {"book_id": book_id, "total_cost_usd": 0.0, "total_calls": 0, "steps": [], "jobs": []}
+
+    job_ids = [j["id"] for j in jobs if j.get("id")]
+    if not job_ids:
+        return {"book_id": book_id, "total_cost_usd": 0.0, "total_calls": 0, "steps": [], "jobs": []}
+
+    filters: dict = {"job_id": ("in", job_ids)}
+    if days > 0:
+        since_iso = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        filters["created_at"] = ("gte", since_iso)
+
+    try:
+        logs = await find(
+            "usage_logs",
+            filters=filters,
+            select="job_id,step,model,provider,cost_usd",
+            order="created_at DESC",
+            limit=50000,
+        )
+    except Exception:
+        logs = []
+
+    by_step: dict[str, dict] = {}
+    by_job: dict[str, dict] = {}
+    total_cost = 0.0
+    total_calls = 0
+
+    for r in logs:
+        step = r.get("step") or "unknown"
+        model = r.get("model") or "unknown"
+        provider = r.get("provider") or "unknown"
+        jid = r.get("job_id") or "__none__"
+        cost = float(r.get("cost_usd") or 0)
+        total_cost += cost
+        total_calls += 1
+
+        sentry = by_step.setdefault(step, {
+            "step": step,
+            "calls": 0,
+            "cost_usd": 0.0,
+            "models": {},
+        })
+        sentry["calls"] += 1
+        sentry["cost_usd"] += cost
+
+        mentry = sentry["models"].setdefault(model, {
+            "model": model,
+            "provider": provider,
+            "calls": 0,
+            "cost_usd": 0.0,
+        })
+        mentry["calls"] += 1
+        mentry["cost_usd"] += cost
+
+        if jid != "__none__":
+            jentry = by_job.setdefault(jid, {"job_id": jid, "calls": 0, "cost_usd": 0.0})
+            jentry["calls"] += 1
+            jentry["cost_usd"] += cost
+
+    steps = []
+    for step_name, data in by_step.items():
+        model_list = sorted(
+            [{**m, "cost_usd": round(m["cost_usd"], 6)} for m in data["models"].values()],
+            key=lambda x: x["cost_usd"],
+            reverse=True,
+        )
+        steps.append({
+            "step": step_name,
+            "calls": data["calls"],
+            "cost_usd": round(data["cost_usd"], 6),
+            "models": model_list,
+        })
+    steps.sort(key=lambda x: x["cost_usd"], reverse=True)
+
+    jobs_out = sorted(
+        [{**v, "cost_usd": round(v["cost_usd"], 6)} for v in by_job.values()],
+        key=lambda x: x["cost_usd"],
+        reverse=True,
+    )
+
+    return {
+        "book_id":       book_id,
+        "total_cost_usd": round(total_cost, 6),
+        "total_calls":   total_calls,
+        "steps":         steps,
+        "jobs":          jobs_out,
+    }
+
+
+@router.post("/jobs/timeout-stuck", status_code=200)
+async def admin_timeout_stuck_jobs(max_age_minutes: int = 60) -> dict:
+    """
+    Mark any job stuck in 'running' for longer than `max_age_minutes` as failed.
+    Default threshold is 60 minutes.
+    """
+    timed_out = await timeout_stuck_jobs(max_age_minutes)
+    return {
+        "ok":          True,
+        "timed_out":   timed_out,
+        "count":       len(timed_out),
+        "max_age_minutes": max_age_minutes,
+    }
+
+
 @router.post("/jobs/{job_id}/rerun", status_code=202)
 async def admin_rerun_steps(
     job_id: str,
@@ -1326,6 +1447,9 @@ async def admin_rerun_steps(
     # Debug logging
     log.info("Rerun job %s: force=%s steps_to_run=%s skipped_done=%s", job_id, force, steps_to_run, skipped_done)
 
+    # Make sure the rerun picks up any model/provider changes made in admin.
+    await refresh_config_cache()
+
     await reset_for_manual_retry(job_id)
     # force_steps=True: use exactly the steps we chose, don't override with
     # just-the-failed-steps logic that _run_job normally applies.
@@ -1397,6 +1521,9 @@ async def admin_retry_job(job_id: str, background_tasks: BackgroundTasks) -> dic
             "retrying_steps": [],
             "message":       "No failed / running / pending steps to retry. Use /admin/jobs/{job_id}/rerun to regenerate specific steps.",
         }
+
+    # Make sure the retry picks up any model/provider changes made in admin.
+    await refresh_config_cache()
 
     await reset_for_manual_retry(job_id)
     background_tasks.add_task(_run_job, job_id, req, previous_result)
