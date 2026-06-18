@@ -12,13 +12,22 @@ STYLE_MAP = {
 
 
 def _build_prompt(chunk_summaries: list[str], length: str, style: str, language: str,
-                  target_words: int | None = None) -> str:
+                  target_words: int | None = None,
+                  missing_topics: list[str] | None = None) -> str:
     lang_name = "Arabic" if language == "ar" else "English"
     target    = target_words if (target_words and target_words > 0) else SUMMARY_LENGTHS.get(length, 750)
     tashkeel  = AR_TASHKEEL_INSTRUCTION if language == "ar" else ""
     combined  = "\n\n---\n\n".join(
         f"Section {i + 1}:\n{s}" for i, s in enumerate(chunk_summaries)
     )
+    missing_note = ""
+    if missing_topics:
+        missing_list = "\n".join(f"- {t}" for t in missing_topics)
+        missing_note = (
+            f"\n\nCRITICAL — a previous version of this summary scored below the "
+            f"required coverage threshold because it missed these topics. You MUST "
+            f"explicitly cover ALL of them in your summary:\n{missing_list}"
+        )
     return (
         f"Create a book summary in {lang_name} for an audio presentation "
         f"of ~{length} (~{target} words).\n"
@@ -28,6 +37,7 @@ def _build_prompt(chunk_summaries: list[str], length: str, style: str, language:
         f"IMPORTANT: Output ONLY the summary itself — no preamble, no introduction, "
         f"no 'Of course' or 'Here is', no script markers, no horizontal rules, "
         f"no closing remarks. Start directly with the first sentence of the summary."
+        f"{missing_note}"
         f"{tashkeel}"
     )
 
@@ -38,6 +48,7 @@ async def run_sonnet_pass(
     style: str,
     language: str,
     model: str | None = None,
+    missing_topics: list[str] | None = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """
     Streaming version — yields ("token", text) and finally ("full", full_text).
@@ -46,7 +57,7 @@ async def run_sonnet_pass(
     """
     model  = model or settings.MODEL_SONNET
     target = SUMMARY_LENGTHS.get(length, 750)
-    prompt = _build_prompt(chunk_summaries, length, style, language)
+    prompt = _build_prompt(chunk_summaries, length, style, language, missing_topics=missing_topics)
     full   = ""
 
     async for token in chat_stream(
@@ -67,6 +78,7 @@ async def run_sonnet_pass_sync(
     language: str,
     model_override: str | None = None,
     max_words: int | None = None,
+    missing_topics: list[str] | None = None,
 ) -> str:
     """
     Non-streaming version — returns the complete summary text.
@@ -75,10 +87,13 @@ async def run_sonnet_pass_sync(
 
     max_words — admin override (SUMMARY_MAX_WORDS_*). When None/0, the length
     preset is used (3min=450, 5min=750, 10min=1500, 15min=2250).
+    missing_topics — topics the previous summary missed (from QA); included in
+    the prompt so the model knows what to fix on retry.
     """
     model  = model_override or settings.MODEL_SONNET
     target = max_words if (max_words and max_words > 0) else SUMMARY_LENGTHS.get(length, 750)
-    prompt = _build_prompt(chunk_summaries, length, style, language, target_words=target)
+    prompt = _build_prompt(chunk_summaries, length, style, language,
+                           target_words=target, missing_topics=missing_topics)
 
     return await chat_complete(
         model=model,

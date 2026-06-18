@@ -674,6 +674,10 @@ async def run_pipeline(
     chapter_audio_translated: dict[int, str] = {}
     chapter_mindmap_translated: dict[int, dict] = {}
 
+    # Flags populated from the previous result (if any).
+    _prev_qa_failed: bool = False
+    _prev_missing_topics: list[str] | None = None
+
     # ── Pre-load previous result so live checkpoints always carry forward
     # assets from steps that aren't being re-run in this pass.
     if previous_result:
@@ -688,6 +692,18 @@ async def run_pipeline(
         _paudio = _prev.get("audio") or {}
         _psums  = _prev.get("summaries") or {}
 
+        # Detect whether the previous run's summary QA failed so we can force
+        # a fresh regeneration instead of reusing the same low-coverage summary.
+        _prev_qa = _prev.get("summary_qa") or {}
+        _prev_qa_failed = _prev_qa.get("passed") is False
+        _prev_missing_topics = _prev_qa.get("missing") if _prev_qa_failed else None
+        if _prev_qa_failed:
+            log.info(
+                "Previous summary QA failed (score=%s) — will force regeneration. "
+                "Missing topics: %s",
+                _prev_qa.get("score"), _prev_missing_topics,
+            )
+
         cover_url   = cover_url   or _pfiles.get("cover")
         mindmap_url = mindmap_url or _pfiles.get("mindmap")
         epub_url    = epub_url    or _pfiles.get("epub")
@@ -698,8 +714,9 @@ async def run_pipeline(
         if _lang_key in _paudio and not full_audio:
             full_audio = _paudio[_lang_key]
 
-        # Quick / full summary (needed if summarize is skipped this run)
-        if not full_summary and _psums:
+        # Quick / full summary (needed if summarize is skipped this run).
+        # Don't preload when QA failed — summarize will regenerate it fresh.
+        if not full_summary and _psums and not _prev_qa_failed:
             _first_sum = next(iter(_psums.values()), {})
             full_summary  = _first_sum.get("text", "")
             quick_summary = _prev.get("quick_summary", "")
@@ -891,7 +908,10 @@ async def run_pipeline(
                 updates["title"] = catalog_title
             if not req.author and book_row.get("author"):
                 updates["author"] = book_row["author"]
-            if not req.summary:
+            if not req.summary and not _prev_qa_failed:
+                # Skip loading cached summary when the previous run's QA failed —
+                # we need the orchestrator to regenerate it, not reuse the same
+                # low-coverage text that already failed the threshold.
                 cached = _pick_cached_summary(book_row, req.language)
                 if cached:
                     updates["summary"] = cached
@@ -1200,6 +1220,7 @@ async def run_pipeline(
                             req.language,
                             model_override=model_sonnet,
                             max_words=summary_max_words or None,
+                            missing_topics=_prev_missing_topics,
                         )
                         full_summary = await run_review_pass(
                             full_summary,

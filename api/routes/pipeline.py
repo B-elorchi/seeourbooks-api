@@ -226,6 +226,14 @@ async def _run_job(
     # narrow req.steps to only the failed ones (standard auto-retry behaviour).
     if not force_steps:
         failed = _failed_steps(previous_result)
+        # When the previous run's summary QA score was below threshold, the
+        # summarize step was "done" (summary was generated) but the result was
+        # not good enough.  Force summarize to re-run so a better summary is
+        # generated — otherwise the same low-coverage summary loops forever.
+        _prev_dict = previous_result if isinstance(previous_result, dict) else {}
+        if (_prev_dict.get("summary_qa") or {}).get("passed") is False:
+            if "summarize" not in (failed or []):
+                failed = ["summarize"] + (failed or [])
         if failed:
             req = req.model_copy(update={"steps": failed})
 
