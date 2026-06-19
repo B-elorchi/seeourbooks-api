@@ -84,7 +84,11 @@ _DEFAULT_MAX_CHARS = 1500
 # smaller one for Arabic. Override per deployment via TTS_MAX_CHARS_GEMINI /
 # TTS_MAX_CHARS_GEMINI_AR. Tune DOWN if audio is cut short; UP for fewer seams.
 _GEMINI_MAX_CHARS    = 8000   # English / Latin scripts (~2k tokens)
-_GEMINI_MAX_CHARS_AR = 4000   # Arabic — heavier tokenisation, stay under 8,192
+# Arabic with tashkeel (full diacritisation) tokenises ~2-3 tokens PER CHARACTER,
+# so a few thousand chars already blows past Gemini's 8,192-token input cap and
+# the audio gets truncated. Keep this small; raise only if AR audio is complete
+# and you want fewer chunk seams.
+_GEMINI_MAX_CHARS_AR = 2200   # Arabic — diacritised text is very token-dense
 
 
 def _is_english_only_voice(voice: str) -> bool:

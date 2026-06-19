@@ -167,7 +167,7 @@ def _defaults() -> dict[str, str]:
         # much heavier than English, so it gets a smaller char budget to avoid
         # truncated audio. Lower if audio is cut short; raise for fewer seams.
         "TTS_MAX_CHARS_GEMINI":           "8000",   # English / Latin
-        "TTS_MAX_CHARS_GEMINI_AR":        "4000",   # Arabic (heavier tokenisation)
+        "TTS_MAX_CHARS_GEMINI_AR":        "2200",   # Arabic — diacritics ~2-3 tokens/char
         "GEMINI_TTS_MODEL":               settings.GEMINI_TTS_MODEL,
         "GEMINI_TTS_AUDIO_STYLE":         "single",
         "GEMINI_TTS_SPEAKER1_VOICE":      "Kore",
