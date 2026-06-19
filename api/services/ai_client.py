@@ -80,7 +80,18 @@ _OPUS_TIER_FALLBACKS = [
     "google/gemini-2.5-pro",
 ]
 
+# Generic safety-net chain for ANY model without a specific entry below. Keeps
+# the OpenRouter-only rule and prevents an unlisted/experimental primary (e.g.
+# deepseek/deepseek-v3.2-exp) from failing with zero fallbacks — which left
+# chunk summaries empty and blocked audio.
+_GENERIC_FALLBACKS = _HAIKU_TIER_FALLBACKS
+
 _DEFAULT_FALLBACK_CHAINS: dict[str, list[str]] = {
+    # DeepSeek primaries (often used for the cheap chunk/QA passes) → reliable tier
+    "deepseek/deepseek-chat":      _HAIKU_TIER_FALLBACKS,
+    "deepseek/deepseek-chat-v3.1": _HAIKU_TIER_FALLBACKS,
+    "deepseek/deepseek-v3.2-exp":  _HAIKU_TIER_FALLBACKS,
+    "deepseek/deepseek-r1":        _HAIKU_TIER_FALLBACKS,
     # Native Anthropic IDs → OpenRouter fallbacks
     "claude-haiku-4-5":          _HAIKU_TIER_FALLBACKS,
     "claude-haiku-4-5-20251001": _HAIKU_TIER_FALLBACKS,
@@ -165,7 +176,9 @@ async def _resolve_fallback_chain(model: str) -> list[str]:
     except Exception:
         pass  # config lookup is best-effort
 
-    extras = chain_override or _DEFAULT_FALLBACK_CHAINS.get(model, [])
+    # Specific chain if configured, else the generic OpenRouter safety-net so an
+    # unlisted/experimental primary still has somewhere to fall back to.
+    extras = chain_override or _DEFAULT_FALLBACK_CHAINS.get(model) or _GENERIC_FALLBACKS
     # De-duplicate while keeping order; ensure primary is at index 0
     seen: set[str] = set()
     ordered: list[str] = []
@@ -254,7 +267,7 @@ async def chat_complete(
     chain = await _resolve_fallback_chain(model)
     last_exc: BaseException | None = None
 
-    for attempt_model in chain:
+    for i, attempt_model in enumerate(chain):
         try:
             result = await _chat_complete_single(attempt_model, messages, max_tokens, system)
             if attempt_model != model:
@@ -268,9 +281,11 @@ async def chat_complete(
             if not _is_recoverable(exc):
                 # Bad input, auth failure, unknown model — don't mask.
                 raise
+            _next = chain[i + 1] if i + 1 < len(chain) else None
             log.warning(
-                "Model %r failed with %s — %s; trying next in fallback chain",
+                "Model %r failed with %s — %s; %s",
                 attempt_model, type(exc).__name__, str(exc)[:240],
+                f"trying next: {_next}" if _next else "no more fallbacks in chain — giving up",
             )
 
     # Every model in the chain failed with a recoverable error.
