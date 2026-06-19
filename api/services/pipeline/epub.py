@@ -21,11 +21,19 @@ import asyncio
 import functools
 import logging
 import re
+import warnings
 from html import escape
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+
+# Silence ebooklib's own deprecation noise (ignore_ncx default + rootfile xpath).
+# These are harmless library warnings emitted on every read_epub() and only
+# clutter the server logs, hiding real errors. Scoped to the ebooklib module so
+# we don't suppress warnings from anywhere else.
+warnings.filterwarnings("ignore", category=UserWarning,   module="ebooklib.epub")
+warnings.filterwarnings("ignore", category=FutureWarning, module="ebooklib.epub")
 
 from api.config.settings import settings
 
