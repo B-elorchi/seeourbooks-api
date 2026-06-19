@@ -118,13 +118,21 @@ def _merge_results(old: dict | str | None, new: dict) -> dict:
     merged["files"] = merged_files
 
     # ── Errors — remove resolved, keep unretried, add new ────────────────────
+    # Only carry forward errors keyed by a REAL step that wasn't re-run. Synthetic
+    # keys (audio_blocked, translate_chapters, audio_chapter_N, …) are recomputed
+    # by every fresh run, so the new run is authoritative — keeping the old ones
+    # would leave stale messages like "Audio blocked: some chapters failed to
+    # summarize" long after summarize succeeded.
+    from api.models.requests import VALID_STEPS   # noqa: PLC0415
     old_errors   = old.get("errors") or {}
     new_errors   = new.get("errors") or {}
     merged_errs  = {}
     for step, err in old_errors.items():
+        if step not in VALID_STEPS:
+            continue                         # synthetic key — let the new run re-add it
         new_status = new_steps.get(step)
         if new_status is None or new_status == "skipped":
-            merged_errs[step] = err          # wasn't retried — error still stands
+            merged_errs[step] = err          # real step, wasn't retried — error still stands
     merged_errs.update(new_errors)
     merged["errors"] = merged_errs
 
