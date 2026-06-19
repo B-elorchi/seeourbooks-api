@@ -74,14 +74,17 @@ _PROVIDER_MAX_CHARS: dict[str, int] = {
 }
 _DEFAULT_MAX_CHARS = 1500
 
-# Gemini TTS handles long context in a SINGLE call. The small per-call budgets
-# above (meant for Deepgram/Cartesia) force a long summary into several separate
-# Gemini requests, and because each request is an independent generation the
-# voice/tone audibly shifts at every chunk boundary (~once per minute). Keeping
-# the whole summary in one call removes those seams. Override per deployment via
-# the admin key TTS_MAX_CHARS_GEMINI. Tune DOWN if very long single requests
-# time out / 400; tune UP so even longer summaries stay a single call.
-_GEMINI_MAX_CHARS = 8000
+# Gemini TTS handles long context in a SINGLE call, which avoids the voice/tone
+# seams you get when a summary is split across several independent requests.
+# BUT Gemini's real limit is ~8,192 INPUT TOKENS, not characters — and Arabic
+# (especially with tashkeel) tokenises ~3-4x heavier than English. So the same
+# character budget that fits English in one call will blow past the token limit
+# in Arabic and Gemini silently narrates only the part that fits (truncated
+# audio). We therefore keep a generous budget for English/Latin text and a much
+# smaller one for Arabic. Override per deployment via TTS_MAX_CHARS_GEMINI /
+# TTS_MAX_CHARS_GEMINI_AR. Tune DOWN if audio is cut short; UP for fewer seams.
+_GEMINI_MAX_CHARS    = 8000   # English / Latin scripts (~2k tokens)
+_GEMINI_MAX_CHARS_AR = 4000   # Arabic — heavier tokenisation, stay under 8,192
 
 
 def _is_english_only_voice(voice: str) -> bool:
@@ -307,13 +310,19 @@ async def synthesize(
         )
 
     # Provider-specific char budget — Deepgram is the strictest at ~1500 chars/req.
-    # Gemini TTS gets a much larger budget so the whole summary is one call and the
-    # voice/tone stays consistent (avoids the per-chunk tone shift ~once a minute).
+    # Gemini TTS gets a larger budget so the summary needs as few calls as
+    # possible (consistent voice). The budget is LANGUAGE-AWARE: Arabic tokenises
+    # much heavier than English, so it uses a smaller char budget to stay under
+    # Gemini's ~8,192 input-token limit and avoid truncated audio.
     if is_gemini_tts:
+        if language == "ar":
+            cfg_key, default_budget = "TTS_MAX_CHARS_GEMINI_AR", _GEMINI_MAX_CHARS_AR
+        else:
+            cfg_key, default_budget = "TTS_MAX_CHARS_GEMINI", _GEMINI_MAX_CHARS
         try:
-            max_chars = int(cfg.get("TTS_MAX_CHARS_GEMINI") or _GEMINI_MAX_CHARS)
+            max_chars = int(cfg.get(cfg_key) or default_budget)
         except (TypeError, ValueError):
-            max_chars = _GEMINI_MAX_CHARS
+            max_chars = default_budget
         max_chars = max(max_chars, 1000)
     else:
         max_chars = _PROVIDER_MAX_CHARS.get(provider, _DEFAULT_MAX_CHARS)

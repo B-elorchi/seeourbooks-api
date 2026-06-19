@@ -161,10 +161,13 @@ def _defaults() -> dict[str, str]:
         "CARTESIA_MODEL":                 settings.CARTESIA_MODEL,
         "CARTESIA_VOICE_EN":              "",
         "CARTESIA_VOICE_AR":              "",
-        # Max characters per Gemini TTS request. Large so a full summary is a
-        # single call — splitting causes the voice/tone to change at each chunk
-        # boundary (~once per minute). Lower it if long requests time out / 400.
-        "TTS_MAX_CHARS_GEMINI":           "8000",
+        # Max characters per Gemini TTS request. Large so a full summary needs as
+        # few calls as possible (splitting changes the voice/tone at each chunk
+        # boundary). Gemini's real cap is ~8,192 INPUT TOKENS — Arabic tokenises
+        # much heavier than English, so it gets a smaller char budget to avoid
+        # truncated audio. Lower if audio is cut short; raise for fewer seams.
+        "TTS_MAX_CHARS_GEMINI":           "8000",   # English / Latin
+        "TTS_MAX_CHARS_GEMINI_AR":        "4000",   # Arabic (heavier tokenisation)
         "GEMINI_TTS_MODEL":               settings.GEMINI_TTS_MODEL,
         "GEMINI_TTS_AUDIO_STYLE":         "single",
         "GEMINI_TTS_SPEAKER1_VOICE":      "Kore",
