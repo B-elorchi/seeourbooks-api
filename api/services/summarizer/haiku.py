@@ -24,6 +24,7 @@ async def run_haiku_pass(
     language: str,
     model: str | None = None,
     max_words: int | None = None,
+    tashkeel_enabled: bool = True,
 ) -> list[str]:
     """
     Summarise each chunk — Pass 1 of the pipeline.
@@ -48,7 +49,7 @@ async def run_haiku_pass(
     _OR_HAIKU = "anthropic/claude-haiku-4-5"
     fallback = None if primary == _OR_HAIKU else _OR_HAIKU
     lang_name = "Arabic" if language == "ar" else "English"
-    tashkeel  = AR_TASHKEEL_INSTRUCTION if language == "ar" else ""
+    tashkeel  = AR_TASHKEEL_INSTRUCTION if (language == "ar" and tashkeel_enabled) else ""
     summaries: list[str] = []
 
     if max_words and max_words > 0:

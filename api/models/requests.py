@@ -36,6 +36,7 @@ class PipelineOptions(BaseModel):
     length_preset: str | None = None   # small | medium | large | custom
     max_chars:     int | None = None   # used when length_preset == "custom"
     audio_style:   str | None = None   # single | multi | podcast | audiobook | news | bedtime | custom
+    arabic_tashkeel: bool | None = None  # None = use ARABIC_TASHKEEL_ENABLED admin config
 
     @field_validator("length_preset")
     @classmethod

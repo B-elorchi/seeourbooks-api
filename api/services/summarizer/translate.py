@@ -19,6 +19,7 @@ async def translate_summary(
     source_lang: str,
     target_lang: str,
     model: str | None = None,
+    tashkeel_enabled: bool = True,
 ) -> str:
     """
     Translate `text` from source_lang to target_lang as a clean, natural,
@@ -31,7 +32,7 @@ async def translate_summary(
     model = model or settings.MODEL_SONNET
     src_name = "Arabic" if source_lang == "ar" else "English"
     tgt_name = "Arabic" if target_lang == "ar" else "English"
-    tashkeel = AR_TASHKEEL_INSTRUCTION if target_lang == "ar" else ""
+    tashkeel = AR_TASHKEEL_INSTRUCTION if (target_lang == "ar" and tashkeel_enabled) else ""
 
     prompt = (
         f"Translate the following book summary from {src_name} into {tgt_name}.\n"

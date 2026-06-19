@@ -121,6 +121,11 @@ def _defaults() -> dict[str, str]:
         "TRANSLATE_CONCURRENCY":         "8",
         # Max auto-retry attempts per job (applies to QA re-runs, network errors, etc.)
         "PIPELINE_MAX_RETRIES":          "8",
+        # Arabic diacritics (tashkeel) injected into summarize / translate prompts.
+        # When true, the AI is instructed to write fully-vowelled Arabic so TTS
+        # pronounces every word correctly.  Disable if your TTS handles undiacritised
+        # Arabic well enough and you want to reduce output token usage.
+        "ARABIC_TASHKEEL_ENABLED":       "true",
         # ── Chunking & summary length knobs (per language) ───────────────────
         # Words per ingest chunk. Bigger = fewer chunks (cheaper, less granular).
         "CHUNK_WORDS_EN":                str(settings.CHUNK_SIZE_WORDS),

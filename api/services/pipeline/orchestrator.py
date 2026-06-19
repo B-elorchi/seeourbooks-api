@@ -640,6 +640,11 @@ async def run_pipeline(
     started = time.time()
     cfg     = await get_all_config()
     forced_steps = forced_steps or set()
+
+    # Arabic tashkeel toggle: admin config default, overridable per request body.
+    _tashkeel_cfg  = cfg.get("ARABIC_TASHKEEL_ENABLED", "true").lower() != "false"
+    _tashkeel_body = req.options.arabic_tashkeel   # bool | None
+    tashkeel_enabled = _tashkeel_body if _tashkeel_body is not None else _tashkeel_cfg
     
     # Parse previous_result for dependency resolution
     _prev_parsed = None
@@ -1106,6 +1111,7 @@ async def run_pipeline(
                                     sums = await run_haiku_pass(
                                         req.book_id, [chunk], req.language, model=model_chunk,
                                         max_words=chapter_max_words or None,
+                                        tashkeel_enabled=tashkeel_enabled,
                                     )
                                 except Exception as exc:
                                     import logging as _log
@@ -1202,6 +1208,7 @@ async def run_pipeline(
                                 sums = await run_haiku_pass(
                                     req.book_id, [chunk], req.language, model=model_chunk,
                                     max_words=chapter_max_words or None,
+                                    tashkeel_enabled=tashkeel_enabled,
                                 )
                             except Exception as exc:
                                 log.warning("Haiku pass failed for chunk %s: %s", ch["index"], exc)
@@ -1245,6 +1252,7 @@ async def run_pipeline(
                             model_override=model_sonnet,
                             max_words=summary_max_words or None,
                             missing_topics=_prev_missing_topics,
+                            tashkeel_enabled=tashkeel_enabled,
                         )
                         full_summary = await run_review_pass(
                             full_summary,
@@ -1365,6 +1373,7 @@ async def run_pipeline(
             try:
                 translated_summary = await translate_summary(
                     full_summary, req.language, target_lang, model=translate_model,
+                    tashkeel_enabled=tashkeel_enabled,
                 )
                 if translated_summary:
                     translated_lang = target_lang
@@ -1403,6 +1412,7 @@ async def run_pipeline(
                     async with tr_sem:
                         tr = await translate_summary(
                             ch["summary"], req.language, target_lang, model=translate_model,
+                            tashkeel_enabled=tashkeel_enabled,
                         )
                     if tr:
                         ch["translated_summary"] = tr

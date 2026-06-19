@@ -101,10 +101,11 @@ async def _reduce_chunk_summaries(
 
 def _build_prompt(chunk_summaries: list[str], length: str, style: str, language: str,
                   target_words: int | None = None,
-                  missing_topics: list[str] | None = None) -> str:
+                  missing_topics: list[str] | None = None,
+                  tashkeel_enabled: bool = True) -> str:
     lang_name = "Arabic" if language == "ar" else "English"
     target    = target_words if (target_words and target_words > 0) else SUMMARY_LENGTHS.get(length, 750)
-    tashkeel  = AR_TASHKEEL_INSTRUCTION if language == "ar" else ""
+    tashkeel  = AR_TASHKEEL_INSTRUCTION if (language == "ar" and tashkeel_enabled) else ""
     combined  = "\n\n---\n\n".join(
         f"Section {i + 1}:\n{s}" for i, s in enumerate(chunk_summaries)
     )
@@ -168,6 +169,7 @@ async def run_sonnet_pass_sync(
     model_override: str | None = None,
     max_words: int | None = None,
     missing_topics: list[str] | None = None,
+    tashkeel_enabled: bool = True,
 ) -> str:
     """
     Non-streaming version — returns the complete summary text.
@@ -186,7 +188,8 @@ async def run_sonnet_pass_sync(
     # prompt fits the model context (big books = hundreds of chapters).
     chunk_summaries = await _reduce_chunk_summaries(chunk_summaries, language, model)
     prompt = _build_prompt(chunk_summaries, length, style, language,
-                           target_words=target, missing_topics=missing_topics)
+                           target_words=target, missing_topics=missing_topics,
+                           tashkeel_enabled=tashkeel_enabled)
 
     try:
         return await chat_complete(
@@ -207,7 +210,8 @@ async def run_sonnet_pass_sync(
             chunk_summaries, language, model, max_chars=_MAX_COMBINED_CHARS // 2,
         )
         prompt = _build_prompt(reduced, length, style, language,
-                               target_words=target, missing_topics=missing_topics)
+                               target_words=target, missing_topics=missing_topics,
+                               tashkeel_enabled=tashkeel_enabled)
         return await chat_complete(
             model=model,
             messages=[{"role": "user", "content": prompt}],
