@@ -83,12 +83,12 @@ _DEFAULT_MAX_CHARS = 1500
 # audio). We therefore keep a generous budget for English/Latin text and a much
 # smaller one for Arabic. Override per deployment via TTS_MAX_CHARS_GEMINI /
 # TTS_MAX_CHARS_GEMINI_AR. Tune DOWN if audio is cut short; UP for fewer seams.
-_GEMINI_MAX_CHARS    = 8000   # English / Latin scripts (~2k tokens)
-# Arabic with tashkeel (full diacritisation) tokenises ~2-3 tokens PER CHARACTER,
-# so a few thousand chars already blows past Gemini's 8,192-token input cap and
-# the audio gets truncated. Keep this small; raise only if AR audio is complete
-# and you want fewer chunk seams.
-_GEMINI_MAX_CHARS_AR = 2200   # Arabic — diacritised text is very token-dense
+_GEMINI_MAX_CHARS    = 2500   # English / Latin — Gemini silently truncates audio
+# output when a single call would produce more than ~1:40 of speech; 2500 chars
+# (~500 words, ~3:20 at audiobook pace) stays safely under that limit.
+# The old value was 8000, which produced complete audio for short summaries but
+# silently cut the end of longer ones. Lower if EN audio still sounds truncated.
+_GEMINI_MAX_CHARS_AR = 2200   # Arabic with tashkeel — ~2-3 tokens/char, very dense
 
 
 def _is_english_only_voice(voice: str) -> bool:
@@ -97,12 +97,13 @@ def _is_english_only_voice(voice: str) -> bool:
 
 _VALID_AUDIO_STYLES = {"single", "multi", "podcast", "audiobook", "news", "bedtime", "custom"}
 
-# Short bracket tags prepended to every TTS chunk (except the first, which already
-# has the full style prompt).  Gemini TTS treats bracketed tags as delivery
-# directions rather than spoken words, so they help keep voice/tone consistent
-# across chunk boundaries without being read aloud.
+# Short bracket tags prepended to every TTS chunk *after the first*.
+# Gemini TTS treats bracketed tags as delivery directions (not spoken words),
+# so these help keep voice/tone consistent at chunk boundaries.
+# "single" now gets a tag too — previously empty, leaving subsequent chunks
+# without any continuity hint and causing the voice to drift.
 _STYLE_TAGS: dict[str, str] = {
-    "single":    "",
+    "single":    "same voice",      # was "" — causes voice drift between chunks
     "audiobook": "narrator",
     "news":      "anchor",
     "bedtime":   "soothing",
@@ -177,7 +178,11 @@ def _apply_audio_style(text: str, style: str | None, cfg: dict) -> tuple[str, bo
         return intro + "\n".join(lines), True, chunk_prefix
 
     # Single-speaker styles: prepend a direction prompt.
+    # "single" now also has a default direction so that the voice characteristics
+    # set in chunk 0 are more likely to be reproduced by subsequent chunks
+    # (which receive a "[same voice] continue" tag via chunk_prefix).
     prompts = {
+        "single":    "Read the following text in a clear, natural, professional voice.",
         "audiobook": "Read the following text in a calm, immersive audiobook narration style.",
         "news":      "Read the following text as a professional news broadcast.",
         "bedtime":   "Read the following text in a soothing, gentle bedtime story style.",
