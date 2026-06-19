@@ -74,6 +74,15 @@ _PROVIDER_MAX_CHARS: dict[str, int] = {
 }
 _DEFAULT_MAX_CHARS = 1500
 
+# Gemini TTS handles long context in a SINGLE call. The small per-call budgets
+# above (meant for Deepgram/Cartesia) force a long summary into several separate
+# Gemini requests, and because each request is an independent generation the
+# voice/tone audibly shifts at every chunk boundary (~once per minute). Keeping
+# the whole summary in one call removes those seams. Override per deployment via
+# the admin key TTS_MAX_CHARS_GEMINI. Tune DOWN if very long single requests
+# time out / 400; tune UP so even longer summaries stay a single call.
+_GEMINI_MAX_CHARS = 8000
+
 
 def _is_english_only_voice(voice: str) -> bool:
     return any(voice.startswith(p) for p in _DEEPGRAM_ENGLISH_VOICE_PREFIXES)
@@ -298,7 +307,16 @@ async def synthesize(
         )
 
     # Provider-specific char budget — Deepgram is the strictest at ~1500 chars/req.
-    max_chars = _PROVIDER_MAX_CHARS.get(provider, _DEFAULT_MAX_CHARS)
+    # Gemini TTS gets a much larger budget so the whole summary is one call and the
+    # voice/tone stays consistent (avoids the per-chunk tone shift ~once a minute).
+    if is_gemini_tts:
+        try:
+            max_chars = int(cfg.get("TTS_MAX_CHARS_GEMINI") or _GEMINI_MAX_CHARS)
+        except (TypeError, ValueError):
+            max_chars = _GEMINI_MAX_CHARS
+        max_chars = max(max_chars, 1000)
+    else:
+        max_chars = _PROVIDER_MAX_CHARS.get(provider, _DEFAULT_MAX_CHARS)
 
     # Reserve room for the per-chunk continuity tag so a chunk + tag never
     # exceeds the provider's per-request character budget.
