@@ -44,8 +44,16 @@ async def translate_summary(
         f"=== TEXT ({src_name}) ===\n{text}"
     )
 
-    # Allow generous output — translation length ≈ source length.
-    approx_tokens = min(8000, int(len(text.split()) * 3) + 500)
+    # Output token budget. Arabic — especially fully diacritised (tashkeel) —
+    # tokenises ~10-12 tokens PER WORD, far more than the source word count
+    # suggests. The old `words * 3` budget cut a ~680-word English summary to
+    # roughly a third in Arabic (truncated translation → short Arabic audio).
+    # Allocate generously when translating INTO Arabic.
+    words = len(text.split())
+    if target_lang == "ar":
+        approx_tokens = min(8000, words * 12 + 1000)
+    else:
+        approx_tokens = min(8000, words * 3 + 500)
     try:
         out = await chat_complete(
             model=model,
