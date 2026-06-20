@@ -1041,9 +1041,18 @@ async def run_pipeline(
     qa_enabled       = cfg.get("SUMMARY_QA_ENABLED", "true") == "true"
     qa_model         = cfg.get("SUMMARY_QA_MODEL") or "deepseek/deepseek-chat"
     qa_threshold     = _cfg_int(cfg, "SUMMARY_QA_THRESHOLD") or 70
-    # Cross-language translation + optional target-language audio
+    # Cross-language translation + optional target-language audio.
+    # Default to a cheap, capable model — translation is a low-complexity task
+    # and Sonnet here cost ~$0.11/call (≈$16 on a 144-chapter book). gpt-4.1-mini
+    # via OpenRouter does it for a fraction of a cent. Admins can override with
+    # the TRANSLATE_MODEL config key.
     translate_enabled   = cfg.get("TRANSLATE_SUMMARY_ENABLED", "true") == "true"
-    translate_model     = cfg.get("TRANSLATE_MODEL") or model_sonnet
+    translate_model     = cfg.get("TRANSLATE_MODEL") or "openai/gpt-4.1-mini"
+    # Per-chapter translation is OFF by default — it costs O(chapters) model
+    # calls (144 on a big book) to produce translated chapter audio/mindmaps
+    # that are rarely consumed. Only the FINAL summary is translated unless an
+    # admin explicitly opts in via TRANSLATE_CHAPTERS_ENABLED=true.
+    translate_chapters_enabled = cfg.get("TRANSLATE_CHAPTERS_ENABLED", "false") == "true"
     target_lang         = "en" if (req.language or "en") == "ar" else "ar"
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -1397,11 +1406,13 @@ async def run_pipeline(
                                            error_msg=errors.get("translate"), duration_sec=_t)
             await _checkpoint()
 
-        # Translate per-chapter summaries only when a step that actually uses them
-        # is requested (audio_chapters_translate or mindmap_chapters_translate).
-        # Translating chapters "just because translate ran" costs O(N) expensive
-        # model calls on large books while producing output nobody reads.
-        _needs_chapter_translations = bool(
+        # Translate per-chapter summaries only when (a) an admin has explicitly
+        # opted into chapter translation AND (b) a step that actually uses them is
+        # requested (audio_chapters_translate or mindmap_chapters_translate).
+        # Translating chapters costs O(N) model calls on large books (144 on a
+        # 144-chapter book) while producing output that is rarely consumed — so
+        # this is OFF by default and must be turned on deliberately.
+        _needs_chapter_translations = translate_chapters_enabled and bool(
             steps & {"audio_chapters_translate", "mindmap_chapters_translate"}
         )
         if translate_step_requested and translated_summary and chapter_results and _needs_chapter_translations:
