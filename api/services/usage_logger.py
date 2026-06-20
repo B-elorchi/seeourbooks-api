@@ -157,7 +157,7 @@ async def _safe_insert(row: dict) -> None:
     try:
         await insert("usage_logs", row)
     except Exception as exc:
-        log.warning("usage_logs insert failed: %s", exc)
+        log.warning("usage_logs insert failed: %s: %s", type(exc).__name__, str(exc).strip() or repr(exc))
 
 
 async def log_text_usage(

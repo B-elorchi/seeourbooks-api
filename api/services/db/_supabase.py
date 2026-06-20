@@ -1,11 +1,23 @@
 """
 Supabase REST backend for the unified DB interface.
 Translates find/insert/upsert/update into Supabase PostgREST HTTP calls.
+
+Uses a single shared, connection-pooled httpx client with automatic retries on
+transient network errors. Creating a fresh AsyncClient per call (the old
+behaviour) opened/closed a TCP+TLS connection every request — under heavy
+concurrent load (e.g. a 100-book batch) that exhausts sockets and produces
+ConnectTimeout storms that cascade into "insert failed" / "could not fetch
+chunks" / job-killing errors. The shared pool fixes that.
 """
+import asyncio
+import logging
+import random
 from typing import Any
 from urllib.parse import quote
 import httpx
 from api.config.settings import settings
+
+log = logging.getLogger(__name__)
 
 
 def _enc(val: Any) -> str:
@@ -15,6 +27,17 @@ def _enc(val: Any) -> str:
 
 _HEADERS: dict = {}
 _BASE: str = ""
+_CLIENT: httpx.AsyncClient | None = None
+
+# Transient errors raised BEFORE the request reaches the server — the write
+# definitely did not happen, so retrying is always safe (even for POST inserts).
+_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+# Errors raised AFTER the request was sent — the server may have processed it,
+# so we only retry these for idempotent methods to avoid duplicate writes.
+_READ_ERRORS = (httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError)
+# 5xx / rate-limit responses that are worth retrying for idempotent calls.
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 4
 
 
 def _init() -> None:
@@ -25,6 +48,62 @@ def _init() -> None:
         "Content-Type":  "application/json",
     }
     _BASE = f"{settings.SUPABASE_URL}/rest/v1"
+
+
+def _get_client() -> httpx.AsyncClient:
+    """Return the shared pooled client, building it lazily on first use."""
+    global _CLIENT
+    if _CLIENT is None or _CLIENT.is_closed:
+        limits = httpx.Limits(
+            max_connections=50,
+            max_keepalive_connections=20,
+            keepalive_expiry=30.0,
+        )
+        # pool=30s — when every connection is busy, wait up to 30s for one to
+        # free up instead of failing instantly with a PoolTimeout.
+        timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+        _CLIENT = httpx.AsyncClient(limits=limits, timeout=timeout)
+    return _CLIENT
+
+
+def _backoff(attempt: int) -> float:
+    """Exponential backoff with jitter: ~0.5, 1, 2s (capped at 8s)."""
+    return min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0, 0.3)
+
+
+async def _request(method: str, url: str, *, idempotent: bool, **kwargs) -> httpx.Response:
+    """
+    Issue an HTTP request on the shared client with transient-failure retries.
+
+    idempotent — True for GET/PATCH/DELETE and merge-duplicate upserts (safe to
+    repeat). False for plain inserts: those are still retried on pre-send
+    connection errors (which guarantee the write never happened) but NOT on
+    read timeouts or 5xx, to avoid creating duplicate rows.
+    """
+    client = _get_client()
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            r = await client.request(method, url, **kwargs)
+            if r.status_code in _RETRY_STATUS and idempotent and attempt < _MAX_ATTEMPTS:
+                last_exc = RuntimeError(f"Supabase {method} {url!r} → HTTP {r.status_code}")
+                await asyncio.sleep(_backoff(attempt))
+                continue
+            return r
+        except _CONNECT_ERRORS as exc:
+            last_exc = exc  # never reached the server — safe to retry any method
+        except _READ_ERRORS as exc:
+            if not idempotent:
+                raise       # may have been processed — don't risk a duplicate
+            last_exc = exc
+        if attempt < _MAX_ATTEMPTS:
+            log.warning("Supabase %s %r transient error (attempt %d/%d): %r — retrying",
+                        method, url, attempt, _MAX_ATTEMPTS, last_exc)
+            await asyncio.sleep(_backoff(attempt))
+            continue
+        break
+    assert last_exc is not None
+    raise last_exc
 
 
 def _build_path(table: str, filters: dict | None, select: str, order: str | None,
@@ -59,16 +138,20 @@ def _build_path(table: str, filters: dict | None, select: str, order: str | None
 
 
 async def startup() -> None:
-    """Validate Supabase credentials are present."""
+    """Validate Supabase credentials are present and warm the shared client."""
     if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_KEY:
         raise RuntimeError(
             "DB_BACKEND=supabase but SUPABASE_URL or SUPABASE_SERVICE_KEY is missing"
         )
     _init()
+    _get_client()
 
 
 async def shutdown() -> None:
-    pass  # Nothing to close for HTTP-based backend
+    global _CLIENT
+    if _CLIENT is not None and not _CLIENT.is_closed:
+        await _CLIENT.aclose()
+    _CLIENT = None
 
 
 async def find(
@@ -82,10 +165,9 @@ async def find(
 ) -> list[dict]:
     _init()
     path = _build_path(table, filters, select, order, limit, offset)
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(f"{_BASE}/{path}", headers=_HEADERS)
-        r.raise_for_status()
-        return r.json()
+    r = await _request("GET", f"{_BASE}/{path}", headers=_HEADERS, idempotent=True)
+    r.raise_for_status()
+    return r.json()
 
 
 def _strip_nul(value):
@@ -120,24 +202,28 @@ async def insert(table: str, data: dict) -> dict:
     _init()
     data = _strip_nul(data)
     h = {**_HEADERS, "Prefer": "return=representation"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(f"{_BASE}/{table}", headers=h, json=data)
-        _raise_with_body(r, "INSERT", table)
-        rows = r.json()
-        return rows[0] if isinstance(rows, list) else rows
+    # idempotent=False: a plain insert that the server may have already applied
+    # must not be blindly repeated. Connection-phase errors are still retried
+    # inside _request (those guarantee the row was never written).
+    r = await _request("POST", f"{_BASE}/{table}", headers=h, json=data, idempotent=False)
+    _raise_with_body(r, "INSERT", table)
+    rows = r.json()
+    return rows[0] if isinstance(rows, list) else rows
 
 
 async def upsert(table: str, data: dict, conflict: str) -> dict:
     _init()
     data = _strip_nul(data)
     h = {**_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(
-            f"{_BASE}/{table}?on_conflict={conflict}", headers=h, json=data
-        )
-        _raise_with_body(r, f"UPSERT (on_conflict={conflict})", table)
-        rows = r.json()
-        return rows[0] if isinstance(rows, list) else rows
+    # Upsert is idempotent (merge-duplicates on the conflict key), so it is safe
+    # to retry on read timeouts / 5xx as well.
+    r = await _request(
+        "POST", f"{_BASE}/{table}?on_conflict={conflict}",
+        headers=h, json=data, idempotent=True,
+    )
+    _raise_with_body(r, f"UPSERT (on_conflict={conflict})", table)
+    rows = r.json()
+    return rows[0] if isinstance(rows, list) else rows
 
 
 async def update(table: str, filters: dict, data: dict) -> None:
@@ -145,15 +231,13 @@ async def update(table: str, filters: dict, data: dict) -> None:
     data = _strip_nul(data)
     parts = [f"{col}=eq.{_enc(val)}" for col, val in filters.items()]
     path = f"{table}?{'&'.join(parts)}"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.patch(f"{_BASE}/{path}", headers=_HEADERS, json=data)
-        _raise_with_body(r, "UPDATE", table)
+    r = await _request("PATCH", f"{_BASE}/{path}", headers=_HEADERS, json=data, idempotent=True)
+    _raise_with_body(r, "UPDATE", table)
 
 
 async def delete(table: str, filters: dict) -> None:
     _init()
     parts = [f"{col}=eq.{_enc(val)}" for col, val in filters.items()]
     path = f"{table}?{'&'.join(parts)}"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.delete(f"{_BASE}/{path}", headers=_HEADERS)
-        _raise_with_body(r, "DELETE", table)
+    r = await _request("DELETE", f"{_BASE}/{path}", headers=_HEADERS, idempotent=True)
+    _raise_with_body(r, "DELETE", table)

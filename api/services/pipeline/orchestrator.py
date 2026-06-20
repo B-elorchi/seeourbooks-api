@@ -470,7 +470,8 @@ async def _fetch_catalog_chapters(book_id: str) -> list[dict]:
     except Exception as exc:
         import logging as _log
         _log.getLogger(__name__).warning(
-            "Could not fetch chunks for book_id=%s: %s", book_id, exc,
+            "Could not fetch chunks for book_id=%s: %s: %s",
+            book_id, type(exc).__name__, str(exc).strip() or repr(exc),
         )
         return []
     return [
@@ -1125,7 +1126,8 @@ async def run_pipeline(
                                 except Exception as exc:
                                     import logging as _log
                                     _log.getLogger(__name__).warning(
-                                        "Haiku pass failed for chunk %s: %s", ch["index"], exc,
+                                        "Haiku pass failed for chunk %s: %s: %s",
+                                        ch["index"], type(exc).__name__, str(exc).strip() or repr(exc),
                                     )
                                     sums = []
                                 summary = sums[0] if sums else ""
@@ -1220,7 +1222,8 @@ async def run_pipeline(
                                     tashkeel_enabled=tashkeel_enabled,
                                 )
                             except Exception as exc:
-                                log.warning("Haiku pass failed for chunk %s: %s", ch["index"], exc)
+                                log.warning("Haiku pass failed for chunk %s: %s: %s",
+                                            ch["index"], type(exc).__name__, str(exc).strip() or repr(exc))
                                 sums = []
                             summary = sums[0] if sums else ""
                             return {
