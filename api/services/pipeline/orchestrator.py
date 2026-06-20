@@ -1397,8 +1397,14 @@ async def run_pipeline(
                                            error_msg=errors.get("translate"), duration_sec=_t)
             await _checkpoint()
 
-        # Translate per-chapter summaries when the translate step is requested.
-        if translate_step_requested and translated_summary and chapter_results:
+        # Translate per-chapter summaries only when a step that actually uses them
+        # is requested (audio_chapters_translate or mindmap_chapters_translate).
+        # Translating chapters "just because translate ran" costs O(N) expensive
+        # model calls on large books while producing output nobody reads.
+        _needs_chapter_translations = bool(
+            steps & {"audio_chapters_translate", "mindmap_chapters_translate"}
+        )
+        if translate_step_requested and translated_summary and chapter_results and _needs_chapter_translations:
             try:
                 # Bound concurrency — firing one translate call per chapter all at
                 # once (200+ on a big book) hammers the provider's rate limit and
