@@ -26,8 +26,8 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
 from api.auth import require_admin
-from api.services.config.runtime import get_all_config, set_config_key, refresh_config_cache
-from api.services.db import find, insert, upsert
+from api.services.config.runtime import get_all_config, set_config_key, refresh_config_cache, get_config_value
+from api.services.db import find, insert, upsert, update
 from api.jobs.store import get_job, get_output, reset_for_manual_retry, delete_job, timeout_stuck_jobs, can_retry
 from api.models.requests import PipelineReq
 from api.services.pipeline.cover import _build_prompt
@@ -1525,6 +1525,101 @@ async def admin_auto_retry_credit_failures(background_tasks: BackgroundTasks) ->
     limit/rate-limit keywords are re-queued.
     """
     retried = await auto_retry_credit_failures(background_tasks)
+    return {"ok": True, "retried": retried, "count": len(retried)}
+
+
+# ── Auto-retry stuck failed/partial jobs ─────────────────────────────────────
+_SWEEP_ATTEMPTS_KEY = "_sweep_attempts"
+
+
+async def auto_retry_stuck_jobs() -> list[str]:
+    """
+    Periodic sweep that re-dispatches jobs stuck in 'failed'/'partial' so their
+    incomplete steps get re-run automatically — no manual "Retry" click needed.
+
+    Differs from the two existing retry paths:
+      • the inline 8-attempt loop fires only right after a failure, and
+      • auto_retry_credit_failures fires only when an exhausted OpenRouter key
+        regains credits.
+    This catches jobs that exhausted their inline retries and would otherwise
+    sit failed forever.
+
+    Guard-rails (so we don't burn money on genuinely-unfixable books):
+      • Each job is swept at most AUTO_RETRY_SWEEP_MAX_ATTEMPTS times — the
+        counter is persisted in the job's `input` JSON (no schema change).
+      • Credit failures are skipped — auto_retry_credit_failures owns those and
+        retrying while the key is dry would just burn the sweep budget.
+      • Only failed/partial steps re-run (merge-aware), never the done ones.
+
+    Returns the list of job IDs that were re-dispatched.
+    """
+    import asyncio
+    from api.routes.pipeline import _run_job, _failed_steps  # local import avoids cycle
+
+    enabled = (await get_config_value("AUTO_RETRY_SWEEP_ENABLED", "true")).lower() == "true"
+    if not enabled:
+        return []
+    try:
+        max_sweeps = int(await get_config_value("AUTO_RETRY_SWEEP_MAX_ATTEMPTS", "3"))
+    except (TypeError, ValueError):
+        max_sweeps = 3
+
+    try:
+        stuck = await find(
+            "pipeline_jobs",
+            filters={"status": ("in", ["failed", "partial"])},
+            select="id,status,input,result,error_msg,retry_count,max_retries",
+            order="created_at DESC",
+            limit=500,
+        )
+    except Exception as exc:
+        log.warning("auto_retry_stuck_jobs: could not query jobs — %s", exc)
+        return []
+
+    retried: list[str] = []
+    for job in stuck:
+        # Credit failures are owned by the credit-aware loop — don't burn the
+        # sweep budget retrying while the key may still be out of credits.
+        if _looks_like_credit_failure(job):
+            continue
+
+        inp = dict(job.get("input") or {})
+        sweeps = int(inp.get(_SWEEP_ATTEMPTS_KEY) or 0)
+        if sweeps >= max_sweeps:
+            continue  # exhausted — leave for a manual retry
+
+        # A 'partial' job with no incomplete steps has nothing to do — skip it
+        # so the sweep doesn't loop on it. A fully 'failed' job with no step map
+        # is re-run from scratch (handled inside _run_job).
+        if job.get("status") == "partial" and not _failed_steps(job.get("result")):
+            continue
+
+        job_id = job["id"]
+        try:
+            req = PipelineReq.model_validate(inp)
+            # Persist the incremented sweep counter so the cap survives restarts.
+            inp[_SWEEP_ATTEMPTS_KEY] = sweeps + 1
+            await update("pipeline_jobs", {"id": job_id}, {"input": inp})
+
+            await reset_for_manual_retry(job_id)   # fresh inline retries
+            asyncio.create_task(_run_job(job_id, req, job.get("result"), False))
+            retried.append(job_id)
+        except Exception as exc:
+            log.warning("auto_retry_stuck_jobs: could not retry %s — %s", job_id, exc)
+
+    if retried:
+        log.info("Auto-retry sweep re-dispatched %d stuck job(s).", len(retried))
+    return retried
+
+
+@router.post("/jobs/auto-retry-stuck", status_code=200)
+async def admin_auto_retry_stuck_jobs() -> dict:
+    """
+    Manually trigger the stuck-job sweep. Re-dispatches every 'failed'/'partial'
+    job that still has incomplete steps and hasn't exhausted its sweep budget,
+    so its remaining steps run again.
+    """
+    retried = await auto_retry_stuck_jobs()
     return {"ok": True, "retried": retried, "count": len(retried)}
 
 

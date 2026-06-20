@@ -21,6 +21,7 @@ async def lifespan(app: FastAPI):
     await run_migrations()   # fix any stale provider_config values automatically
     await _recover_stuck_jobs()
     asyncio.create_task(_auto_retry_credit_failures_loop())
+    asyncio.create_task(_auto_retry_stuck_jobs_loop())
     yield
     await db_shutdown()      # graceful close
 
@@ -108,6 +109,35 @@ async def _auto_retry_credit_failures_loop() -> None:
             break
         except Exception as exc:
             log.warning("Auto-retry credit loop error: %s", exc)
+
+
+async def _auto_retry_stuck_jobs_loop() -> None:
+    """
+    Background loop: every AUTO_RETRY_SWEEP_INTERVAL_MIN minutes (default 30),
+    sweep all jobs stuck in 'failed'/'partial' and re-dispatch their incomplete
+    steps. Each job is retried at most a few times (see auto_retry_stuck_jobs)
+    so genuinely-unfixable books don't loop forever.
+    """
+    import asyncio
+    import logging
+    from api.routes.admin import auto_retry_stuck_jobs       # local import avoids cycle
+    from api.services.config.runtime import get_config_value
+    log = logging.getLogger(__name__)
+
+    while True:
+        try:
+            try:
+                interval = int(await get_config_value("AUTO_RETRY_SWEEP_INTERVAL_MIN", "30"))
+            except (TypeError, ValueError):
+                interval = 30
+            await asyncio.sleep(max(1, interval) * 60)
+            retried = await auto_retry_stuck_jobs()
+            if retried:
+                log.info("Stuck-job sweep re-dispatched %d job(s).", len(retried))
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            log.warning("Auto-retry stuck-job loop error: %s", exc)
 
 
 app = FastAPI(
