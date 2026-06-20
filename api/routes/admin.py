@@ -1324,6 +1324,29 @@ async def admin_book_cost_details(book_id: str, days: int = 0) -> dict:
     except Exception:
         logs = []
 
+    # Fetch step durations from pipeline_step_results (one row per step per run).
+    # Sum duration_sec across all runs so reruns accumulate correctly.
+    try:
+        step_dur_rows = await find(
+            "pipeline_step_results",
+            filters={"job_id": ("in", job_ids)},
+            select="job_id,step,duration_sec",
+            limit=50000,
+        )
+    except Exception:
+        step_dur_rows = []
+
+    # duration per step: sum across all runs; per job: sum of its steps
+    step_duration: dict[str, int] = {}
+    job_duration: dict[str, int] = {}
+    for dr in step_dur_rows:
+        sname = dr.get("step") or "unknown"
+        jid   = dr.get("job_id") or "__none__"
+        dur   = int(dr.get("duration_sec") or 0)
+        step_duration[sname] = step_duration.get(sname, 0) + dur
+        if jid != "__none__":
+            job_duration[jid] = job_duration.get(jid, 0) + dur
+
     by_step: dict[str, dict] = {}
     by_job: dict[str, dict] = {}
     total_cost = 0.0
@@ -1357,9 +1380,18 @@ async def admin_book_cost_details(book_id: str, days: int = 0) -> dict:
         mentry["cost_usd"] += cost
 
         if jid != "__none__":
-            jentry = by_job.setdefault(jid, {"job_id": jid, "calls": 0, "cost_usd": 0.0})
+            jentry = by_job.setdefault(jid, {"job_id": jid, "calls": 0, "cost_usd": 0.0, "duration_sec": 0})
             jentry["calls"] += 1
             jentry["cost_usd"] += cost
+
+    # Attach durations to jobs
+    for jid, jentry in by_job.items():
+        jentry["duration_sec"] = job_duration.get(jid, 0)
+
+    # Also include jobs that only appear in step_results (no AI calls logged)
+    for jid, dur in job_duration.items():
+        if jid not in by_job and jid != "__none__":
+            by_job[jid] = {"job_id": jid, "calls": 0, "cost_usd": 0.0, "duration_sec": dur}
 
     steps = []
     for step_name, data in by_step.items():
@@ -1369,10 +1401,11 @@ async def admin_book_cost_details(book_id: str, days: int = 0) -> dict:
             reverse=True,
         )
         steps.append({
-            "step": step_name,
-            "calls": data["calls"],
-            "cost_usd": round(data["cost_usd"], 6),
-            "models": model_list,
+            "step":         step_name,
+            "calls":        data["calls"],
+            "cost_usd":     round(data["cost_usd"], 6),
+            "duration_sec": step_duration.get(step_name, 0),
+            "models":       model_list,
         })
     steps.sort(key=lambda x: x["cost_usd"], reverse=True)
 
@@ -1382,12 +1415,15 @@ async def admin_book_cost_details(book_id: str, days: int = 0) -> dict:
         reverse=True,
     )
 
+    total_duration_sec = sum(step_duration.values())
+
     return {
-        "book_id":       book_id,
-        "total_cost_usd": round(total_cost, 6),
-        "total_calls":   total_calls,
-        "steps":         steps,
-        "jobs":          jobs_out,
+        "book_id":            book_id,
+        "total_cost_usd":     round(total_cost, 6),
+        "total_calls":        total_calls,
+        "total_duration_sec": total_duration_sec,
+        "steps":              steps,
+        "jobs":               jobs_out,
     }
 
 
