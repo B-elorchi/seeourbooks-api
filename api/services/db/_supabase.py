@@ -120,6 +120,13 @@ def _build_path(table: str, filters: dict | None, select: str, order: str | None
                     parts.append(f"{col}=in.({joined})")
                 else:
                     parts.append(f"{col}={op}.{_enc(raw)}")
+            elif isinstance(val, tuple) and val[0] == "is":
+                # ("is", None) → is.null ; ("is", True/False) → is.true/false
+                token = "null" if val[1] is None else str(val[1]).lower()
+                parts.append(f"{col}=is.{token}")
+            elif isinstance(val, tuple) and val[0] == "not_is":
+                token = "null" if val[1] is None else str(val[1]).lower()
+                parts.append(f"{col}=not.is.{token}")
             else:
                 parts.append(f"{col}=eq.{_enc(val)}")
 

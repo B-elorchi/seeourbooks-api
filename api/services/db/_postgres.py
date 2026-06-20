@@ -79,6 +79,11 @@ def _build_where(filters: dict | None) -> tuple[str, list]:
             placeholders = ", ".join(f"${len(values) + i + 1}" for i in range(len(val[1])))
             clauses.append(f"{col} IN ({placeholders})")
             values.extend(val[1])
+        elif isinstance(val, tuple) and val[0] == "is":
+            # ("is", None) → IS NULL ; ("is", True/False) → IS TRUE/FALSE
+            clauses.append(f"{col} IS NULL" if val[1] is None else f"{col} IS {val[1]}")
+        elif isinstance(val, tuple) and val[0] == "not_is":
+            clauses.append(f"{col} IS NOT NULL" if val[1] is None else f"{col} IS NOT {val[1]}")
         elif isinstance(val, tuple) and val[0] in _SQL_OPS:
             clauses.append(f"{col} {_SQL_OPS[val[0]]} ${len(values) + 1}")
             values.append(val[1])

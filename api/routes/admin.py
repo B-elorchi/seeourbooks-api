@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from api.auth import require_admin
 from api.services.config.runtime import get_all_config, set_config_key, refresh_config_cache, get_config_value
 from api.services.db import find, insert, upsert, update
-from api.jobs.store import get_job, get_output, reset_for_manual_retry, delete_job, timeout_stuck_jobs, can_retry
+from api.jobs.store import get_job, get_output, reset_for_manual_retry, delete_job, timeout_stuck_jobs, can_retry, create_job
 from api.models.requests import PipelineReq
 from api.services.pipeline.cover import _build_prompt
 from api.services.openrouter_keys import openrouter_key_has_credits, reset_openrouter_keys
@@ -1827,6 +1827,134 @@ async def admin_skip_steps(job_id: str, body: SkipStepsRequest) -> dict:
         "status":     new_status,
         "status_url": f"/api/pipeline/status/{job_id}",
     }
+
+
+# ── Batch operations ─────────────────────────────────────────────────────────
+
+_SUMMARY_NULL_SENTINELS = {"", "null", "none", "nil", "n/a", "na", "undefined"}
+
+
+def _summary_present(value) -> bool:
+    """True if a summary column holds real text (not empty / a null sentinel)."""
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and value.strip().lower() not in _SUMMARY_NULL_SENTINELS
+    )
+
+
+@router.post("/batch/backfill-arabic", status_code=200)
+async def admin_batch_backfill_arabic(
+    background_tasks: BackgroundTasks,
+    limit: int = 100,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Find catalog books that HAVE an English summary but NO Arabic one and launch
+    translation + Arabic full-summary audio for each.
+
+    Reuses the stored English summary — no re-summarization. Each job runs only
+    steps=["translate", "audio_full_translate"], so the existing EN summary is
+    translated to Arabic and an Arabic audiobook is generated.
+
+    - limit:   max books to enqueue per call (default 100). Repeat for more.
+    - dry_run: return the candidate count/list without enqueuing anything.
+    """
+    from api.routes.pipeline import _run_job  # noqa: PLC0415
+
+    limit = min(max(limit, 1), 1000)
+    try:
+        # Server-side narrow to books with no Arabic v2 summary; the EN-present
+        # and Arabic-v1-absent checks are done in Python (an OR across columns).
+        rows = await find(
+            "books",
+            filters={"arabic_summary_v2": ("is", None)},
+            select="book_id, summary_english, summary_en_10min, arabic_summary",
+            limit=limit * 5,  # over-fetch; most rows get filtered out below
+        )
+    except Exception as exc:
+        raise HTTPException(503, f"Could not query books: {exc}") from exc
+
+    candidates: list[str] = []
+    for r in rows:
+        has_en = _summary_present(r.get("summary_english")) or _summary_present(r.get("summary_en_10min"))
+        has_ar = _summary_present(r.get("arabic_summary"))  # v2 already null via filter
+        if has_en and not has_ar and r.get("book_id") is not None:
+            candidates.append(str(r["book_id"]))
+        if len(candidates) >= limit:
+            break
+
+    if dry_run:
+        return {"ok": True, "dry_run": True, "candidates": len(candidates), "book_ids": candidates}
+
+    await refresh_config_cache()  # pick up current step/model settings
+    enqueued: list[str] = []
+    for book_id in candidates:
+        try:
+            req = PipelineReq(
+                book_id=book_id, language="en", source="catalog",
+                steps=["translate", "audio_full_translate"],
+            )
+            job_id = await create_job(book_id, req.model_dump())
+            background_tasks.add_task(_run_job, job_id, req, None, True)
+            enqueued.append(job_id)
+        except Exception as exc:
+            log.warning("backfill-arabic: could not enqueue book %s: %s", book_id, exc)
+
+    return {"ok": True, "enqueued": len(enqueued), "candidates": len(candidates), "job_ids": enqueued}
+
+
+@router.post("/batch/regen-partial", status_code=200)
+async def admin_batch_regen_partial(
+    background_tasks: BackgroundTasks,
+    limit: int = 200,
+    force: bool = False,
+) -> dict:
+    """
+    Re-run every job currently stuck in 'partial' status.
+
+    For each partial job, re-runs its incomplete steps (anything not 'done').
+    Pass force=true to regenerate ALL steps including the done ones. Done steps
+    are reused (merge-aware) so completed work is never wasted.
+
+    - limit: max partial jobs to process per call (default 200).
+    """
+    from api.routes.pipeline import _run_job  # noqa: PLC0415
+
+    limit = min(max(limit, 1), 1000)
+    try:
+        jobs = await find(
+            "pipeline_jobs",
+            filters={"status": "partial"},
+            select="id, input, result",
+            order="created_at DESC",
+            limit=limit,
+        )
+    except Exception as exc:
+        raise HTTPException(503, f"Could not query jobs: {exc}") from exc
+
+    await refresh_config_cache()  # reruns pick up current step/model settings
+    enqueued: list[str] = []
+    for job in jobs:
+        job_id    = job.get("id")
+        raw_input = job.get("input")
+        if not job_id or not raw_input:
+            continue
+        result    = job.get("result") if isinstance(job.get("result"), dict) else {}
+        steps_map = result.get("steps") or {}
+        all_steps = list(steps_map.keys())
+        steps_to_run = all_steps if force else [s for s in all_steps if steps_map.get(s) != "done"]
+        if not steps_to_run:
+            continue
+        try:
+            req = PipelineReq.model_validate(raw_input).model_copy(update={"steps": steps_to_run})
+            await reset_for_manual_retry(job_id)
+            background_tasks.add_task(_run_job, job_id, req, result or None, True)
+            enqueued.append(job_id)
+        except Exception as exc:
+            log.warning("regen-partial: could not enqueue job %s: %s", job_id, exc)
+
+    return {"ok": True, "enqueued": len(enqueued)}
 
 
 @router.delete("/jobs/{job_id}", status_code=200)
