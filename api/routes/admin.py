@@ -448,7 +448,8 @@ async def _run_ingest(
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
-                log.warning("chunk[%d] insert failed: %s", idx, exc)
+                detail = str(exc).strip() or repr(exc)
+                log.warning("chunk[%d] insert failed: %s: %s", idx, type(exc).__name__, detail)
 
         if saved == 0:
             _set("error", error=f"No chunks could be saved. DB error: {first_error}")

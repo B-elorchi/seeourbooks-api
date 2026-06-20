@@ -550,7 +550,15 @@ async def _save_chunks(
             await insert("chunks", _row(idx, chunks[idx]))
             saved += 1
         except Exception as exc:
-            log.warning("v2: chunk[%d] insert failed: %s", idx, exc)
+            detail = str(exc).strip() or repr(exc)
+            log.warning("v2: chunk[%d] insert failed: %s: %s", idx, type(exc).__name__, detail)
+
+    if saved < total:
+        log.warning(
+            "v2: book %s saved only %d/%d chunks — %d failed; summary will be built "
+            "from incomplete content and may score low on coverage",
+            book_id, saved, total, total - saved,
+        )
 
     return saved
 
