@@ -94,8 +94,8 @@
 # # Override per deployment via TTS_MAX_CHARS_GEMINI / TTS_MAX_CHARS_GEMINI_AR.
 # # If audio is CUT SHORT → decrease. If you want fewer chunks → increase carefully.
 # # ═══════════════════════════════════════════════════════════════════════════════
-# _GEMINI_MAX_CHARS    = 3800   # English / Latin scripts
-# _GEMINI_MAX_CHARS_AR = 3200   # Arabic
+_GEMINI_MAX_CHARS    = 2500   # English / Latin — Gemini silently truncates beyond ~1:40 per call
+_GEMINI_MAX_CHARS_AR = 2200   # Arabic with tashkeel — denser tokens, stay safely under limit
 
 
 # def _is_english_only_voice(voice: str) -> bool:
