@@ -239,15 +239,27 @@ def _repair_truncated_json(text: str) -> str | None:
     return candidate + ''.join(reversed(stack))
 
 
+_TRAILING_COMMA_RE = re.compile(r',(\s*[}\]])')
+
+
+def _strip_trailing_commas(text: str) -> str:
+    """Remove trailing commas before } or ] — standard LLM JSON sloppiness."""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _TRAILING_COMMA_RE.sub(r'\1', text)
+    return text
+
+
 def _parse_json_mindmap(raw: str) -> dict:
     """
     Robustly parse a JSON mind map from an LLM response.
 
-    Handles the common failure modes that caused
-    'Expecting value: line 1 column 1 (char 0)':
+    Handles the common failure modes:
       • empty / whitespace-only responses
       • ```json ... ``` markdown fences
-      • leading prose before the JSON object ("Here is the mind map: { ... }")
+      • leading prose before the JSON object
+      • trailing commas (LLMs add these constantly — Python json rejects them)
       • truncated JSON (incomplete due to max_tokens cutoff)
     """
     raw = (raw or "").strip()
@@ -257,47 +269,53 @@ def _parse_json_mindmap(raw: str) -> dict:
     # Strip markdown fences (```json ... ``` or ``` ... ```)
     if raw.startswith("```"):
         lines = raw.split("\n")
-        lines = lines[1:]                      # drop opening fence (``` or ```json)
+        lines = lines[1:]
         if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]                 # drop closing fence
+            lines = lines[:-1]
         raw = "\n".join(lines).strip()
 
-    # Try parsing as-is first
-    try:
-        return json_module.loads(raw)
-    except json_module.JSONDecodeError:
-        pass
+    def _try_parse(text: str) -> dict | None:
+        """Attempt json.loads, then retry after stripping trailing commas."""
+        try:
+            return json_module.loads(text)
+        except json_module.JSONDecodeError:
+            pass
+        cleaned = _strip_trailing_commas(text)
+        if cleaned != text:
+            try:
+                return json_module.loads(cleaned)
+            except json_module.JSONDecodeError:
+                pass
+        return None
 
-    # Fallback 1: extract the outermost { ... } object from surrounding prose.
+    # Pass 1: raw response as-is
+    result = _try_parse(raw)
+    if result is not None:
+        return result
+
+    # Pass 2: extract the outermost { ... } object (strips surrounding prose)
     start = raw.find("{")
     end   = raw.rfind("}")
     if start != -1 and end != -1 and end > start:
         candidate = raw[start:end + 1]
-        try:
-            return json_module.loads(candidate)
-        except json_module.JSONDecodeError:
-            pass  # Try repair next
-    
-    # Fallback 2: try to repair truncated JSON
+        result = _try_parse(candidate)
+        if result is not None:
+            return result
+
+    # Pass 3: repair truncated JSON (bracket-mismatch / cutoff mid-token)
     if start != -1:
-        # Extract from first { to end
-        candidate = raw[start:]
-        repaired = _repair_truncated_json(candidate)
+        repaired = _repair_truncated_json(raw[start:])
         if repaired:
-            try:
-                result = json_module.loads(repaired)
+            result = _try_parse(repaired)
+            if result is not None:
                 log.info("Successfully repaired truncated JSON mindmap")
                 return result
-            except json_module.JSONDecodeError:
-                pass
-    
-    # Final error with helpful context
+
     if start == -1:
         raise ValueError(
             f"mind map response contained no JSON object. First 200 chars: {raw[:200]!r}"
         )
-    
-    # Show what we tried to parse
+
     candidate = raw[start:end + 1] if end > start else raw[start:]
     raise ValueError(
         f"mind map response was not valid JSON (tried repair). "

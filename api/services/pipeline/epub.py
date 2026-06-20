@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import io
 import logging
 import re
 import warnings
+import zipfile
 from html import escape
 from pathlib import Path
 from urllib.parse import quote
@@ -408,6 +410,77 @@ def _build_chapter_insights(
     return item
 
 
+# ── EPUB loading helpers ──────────────────────────────────────────────────────
+
+def _read_epub_patched(epub_path: str, original_exc: Exception):
+    """
+    Fallback reader: when ebooklib fails because the zip has manifest entries
+    pointing to files that don't exist (e.g. a font that was deleted from the
+    archive), rebuild the zip in-memory with those items removed from
+    content.opf, then re-read with ebooklib.
+
+    Returns an EpubBook on success, or None if the patched zip also fails.
+    """
+    try:
+        with zipfile.ZipFile(epub_path, "r") as zin:
+            names_in_zip = set(zin.namelist())
+
+            # Find and patch the OPF manifest to remove missing items
+            opf_name: str | None = None
+            for name in names_in_zip:
+                if name.endswith(".opf"):
+                    opf_name = name
+                    break
+
+            if opf_name is None:
+                return None
+
+            opf_bytes = zin.read(opf_name)
+            # Remove <item> elements whose href points to a missing file.
+            # The href may be relative to the OPF directory.
+            opf_dir = opf_name.rsplit("/", 1)[0] + "/" if "/" in opf_name else ""
+            def _item_missing(m: re.Match) -> str:
+                tag = m.group(0)
+                href_m = re.search(r'href=["\']([^"\']+)["\']', tag)
+                if not href_m:
+                    return tag
+                href = href_m.group(1)
+                full = opf_dir + href if not href.startswith("/") else href.lstrip("/")
+                return "" if full not in names_in_zip else tag
+
+            patched_opf = re.sub(
+                r'<item\b[^>]*/?>',
+                _item_missing,
+                opf_bytes.decode("utf-8", errors="replace"),
+            ).encode("utf-8")
+
+            # Rebuild zip in-memory with patched OPF
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+                for name in names_in_zip:
+                    if name == opf_name:
+                        zout.writestr(name, patched_opf)
+                    else:
+                        zout.writestr(name, zin.read(name))
+
+        buf.seek(0)
+        # Write patched bytes back to a temp path, then read with ebooklib
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".epub", delete=False) as tmp:
+            tmp.write(buf.read())
+            tmp_path = tmp.name
+        try:
+            from ebooklib import epub as _epub
+            book = _epub.read_epub(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+        return book
+
+    except Exception as patch_exc:
+        log.warning("EPUB manifest patch also failed (%s) — will build from scratch", patch_exc)
+        return None
+
+
 # ── Synchronous ebooklib worker ───────────────────────────────────────────────
 
 def _inject_sync(
@@ -452,8 +525,17 @@ def _inject_sync(
             from_scratch = False
             log.info("Loaded source EPUB: %s", epub_path)
         except Exception as exc:
-            log.warning("Could not parse source EPUB (%s) — creating from scratch", exc)
-            book = epub.EpubBook()
+            # Some EPUBs have manifest entries for files not present in the zip
+            # (e.g. a font referenced in content.opf but missing from the archive).
+            # ebooklib hard-fails on these. Patch: rebuild the zip without the
+            # missing items and re-read, so we keep all real content.
+            book = _read_epub_patched(epub_path, exc)
+            if book is not None:
+                from_scratch = False
+                log.info("Loaded source EPUB after patching missing manifest items: %s", epub_path)
+            else:
+                log.warning("Could not parse source EPUB (%s) — creating from scratch", exc)
+                book = epub.EpubBook()
     else:
         book = epub.EpubBook()
 
