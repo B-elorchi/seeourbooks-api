@@ -413,39 +413,51 @@ async def _ingest_book(
     is_epub:   bool  = False
     tried:     list[str] = []
 
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+    # Mimic a browser User-Agent — some CDNs (including nginx-based file servers)
+    # return 403 or a redirect-to-error-page for the default python-httpx agent.
+    _HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+
+    async with httpx.AsyncClient(timeout=300, follow_redirects=True, headers=_HEADERS) as client:
         for url in epub_candidates:
             tried.append(url)
             try:
                 r = await client.get(url)
-                if r.status_code == 200 and len(r.content) > 1000:
+                # Accept 200 OK and 206 Partial Content (range response from some CDNs)
+                if r.status_code in (200, 206) and len(r.content) > 1000:
                     raw_bytes, used_url, is_epub = r.content, url, True
                     log.info("v2: downloaded EPUB for %s from %s (%d B)", book_id, url, len(raw_bytes))
                     break
-                log.debug("v2: EPUB %s → HTTP %s", url, r.status_code)
+                log.warning("v2: EPUB %s → HTTP %s (skipping)", url, r.status_code)
             except Exception as exc:
-                log.debug("v2: EPUB %s failed: %s", url, exc)
+                log.warning("v2: EPUB %s failed: %s", url, exc)
 
         if not raw_bytes:
             for url in txt_candidates:
                 tried.append(url)
                 try:
                     r = await client.get(url)
-                    if r.status_code == 200 and len(r.content) > 500:
+                    if r.status_code in (200, 206) and len(r.content) > 500:
                         raw_bytes, used_url, is_epub = r.content, url, False
                         log.info("v2: downloaded TXT for %s from %s (%d B)", book_id, url, len(raw_bytes))
                         break
-                    log.debug("v2: TXT %s → HTTP %s", url, r.status_code)
+                    log.warning("v2: TXT %s → HTTP %s (skipping)", url, r.status_code)
                 except Exception as exc:
-                    log.debug("v2: TXT %s failed: %s", url, exc)
+                    log.warning("v2: TXT %s failed: %s", url, exc)
 
     if not raw_bytes:
         raise HTTPException(
             404,
             f"No source file found for book {book_id!r} (language={language!r}). "
             f"Tried: {tried}. "
-            "The book is not in the database and its EPUB/TXT could not be downloaded "
-            "from the CDN. Check the book id and language, or upload the file first."
+            "The file could not be downloaded from the CDN — check the server logs "
+            "for the HTTP status code returned for each URL."
         )
 
     # ── Extract text + metadata ───────────────────────────────────────────────

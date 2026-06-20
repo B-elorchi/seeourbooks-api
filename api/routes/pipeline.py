@@ -356,10 +356,10 @@ async def pipeline_output(book_id: str):
 
 
 @router.get("/jobs")
-async def pipeline_jobs(limit: int = 50):
-    """List all pipeline jobs (newest first)."""
+async def pipeline_jobs(limit: int = 50, offset: int = 0, status: str | None = None):
+    """List pipeline jobs (newest first). status filter searches the full table."""
     try:
-        return await list_jobs(limit=limit)
+        return await list_jobs(limit=limit, offset=offset, status=status or None)
     except Exception as exc:
         import logging as _log
         _log.getLogger(__name__).warning("pipeline_jobs: DB unreachable — %s", exc)

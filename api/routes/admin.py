@@ -366,27 +366,37 @@ async def _run_ingest(
         used_url:  str   = ""
         is_epub:   bool  = False
 
-        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        _CDN_HEADERS = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+        }
+        async with httpx.AsyncClient(timeout=300, follow_redirects=True, headers=_CDN_HEADERS) as client:
             for url in epub_candidates:
                 try:
                     resp = await client.get(url)
-                    if resp.status_code == 200 and len(resp.content) > 1000:
+                    if resp.status_code in (200, 206) and len(resp.content) > 1000:
                         raw_bytes, used_url, is_epub = resp.content, url, True
                         log.info("Ingest %s: downloaded EPUB from %s (%d bytes)", book_id, url, len(raw_bytes))
                         break
+                    log.warning("Ingest %s: EPUB %s → HTTP %s", book_id, url, resp.status_code)
                 except Exception as exc:
-                    log.debug("EPUB candidate %s failed: %s", url, exc)
+                    log.warning("Ingest %s: EPUB %s failed: %s", book_id, url, exc)
 
             if not raw_bytes:
                 for url in txt_candidates:
                     try:
                         resp = await client.get(url)
-                        if resp.status_code == 200 and len(resp.content) > 500:
+                        if resp.status_code in (200, 206) and len(resp.content) > 500:
                             raw_bytes, used_url, is_epub = resp.content, url, False
                             log.info("Ingest %s: downloaded TXT from %s (%d bytes)", book_id, url, len(raw_bytes))
                             break
+                        log.warning("Ingest %s: TXT %s → HTTP %s", book_id, url, resp.status_code)
                     except Exception as exc:
-                        log.debug("TXT candidate %s failed: %s", url, exc)
+                        log.warning("Ingest %s: TXT %s failed: %s", book_id, url, exc)
 
         if not raw_bytes:
             _set("error", error=f"Could not download from any URL. Tried EPUB: {epub_candidates}, TXT: {txt_candidates}")

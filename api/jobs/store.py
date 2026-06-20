@@ -142,8 +142,62 @@ async def get_output(book_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
-async def list_jobs(limit: int = 50) -> list[dict]:
-    return await find("pipeline_jobs", order="created_at DESC", limit=limit)
+async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None) -> list[dict]:
+    """
+    Return a lightweight job list — only the columns needed by the sidebar.
+    On Postgres: extracts result->'metadata' (title, author) instead of the
+    full multi-MB result JSONB, making pagination fast even on large datasets.
+
+    status filter values (mapped to DB columns):
+      "running"  → status IN ('running', 'queued')
+      "done"     → status = 'done'
+      "failed"   → status IN ('failed', 'partial', 'cancelled')
+      None / "all" → no filter (paginated)
+    """
+    from api.config.settings import settings
+    # When a status filter is active fetch up to 2000 rows (all matching).
+    # Pagination is disabled server-side so the client sees the full filtered set.
+    if status and status != "all":
+        limit = 2000
+        offset = 0
+    else:
+        limit = min(max(limit, 1), 500)
+        offset = max(offset, 0)
+
+    _STATUS_CLAUSES: dict[str, str] = {
+        "running": "status IN ('running', 'queued')",
+        "done":    "status = 'done'",
+        "failed":  "status IN ('failed', 'partial', 'cancelled')",
+    }
+    where = _STATUS_CLAUSES.get(status or "", "") if status else ""
+
+    if settings.DB_BACKEND == "postgres":
+        from api.services.db._postgres import _pool_or_raise
+        where_clause = f"WHERE {where}" if where else ""
+        sql = f"""
+            SELECT id, book_id, status, created_at, input,
+                   result->'metadata' AS metadata
+            FROM pipeline_jobs
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+        """
+        async with _pool_or_raise().acquire() as conn:
+            rows = await conn.fetch(sql, limit, offset)
+        return [dict(r) for r in rows]
+
+    # Supabase fallback
+    filters = {}
+    if where:
+        # Map simplified status labels to Supabase filter format
+        if status == "running":
+            filters["status"] = ("in", ["running", "queued"])
+        elif status == "done":
+            filters["status"] = "done"
+        elif status == "failed":
+            filters["status"] = ("in", ["failed", "partial", "cancelled"])
+    return await find("pipeline_jobs", filters=filters or None, order="created_at DESC",
+                      limit=limit, offset=offset or None)
 
 
 async def delete_job(job_id: str) -> None:

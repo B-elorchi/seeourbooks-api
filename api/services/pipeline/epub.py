@@ -225,18 +225,28 @@ def _epub_source_url(book_id: str, language: str) -> str:
 
 # ── Public: fetch source EPUB ─────────────────────────────────────────────────
 
+_CDN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+}
+
+
 async def fetch_epub(book_id: str, language: str, output_path: str) -> str:
     url = _epub_source_url(book_id, language)
     log.info("Fetching EPUB from %s", url)
     try:
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=300, follow_redirects=True, headers=_CDN_HEADERS) as client:
             r = await client.get(url)
     except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError) as exc:
         raise EpubNotAvailableError(f"EPUB host unreachable for {url}: {exc}") from exc
 
     if r.status_code == 404:
         raise EpubNotAvailableError(f"source EPUB not found at {url} (404)")
-    if r.status_code != 200:
+    if r.status_code not in (200, 206):
         raise EpubNotAvailableError(f"EPUB host returned {r.status_code} for {url}")
     if not r.content or len(r.content) < 100:
         raise EpubNotAvailableError(f"empty response body from {url}")
