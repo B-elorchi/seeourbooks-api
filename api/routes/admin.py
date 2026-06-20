@@ -54,6 +54,10 @@ class RerunRequest(BaseModel):
     steps: list[str]  # e.g. ["audio_full", "cover"]
 
 
+class SkipStepsRequest(BaseModel):
+    steps: list[str]  # steps to mark as "skipped"
+
+
 class BookUpsertRequest(BaseModel):
     book_id:     str
     title:       str | None = None   # auto-fetched from Gutenberg when omitted + book_id is numeric
@@ -1735,6 +1739,93 @@ async def admin_rerun_steps(
         "rerun_steps":  steps_to_run,
         "skipped_done": skipped_done,
         "status_url":   f"/api/pipeline/status/{job_id}",
+    }
+
+
+@router.post("/jobs/{job_id}/skip-steps", status_code=200)
+async def admin_skip_steps(job_id: str, body: SkipStepsRequest) -> dict:
+    """
+    Mark specific steps as 'skipped' for a job and recompute the overall status.
+
+    Use this when an optional step failed for a reason you don't want to fix
+    (e.g. per-chapter mindmaps hit a 402 'insufficient credits') and you just
+    want the book to count as done without rerunning anything. Only 'failed'
+    steps block a 'done' status, so skipping the failed steps flips a stuck
+    'partial'/'failed' job to 'done'. The skipped steps' errors are cleared.
+    """
+    from api.models.requests import VALID_STEPS  # noqa: PLC0415
+
+    if not body.steps:
+        raise HTTPException(422, "steps list must not be empty")
+    unknown = [s for s in body.steps if s not in VALID_STEPS]
+    if unknown:
+        raise HTTPException(422, f"Unknown step(s): {unknown}. Valid: {sorted(VALID_STEPS)}")
+
+    try:
+        job = await get_job(job_id)
+    except Exception as exc:
+        raise HTTPException(503, f"Database unreachable: {exc}") from exc
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
+
+    result = job.get("result")
+    if not isinstance(result, dict):
+        raise HTTPException(422, "Job has no structured result to modify — rerun it instead")
+
+    steps_map = dict(result.get("steps") or {})
+    errors    = dict(result.get("errors") or {})
+
+    for s in body.steps:
+        steps_map[s] = "skipped"
+        # Drop error entries tied to this step (e.g. "mindmap_chapter_5_ar").
+        for k in [k for k in errors if k == s or k.startswith(f"{s}_")]:
+            errors.pop(k, None)
+
+    # Recompute overall status — only 'failed' steps block 'done'
+    # (mirrors the orchestrator's final-status logic).
+    statuses = list(steps_map.values())
+    failed   = sum(1 for v in statuses if v == "failed")
+    if failed == 0:
+        new_status = "done"
+    elif failed == len(statuses):
+        new_status = "failed"
+    else:
+        new_status = "partial"
+
+    result["steps"]  = steps_map
+    result["errors"] = errors
+    result["status"] = new_status
+
+    patch: dict = {"status": new_status, "result": result}
+    if new_status == "done":
+        patch["error_msg"] = None
+    await update("pipeline_jobs", {"id": job_id}, patch)
+
+    # Keep the per-step results table consistent (drives the cost/detail view).
+    for s in body.steps:
+        try:
+            await update("pipeline_step_results", {"job_id": job_id, "step": s},
+                         {"status": "skipped", "error_msg": None})
+        except Exception:
+            pass  # best-effort
+
+    # Mirror to the books table so the public site reflects completion.
+    try:
+        from api.services.pipeline.orchestrator import _persist_book_details  # noqa: PLC0415
+        book_id = str(job.get("book_id") or result.get("book_id") or "")
+        if book_id:
+            await _persist_book_details(
+                book_id, {"status": "complete" if new_status == "done" else new_status},
+            )
+    except Exception as exc:
+        log.warning("skip-steps: could not update books table for %s: %s", job_id, exc)
+
+    return {
+        "ok":         True,
+        "job_id":     job_id,
+        "skipped":    body.steps,
+        "status":     new_status,
+        "status_url": f"/api/pipeline/status/{job_id}",
     }
 
 
