@@ -1017,7 +1017,9 @@ async def run_pipeline(
         "cover":                      (cfg.get("PIPELINE_STEP_COVER", "true") == "true") and cover_enabled,
         "alt_text":                   (cfg.get("PIPELINE_STEP_ALTTEXT", "true") == "true") and alttext_enabled,
         "mindmap":                    (cfg.get("PIPELINE_STEP_MINDMAP", "true") == "true") and mindmap_enabled,
-        "mindmap_chapters":           (cfg.get("PIPELINE_STEP_MINDMAP", "true") == "true") and mindmap_enabled,
+        # Per-chapter mindmaps have their own toggle so they can be turned off
+        # independently of the full-book mindmap (defaults to on for back-compat).
+        "mindmap_chapters":           (cfg.get("PIPELINE_STEP_MINDMAP_CHAPTERS", "true") == "true") and mindmap_enabled,
         "mindmap_translate":          (cfg.get("PIPELINE_STEP_MINDMAP_TRANSLATE", "true") == "true") and mindmap_enabled,
         "mindmap_chapters_translate": (cfg.get("PIPELINE_STEP_MINDMAP_CHAPTERS_TRANSLATE", "true") == "true") and mindmap_enabled,
         "inject_epub":                (cfg.get("PIPELINE_STEP_INJECT_EPUB", "true") == "true") and epub_enabled,

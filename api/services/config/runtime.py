@@ -211,6 +211,7 @@ def _defaults() -> dict[str, str]:
         "PIPELINE_STEP_AUDIO_CHAPTERS":           "true",
         "PIPELINE_STEP_AUDIO_FULL_TRANSLATE":     "true",
         "PIPELINE_STEP_AUDIO_CHAPTERS_TRANSLATE": "true",
+        "PIPELINE_STEP_MINDMAP_CHAPTERS":         "true",
         "PIPELINE_STEP_MINDMAP_TRANSLATE":        "true",
         "PIPELINE_STEP_MINDMAP_CHAPTERS_TRANSLATE": "true",
         # NOTE: audio/mindmap source steps also honour PIPELINE_STEP_TTS / PIPELINE_STEP_MINDMAP.
