@@ -175,8 +175,11 @@ async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None)
         from api.services.db._postgres import _pool_or_raise
         where_clause = f"WHERE {where}" if where else ""
         sql = f"""
-            SELECT id, book_id, status, created_at, input,
-                   result->'metadata' AS metadata
+            SELECT id, book_id, status, created_at, input, retry_count, max_retries,
+                   result->'metadata' AS metadata,
+                   result->'steps' AS steps,
+                   result->'current_step' AS current_step,
+                   result->'processing_time' AS processing_time
             FROM pipeline_jobs
             {where_clause}
             ORDER BY created_at DESC
@@ -184,20 +187,40 @@ async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None)
         """
         async with _pool_or_raise().acquire() as conn:
             rows = await conn.fetch(sql, limit, offset)
-        return [dict(r) for r in rows]
+        raw_rows = [dict(r) for r in rows]
+    else:
+        # Supabase fallback
+        filters = {}
+        if where:
+            # Map simplified status labels to Supabase filter format
+            if status == "running":
+                filters["status"] = ("in", ["running", "queued"])
+            elif status == "done":
+                filters["status"] = "done"
+            elif status == "failed":
+                filters["status"] = ("in", ["failed", "partial", "cancelled"])
+        
+        raw_rows = await find(
+            "pipeline_jobs",
+            filters=filters or None,
+            order="created_at DESC",
+            limit=limit,
+            offset=offset or None,
+            select="id, book_id, status, created_at, input, retry_count, max_retries, metadata:result->metadata, steps:result->steps, current_step:result->current_step, processing_time:result->processing_time"
+        )
 
-    # Supabase fallback
-    filters = {}
-    if where:
-        # Map simplified status labels to Supabase filter format
-        if status == "running":
-            filters["status"] = ("in", ["running", "queued"])
-        elif status == "done":
-            filters["status"] = "done"
-        elif status == "failed":
-            filters["status"] = ("in", ["failed", "partial", "cancelled"])
-    return await find("pipeline_jobs", filters=filters or None, order="created_at DESC",
-                      limit=limit, offset=offset or None)
+    # Reconstruct the "result" dictionary as expected by the frontend
+    res = []
+    for r in raw_rows:
+        d = dict(r)
+        d["result"] = {
+            "metadata": d.pop("metadata", None),
+            "steps": d.pop("steps", {}),
+            "current_step": d.pop("current_step", None),
+            "processing_time": d.pop("processing_time", None)
+        }
+        res.append(d)
+    return res
 
 
 async def delete_job(job_id: str) -> None:

@@ -38,6 +38,7 @@ import re
 import xml.etree.ElementTree as ET
 import zipfile
 from html.parser import HTMLParser
+import asyncio
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
@@ -54,6 +55,10 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v2/pipeline")
 
+# Global concurrency limit for top-level pipeline jobs.
+# Prevents a batch of 100 books from concurrently opening 100 DB connections
+# and hammering APIs during the initial download/ingest phase.
+_JOB_CONCURRENCY_SEM = asyncio.Semaphore(10)
 
 # ── Request model ─────────────────────────────────────────────────────────────
 
@@ -183,59 +188,60 @@ async def _ingest_then_run(
     ensure the book row exists, then hand off to the normal pipeline runner.
     Any ingest error is written to the job so the client can see it.
     """
-    # Flip the job to "running" right away with an "ingest" marker so the UI
-    # doesn't show it stuck in "queued" during the (potentially long) download +
-    # text-extraction + chunk-insert phase that happens before _run_job starts.
-    try:
-        await update(
-            "pipeline_jobs",
-            {"id": job_id},
-            {
-                "status": "running",
-                "result": {
-                    "book_id":      book_id,
-                    "status":       "running",
-                    "current_step": "ingest",
-                    "running_steps": ["ingest"],
-                    "steps":        {},
+    async with _JOB_CONCURRENCY_SEM:
+        # Flip the job to "running" right away with an "ingest" marker so the UI
+        # doesn't show it stuck in "queued" during the (potentially long) download +
+        # text-extraction + chunk-insert phase that happens before _run_job starts.
+        try:
+            await update(
+                "pipeline_jobs",
+                {"id": job_id},
+                {
+                    "status": "running",
+                    "result": {
+                        "book_id":      book_id,
+                        "status":       "running",
+                        "current_step": "ingest",
+                        "running_steps": ["ingest"],
+                        "steps":        {},
+                    },
                 },
-            },
+            )
+        except Exception as exc:
+            log.debug("v2: could not set ingest-running status for %s: %s", job_id, exc)
+
+        try:
+            ingest_status, _chunks, _meta, final_row = await _ensure_chunks(
+                book_id, bid, book_row, req.language
+            )
+            log.info("v2: ingest=%s for book %s — handing off to pipeline", ingest_status, book_id)
+        except HTTPException as exc:
+            # 404 (file not found) / 422 (bad file) / 502 (db) — record on the job.
+            await set_failed(job_id, f"ingest: {exc.detail}")
+            return
+        except Exception as exc:
+            log.exception("v2: ingest failed for book %s", book_id)
+            await set_failed(job_id, f"ingest: {exc}")
+            return
+
+        # Check for cancellation between ingest and pipeline phases.
+        if is_cancelled(job_id):
+            await set_cancelled(job_id)
+            return
+
+        # Hand off to the standard pipeline runner with resolved metadata.
+        pipeline_req = PipelineReq(
+            book_id=book_id,
+            title=final_row.get("title") or None,
+            author=final_row.get("author") or None,
+            language=req.language,
+            steps=req.steps,
+            source=req.source,
+            options=req.options,
         )
-    except Exception as exc:
-        log.debug("v2: could not set ingest-running status for %s: %s", job_id, exc)
-
-    try:
-        ingest_status, _chunks, _meta, final_row = await _ensure_chunks(
-            book_id, bid, book_row, req.language
-        )
-        log.info("v2: ingest=%s for book %s — handing off to pipeline", ingest_status, book_id)
-    except HTTPException as exc:
-        # 404 (file not found) / 422 (bad file) / 502 (db) — record on the job.
-        await set_failed(job_id, f"ingest: {exc.detail}")
-        return
-    except Exception as exc:
-        log.exception("v2: ingest failed for book %s", book_id)
-        await set_failed(job_id, f"ingest: {exc}")
-        return
-
-    # Check for cancellation between ingest and pipeline phases.
-    if is_cancelled(job_id):
-        await set_cancelled(job_id)
-        return
-
-    # Hand off to the standard pipeline runner with resolved metadata.
-    pipeline_req = PipelineReq(
-        book_id=book_id,
-        title=final_row.get("title") or None,
-        author=final_row.get("author") or None,
-        language=req.language,
-        steps=req.steps,
-        source=req.source,
-        options=req.options,
-    )
-    # force_steps=True: run exactly the steps the user selected (plus auto-added
-    # dependencies), don't auto-switch to retrying old failed steps.
-    await _run_job(job_id, pipeline_req, previous_result, True)
+        # force_steps=True: run exactly the steps the user selected (plus auto-added
+        # dependencies), don't auto-switch to retrying old failed steps.
+        await _run_job(job_id, pipeline_req, previous_result, True)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

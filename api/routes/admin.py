@@ -2073,13 +2073,17 @@ async def admin_retry_job(job_id: str, background_tasks: BackgroundTasks) -> dic
     # If the job already succeeded and there is nothing to retry, don't re-run
     # every step from scratch — that would waste credits and overwrite assets.
     if previous_result and not failed:
-        return {
-            "ok":            True,
-            "job_id":        job_id,
-            "status":        "skipped",
-            "retrying_steps": [],
-            "message":       "No failed / running / pending steps to retry. Use /admin/jobs/{job_id}/rerun to regenerate specific steps.",
-        }
+        if job.get("status") in ("failed", "cancelled"):
+            # Global failure before any specific steps were recorded
+            pass
+        else:
+            return {
+                "ok":            True,
+                "job_id":        job_id,
+                "status":        "skipped",
+                "retrying_steps": [],
+                "message":       "No failed / running / pending steps to retry. Use /admin/jobs/{job_id}/rerun to regenerate specific steps.",
+            }
 
     # Make sure the retry picks up any model/provider changes made in admin.
     await refresh_config_cache()
