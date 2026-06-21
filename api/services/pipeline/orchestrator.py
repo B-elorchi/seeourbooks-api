@@ -413,6 +413,22 @@ async def _persist_cover(
             log.debug("books.cover_status update failed for %s: %s", book_id, exc)
 
 
+async def _existing_cover_url(book_id: str) -> str | None:
+    """Return a previously-generated cover URL for this book, if one exists."""
+    if not book_id.isdigit():
+        return None
+    try:
+        rows = await find("covers", filters={"bookid": int(book_id)},
+                          select="coverurl", limit=1)
+        for r in rows:
+            url = r.get("coverurl")
+            if url:
+                return url
+    except Exception as exc:
+        log.debug("could not look up existing cover for %s: %s", book_id, exc)
+    return None
+
+
 async def _persist_audio(
     book_id: str,
     language: str,
@@ -1498,8 +1514,18 @@ async def run_pipeline(
             except JobCancelledError:
                 raise
             except Exception as e:
-                errors["cover"] = str(e)
-                step_status["cover"] = "failed"
+                # Generation failed (e.g. image-credit 402). If a cover already
+                # exists from a previous run, reuse it instead of failing the
+                # whole book — losing a good cover over a transient billing
+                # error is worse than keeping the one we have.
+                existing = await _existing_cover_url(req.book_id)
+                if existing:
+                    cover_url = existing
+                    step_status["cover"] = "done"
+                    log.warning("cover generation failed (%s) — reusing existing cover %s", e, existing)
+                else:
+                    errors["cover"] = str(e)
+                    step_status["cover"] = "failed"
             _t = round(time.time() - started)
             await _persist_step_result(job_id, "cover", step_status["cover"], output_url=cover_url, duration_sec=_t)
             if step_status["cover"] == "done":
