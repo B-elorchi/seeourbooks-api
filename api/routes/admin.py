@@ -1742,6 +1742,69 @@ async def admin_rerun_steps(
     }
 
 
+async def _mark_steps_skipped(job: dict, steps: list[str]) -> str | None:
+    """
+    Mark the given steps as 'skipped' on a job, clear their errors, recompute the
+    overall status (only 'failed' steps block 'done', mirroring the orchestrator),
+    and persist to pipeline_jobs / pipeline_step_results / books.
+
+    Returns the new overall status, or None if the job has no structured result.
+    Shared by the single skip endpoint and the batch force-complete endpoint.
+    """
+    job_id = job.get("id")
+    result = job.get("result")
+    if not job_id or not isinstance(result, dict):
+        return None
+
+    steps_map = dict(result.get("steps") or {})
+    errors    = dict(result.get("errors") or {})
+
+    for s in steps:
+        steps_map[s] = "skipped"
+        # Drop error entries tied to this step (e.g. "mindmap_chapter_5_ar").
+        for k in [k for k in errors if k == s or k.startswith(f"{s}_")]:
+            errors.pop(k, None)
+
+    statuses = list(steps_map.values())
+    failed   = sum(1 for v in statuses if v == "failed")
+    if failed == 0:
+        new_status = "done"
+    elif failed == len(statuses):
+        new_status = "failed"
+    else:
+        new_status = "partial"
+
+    result["steps"]  = steps_map
+    result["errors"] = errors
+    result["status"] = new_status
+
+    patch: dict = {"status": new_status, "result": result}
+    if new_status == "done":
+        patch["error_msg"] = None
+    await update("pipeline_jobs", {"id": job_id}, patch)
+
+    # Keep the per-step results table consistent (drives the cost/detail view).
+    for s in steps:
+        try:
+            await update("pipeline_step_results", {"job_id": job_id, "step": s},
+                         {"status": "skipped", "error_msg": None})
+        except Exception:
+            pass  # best-effort
+
+    # Mirror to the books table so the public site reflects completion.
+    try:
+        from api.services.pipeline.orchestrator import _persist_book_details  # noqa: PLC0415
+        book_id = str(job.get("book_id") or result.get("book_id") or "")
+        if book_id:
+            await _persist_book_details(
+                book_id, {"status": "complete" if new_status == "done" else new_status},
+            )
+    except Exception as exc:
+        log.warning("skip-steps: could not update books table for %s: %s", job_id, exc)
+
+    return new_status
+
+
 @router.post("/jobs/{job_id}/skip-steps", status_code=200)
 async def admin_skip_steps(job_id: str, body: SkipStepsRequest) -> dict:
     """
@@ -1768,57 +1831,9 @@ async def admin_skip_steps(job_id: str, body: SkipStepsRequest) -> dict:
     if not job:
         raise HTTPException(404, f"Job {job_id} not found")
 
-    result = job.get("result")
-    if not isinstance(result, dict):
+    new_status = await _mark_steps_skipped(job, body.steps)
+    if new_status is None:
         raise HTTPException(422, "Job has no structured result to modify — rerun it instead")
-
-    steps_map = dict(result.get("steps") or {})
-    errors    = dict(result.get("errors") or {})
-
-    for s in body.steps:
-        steps_map[s] = "skipped"
-        # Drop error entries tied to this step (e.g. "mindmap_chapter_5_ar").
-        for k in [k for k in errors if k == s or k.startswith(f"{s}_")]:
-            errors.pop(k, None)
-
-    # Recompute overall status — only 'failed' steps block 'done'
-    # (mirrors the orchestrator's final-status logic).
-    statuses = list(steps_map.values())
-    failed   = sum(1 for v in statuses if v == "failed")
-    if failed == 0:
-        new_status = "done"
-    elif failed == len(statuses):
-        new_status = "failed"
-    else:
-        new_status = "partial"
-
-    result["steps"]  = steps_map
-    result["errors"] = errors
-    result["status"] = new_status
-
-    patch: dict = {"status": new_status, "result": result}
-    if new_status == "done":
-        patch["error_msg"] = None
-    await update("pipeline_jobs", {"id": job_id}, patch)
-
-    # Keep the per-step results table consistent (drives the cost/detail view).
-    for s in body.steps:
-        try:
-            await update("pipeline_step_results", {"job_id": job_id, "step": s},
-                         {"status": "skipped", "error_msg": None})
-        except Exception:
-            pass  # best-effort
-
-    # Mirror to the books table so the public site reflects completion.
-    try:
-        from api.services.pipeline.orchestrator import _persist_book_details  # noqa: PLC0415
-        book_id = str(job.get("book_id") or result.get("book_id") or "")
-        if book_id:
-            await _persist_book_details(
-                book_id, {"status": "complete" if new_status == "done" else new_status},
-            )
-    except Exception as exc:
-        log.warning("skip-steps: could not update books table for %s: %s", job_id, exc)
 
     return {
         "ok":         True,
@@ -1955,6 +1970,53 @@ async def admin_batch_regen_partial(
             log.warning("regen-partial: could not enqueue job %s: %s", job_id, exc)
 
     return {"ok": True, "enqueued": len(enqueued)}
+
+
+@router.post("/batch/force-complete-partial", status_code=200)
+async def admin_batch_force_complete_partial(limit: int = 1000, dry_run: bool = False) -> dict:
+    """
+    Force every 'partial' job to 'done' by marking its incomplete steps as
+    'skipped' (no rerun, no model calls). For each partial job, all steps that
+    are not already 'done' are skipped, which — since only 'failed' steps block
+    'done' — flips the job to 'done' and its book to 'complete'.
+
+    Use this to clear out a backlog of partial books whose only missing pieces
+    are optional/expensive steps you don't intend to generate.
+
+    - limit:   max partial jobs to process per call (default 1000).
+    - dry_run: report how many would be affected without changing anything.
+    """
+    limit = min(max(limit, 1), 5000)
+    try:
+        jobs = await find(
+            "pipeline_jobs",
+            filters={"status": "partial"},
+            select="id, book_id, result",
+            order="created_at DESC",
+            limit=limit,
+        )
+    except Exception as exc:
+        raise HTTPException(503, f"Could not query jobs: {exc}") from exc
+
+    if dry_run:
+        return {"ok": True, "dry_run": True, "partial_jobs": len(jobs)}
+
+    completed: list[str] = []
+    for job in jobs:
+        result = job.get("result") if isinstance(job.get("result"), dict) else {}
+        steps_map = result.get("steps") or {}
+        # Skip everything that isn't already done (failed/partial/running/pending).
+        incomplete = [s for s, v in steps_map.items() if v != "done"]
+        if not incomplete:
+            continue
+        try:
+            new_status = await _mark_steps_skipped(job, incomplete)
+            if new_status == "done":
+                completed.append(job.get("id"))
+        except Exception as exc:
+            log.warning("force-complete-partial: could not update job %s: %s", job.get("id"), exc)
+
+    return {"ok": True, "completed": len(completed), "scanned": len(jobs)}
 
 
 @router.delete("/jobs/{job_id}", status_code=200)
