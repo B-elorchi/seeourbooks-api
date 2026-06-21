@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from api.auth import require_admin
 from api.services.config.runtime import get_all_config, set_config_key, refresh_config_cache, get_config_value
 from api.services.db import find, insert, upsert, update
-from api.jobs.store import get_job, get_output, reset_for_manual_retry, delete_job, timeout_stuck_jobs, can_retry, create_job
+from api.jobs.store import get_job, get_output, reset_for_manual_retry, delete_job, timeout_stuck_jobs, create_job
 from api.models.requests import PipelineReq
 from api.services.pipeline.cover import _build_prompt
 from api.services.openrouter_keys import openrouter_key_has_credits, reset_openrouter_keys
@@ -1501,8 +1501,13 @@ async def auto_retry_credit_failures(background_tasks: BackgroundTasks | None = 
     for job in failed:
         if not _looks_like_credit_failure(job):
             continue
-        if not can_retry(job):
-            continue
+        # NOTE: deliberately do NOT gate on can_retry() here. A job that failed
+        # repeatedly *while credits were out* will have exhausted its retry
+        # budget — but that is an external billing problem, not the job's fault.
+        # Once credits are back we must retry it regardless; reset_for_manual_retry
+        # below zeroes retry_count to give it a fresh 8 inline attempts anyway.
+        # (Gating on can_retry left credit-failed jobs permanently stuck even
+        # after the admin topped up credits.)
 
         job_id = job["id"]
         try:
