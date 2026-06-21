@@ -113,7 +113,7 @@ async def _auto_retry_credit_failures_loop() -> None:
 
 async def _auto_retry_stuck_jobs_loop() -> None:
     """
-    Background loop: every AUTO_RETRY_SWEEP_INTERVAL_MIN minutes (default 30),
+    Background loop: every AUTO_RETRY_SWEEP_INTERVAL_MIN minutes (default 15),
     sweep all jobs stuck in 'failed'/'partial' and re-dispatch their incomplete
     steps. Each job is retried at most a few times (see auto_retry_stuck_jobs)
     so genuinely-unfixable books don't loop forever.
@@ -127,9 +127,9 @@ async def _auto_retry_stuck_jobs_loop() -> None:
     while True:
         try:
             try:
-                interval = int(await get_config_value("AUTO_RETRY_SWEEP_INTERVAL_MIN", "30"))
+                interval = int(await get_config_value("AUTO_RETRY_SWEEP_INTERVAL_MIN", "15"))
             except (TypeError, ValueError):
-                interval = 30
+                interval = 15
             await asyncio.sleep(max(1, interval) * 60)
             retried = await auto_retry_stuck_jobs()
             if retried:
