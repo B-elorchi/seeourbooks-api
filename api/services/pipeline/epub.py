@@ -283,6 +283,8 @@ def _build_front_matter(
     author: str,
     summary_text: str,
     language: str,
+    translated_summary: str | None = None,
+    translated_lang: str | None = None,
     audio_url: str | None,
     mindmap_url: str | None,
 ) -> object:
@@ -299,6 +301,17 @@ def _build_front_matter(
         f'<p class="badge">{escape(badge_text)}</p>',
         f'<div class="summary-text">{_paragraphs_html(summary_text)}</div>',
     ]
+    
+    # ── Translated Summary ────────────────────────────────────────────────────
+    if translated_summary and translated_lang:
+        is_tr_arabic   = translated_lang.lower() == "ar"
+        tr_badge_text  = "ملخص (مترجم)" if is_tr_arabic else "Summary (Translated)"
+        body_parts.append(
+            f'<div style="margin-top:2em; padding-top:1em; border-top:1px solid #eee;">'
+            f'<p class="badge">{escape(tr_badge_text)}</p>'
+            f'<div class="summary-text">{_paragraphs_html(translated_summary)}</div>'
+            f'</div>'
+        )
 
     # ── Full audio ────────────────────────────────────────────────────────────
     if audio_url:
@@ -346,6 +359,7 @@ def _build_chapter_insights(
     slug: str,
     ch: dict,
     language: str,
+    translated_lang: str | None = None,
     chapter_audio: dict[int, str],
     chapter_mindmap: dict[int, dict],
 ) -> object | None:
@@ -377,6 +391,18 @@ def _build_chapter_insights(
         f'<div class="summary-text">{_paragraphs_html(ch_summary)}</div>',
         f'</div>',
     ]
+    
+    # Translated Summary
+    tr_summary = (ch.get("translated_summary") or "").strip()
+    if tr_summary and translated_lang:
+        is_tr_arabic   = translated_lang.lower() == "ar"
+        tr_sum_label   = "ملخص (مترجم)" if is_tr_arabic else "Summary (Translated)"
+        body_parts += [
+            f'<div class="asset-box">',
+            f'<h3>📝 {tr_sum_label}</h3>',
+            f'<div class="summary-text">{_paragraphs_html(tr_summary)}</div>',
+            f'</div>',
+        ]
 
     # Chapter audio
     audio_url = chapter_audio.get(idx)
@@ -501,6 +527,8 @@ def _inject_sync(
     author: str,
     summary_text: str,
     language: str,
+    translated_summary: str | None = None,
+    translated_lang: str | None = None,
     cover_path: str | None,
     chapters: list[dict] | None,
     chapter_audio: dict[int, str] | None,
@@ -612,6 +640,7 @@ def _inject_sync(
         epub,
         slug=slug, title=title, author=author,
         summary_text=summary_text, language=language,
+        translated_summary=translated_summary, translated_lang=translated_lang,
         audio_url=audio_url, mindmap_url=mindmap_url,
     )
     book.add_item(front_item)
@@ -628,8 +657,8 @@ def _inject_sync(
         item = _build_chapter_insights(
             epub,
             slug=slug, ch=ch, language=language,
-            chapter_audio=chapter_audio,
-            chapter_mindmap=chapter_mindmap,
+            translated_lang=translated_lang,
+            chapter_audio=chapter_audio, chapter_mindmap=chapter_mindmap,
         )
         if item:
             book.add_item(item)
@@ -834,6 +863,8 @@ async def inject_summary_into_epub(
     author:          str,
     summary_text:    str,
     language:        str,
+    translated_summary: str | None = None,
+    translated_lang: str | None = None,
     cover_path:      str | None = None,
     chapters:        list[dict] | None = None,
     chapter_audio:   dict[int, str] | None = None,
@@ -851,7 +882,8 @@ async def inject_summary_into_epub(
         _inject_sync,
         epub_path, output_path,
         title=title, author=author, summary_text=summary_text,
-        language=language, cover_path=cover_path,
+        language=language, translated_summary=translated_summary,
+        translated_lang=translated_lang, cover_path=cover_path,
         chapters=chapters, chapter_audio=chapter_audio,
         chapter_mindmap=chapter_mindmap,
         audio_url=audio_url, mindmap_url=mindmap_url,

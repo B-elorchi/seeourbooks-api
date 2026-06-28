@@ -1452,12 +1452,27 @@ async def run_pipeline(
         # Translating chapters costs O(N) model calls on large books (144 on a
         # 144-chapter book) while producing output that is rarely consumed — so
         # this is OFF by default and must be turned on deliberately.
+        translate_chapters_step_requested = "translate_chapters" in steps
         _needs_chapter_translations = translate_chapters_enabled and bool(
-            steps & {"audio_chapters_translate", "mindmap_chapters_translate"}
+            steps & {"translate_chapters", "audio_chapters_translate", "mindmap_chapters_translate"}
         )
-        if translate_step_requested and translated_summary and chapter_results and _needs_chapter_translations:
+        _tr_ch_already_done = (
+            "translate_chapters" not in forced_steps
+            and "summarize" not in steps
+            and "translate" not in steps
+            and bool(chapter_results) and all(ch.get("translated_summary") for ch in chapter_results)
+        )
+        if _tr_ch_already_done and translate_chapters_step_requested:
+            step_status["translate_chapters"] = "done"
+            log.info("translate_chapters already done — reusing existing (not forced)")
+            
+        if (translate_chapters_step_requested or _needs_chapter_translations) and translated_summary and chapter_results and not _tr_ch_already_done:
+            if translate_chapters_step_requested:
+                step_status["translate_chapters"] = "running"
+                set_step("translate_chapters")
+                await _checkpoint()
             try:
-                # Bound concurrency — firing one translate call per chapter all at
+                # Bound concurrency - firing one translate call per chapter all at
                 # once (200+ on a big book) hammers the provider's rate limit and
                 # the resulting 429 retry-storm can stall the step for many minutes.
                 tr_conc = max(1, int(cfg.get("TRANSLATE_CONCURRENCY", "8")))
@@ -2333,8 +2348,10 @@ async def run_pipeline(
                     out_path,
                     title            = req.title or req.book_id,
                     author           = req.author or "",
-                    summary_text     = full_summary,
-                    language         = req.language,
+                    summary_text       = full_summary,
+                    language           = req.language,
+                    translated_summary = translated_summary,
+                    translated_lang    = target_lang,
                     cover_path       = _cover_for_epub,
                     chapters         = chapter_results,
                     chapter_audio    = chapter_audio,
