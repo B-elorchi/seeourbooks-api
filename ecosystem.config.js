@@ -2,7 +2,7 @@ module.exports = {
 	apps: [
 		{
 			name: "seeourbooks-api",
-			script: "/usr/bin/uvicorn",
+			script: "/home/seeourbooks/seeourbooks-api/venv/bin/uvicorn",
 			args: "api.main:app --host 0.0.0.0 --port 8000",
 			cwd: "/home/seeourbooks/seeourbooks-api",
 			interpreter: "none",
@@ -16,7 +16,7 @@ module.exports = {
 		},
 		{
 			name: "seeourbooks-worker",
-			script: "/usr/local/bin/celery",
+			script: "/home/seeourbooks/seeourbooks-api/venv/bin/celery",
 			args: "-A api.celery_app worker --loglevel=info --concurrency=4",
 			cwd: "/home/seeourbooks/seeourbooks-api",
 			interpreter: "none",
