@@ -46,6 +46,10 @@ class Settings(BaseSettings):
 
     # ── OpenAI ────────────────────────────────────────────────────────────────
     OPENAI_API_KEY:    str = ""
+
+    # ── Cerebras ──────────────────────────────────────────────────────────────
+    CEREBRAS_API_KEY:  str = ""
+    
     # Legacy single-language model — kept as a fallback when the per-language
     # IMAGE_MODEL_{EN,AR} settings aren't configured in the admin panel yet.
     IMAGE_MODEL:       str = "google/gemini-2.5-flash-image"

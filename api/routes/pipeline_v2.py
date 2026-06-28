@@ -159,10 +159,9 @@ async def v2_pipeline_run(req: V2PipelineReq, background_tasks: BackgroundTasks,
         except Exception:
             pass
 
-    # Do everything heavy in the background: ingest (if needed) → run pipeline.
-    background_tasks.add_task(
-        _ingest_then_run, job_id, book_id, bid, book_row, req, previous_result,
-    )
+    # Do everything heavy in the background via Celery.
+    from api.jobs.tasks import run_pipeline_task
+    run_pipeline_task.delay(job_id, req.dict(), previous_result)
 
     return {
         "ok":         True,
@@ -250,9 +249,13 @@ async def _get_book_row(bid: object) -> dict | None:
     """Return the existing book row, or None if not in the DB. Never raises on 'not found'."""
     try:
         rows = await find("books", filters={"book_id": bid}, limit=1)
+        return rows[0] if rows else None
     except Exception as exc:
+        msg = str(exc).lower()
+        if "404" in msg or "not found" in msg or "403" in msg or "forbidden" in msg:
+            log.warning("v2: _get_book_row caught %s, assuming book not in DB.", msg)
+            return None
         raise HTTPException(502, f"DB read failed: {exc}") from exc
-    return rows[0] if rows else None
 
 
 def _is_placeholder_title(title: str | None, book_id: str) -> bool:

@@ -3,6 +3,7 @@ import logging
 from api.config.settings import settings
 from api.services.ai_client import chat_complete
 from api.services.db import find, upsert
+from api.services.db.redis_cache import get_chunk_summary_cache, set_chunk_summary_cache
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ async def run_haiku_pass(
 
     if max_words and max_words > 0:
         length_instr = f"in about {max_words} words"
-        max_tokens   = int(max_words * 2.5) + 100
+        max_tokens   = min(4096, int(max_words * 2.5) + 100)
     else:
         length_instr = "in 3-5 sentences"
         max_tokens   = 512
@@ -69,14 +70,9 @@ async def run_haiku_pass(
         content = (chunk.get("content") or "").strip()
         word_count = len(content.split())
 
-        existing = await find(
-            "chunk_summaries",
-            filters={"chunk_id": cid, "language": language},
-            select="summary",
-            limit=1,
-        )
+        existing = await get_chunk_summary_cache(cid, language)
         if existing:
-            summaries.append(existing[0]["summary"])
+            summaries.append(existing)
             continue
 
         # Skip unsalvageable chunks BEFORE calling the model — saves cost and
@@ -110,18 +106,7 @@ async def run_haiku_pass(
                 f"(primary={primary}, fallback={fallback}, words={word_count})"
             )
 
-        await upsert(
-            "chunk_summaries",
-            {
-                "book_id":     book_id,
-                "chunk_id":    cid,
-                "chunk_index": idx,
-                "language":    language,
-                "summary":     summary,
-                "model":       model,
-            },
-            "chunk_id,language",
-        )
+        await set_chunk_summary_cache(cid, language, summary, str(primary))
         summaries.append(summary)
 
     return summaries

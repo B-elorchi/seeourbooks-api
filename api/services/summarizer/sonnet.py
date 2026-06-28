@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from typing import AsyncIterator
 
 from api.config.settings import settings, SUMMARY_LENGTHS
@@ -7,6 +8,9 @@ from api.services.ai_client import chat_complete, chat_stream
 from api.services.summarizer.haiku import AR_TASHKEEL_INSTRUCTION
 
 log = logging.getLogger(__name__)
+
+def _strip_tashkeel(text: str) -> str:
+    return re.sub(r'[\u0617-\u061A\u064B-\u0652]', '', text)
 
 STYLE_MAP = {
     "narrative": "flowing narrative prose",
@@ -153,7 +157,7 @@ async def run_sonnet_pass(
     async for token in chat_stream(
         model=model,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=target * 2,
+        max_tokens=min(4096, target * 2),
     ):
         full += token
         yield "token", token
@@ -192,11 +196,26 @@ async def run_sonnet_pass_sync(
                            tashkeel_enabled=tashkeel_enabled)
 
     try:
-        return await chat_complete(
+        result = await chat_complete(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=target * 2,
+            max_tokens=min(4096, target * 2),
         )
+        if language == "ar":
+            clean_len = len(_strip_tashkeel(result))
+            if clean_len < 3000:
+                log.info("Arabic summary too short (%d chars without tashkeel). Expanding...", clean_len)
+                expansion_prompt = "النص السابق قصير جداً. الرجاء توسيع وتفصيل الملخص بشكل كبير ليصبح طويلاً ومفصلاً مع الحفاظ على الأسلوب المطلوب."
+                result = await chat_complete(
+                    model=model,
+                    messages=[
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": result},
+                        {"role": "user", "content": expansion_prompt}
+                    ],
+                    max_tokens=min(4096, target * 2),
+                )
+        return result
     except Exception as exc:
         if not _looks_like_context_error(exc):
             raise
@@ -215,5 +234,5 @@ async def run_sonnet_pass_sync(
         return await chat_complete(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=target * 2,
+            max_tokens=min(4096, target * 2),
         )

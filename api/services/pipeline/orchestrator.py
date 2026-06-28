@@ -215,10 +215,8 @@ def _resolve_steps(
     if ({"audio_chapters_translate", "mindmap_chapters_translate"} & steps) and not _has_translated_chapters(previous_result, source_lang):
         steps.add("translate")
 
-    if "alt_text" in steps:
-        steps.add("cover")
-    if "video" in steps:
-        steps.add("audio_full")
+    # Removed auto-injection of 'cover' and 'audio_full' per user request.
+    # The pipeline will now only run the exact steps requested.
     return steps
 
 
@@ -1125,11 +1123,15 @@ async def run_pipeline(
                     # If no DB summaries, generate them from chapter text
                     if not _db_loaded and chapters:
                         log.info("No DB chapter summaries found — generating from chapter text")
-                        haiku_conc = max(1, int(cfg.get("HAIKU_CONCURRENCY", "6")))
+                        haiku_conc = max(1, int(cfg.get("HAIKU_CONCURRENCY", "3")))
                         sem = asyncio.Semaphore(haiku_conc)
 
                         async def _summarize_chunk(ch: dict) -> dict:
                             async with sem:
+                                chunk_start = time.time()
+                                delay = float(cfg.get("DELAY_BETWEEN_CHUNKS", "0"))
+                                if delay > 0:
+                                    await asyncio.sleep(delay)
                                 chunk = {
                                     "id":          f"{req.book_id}_ch{ch['index']}",
                                     "chunk_index": ch["index"],
@@ -1149,6 +1151,8 @@ async def run_pipeline(
                                     )
                                     sums = []
                                 summary = sums[0] if sums else ""
+                                chunk_dur = time.time() - chunk_start
+                                log.info("Completed summarize pass 1 for chunk %s/%s in %.1fs", ch["index"], len(chapters), chunk_dur)
                                 return {
                                     "index":         ch["index"],
                                     "title":         ch["title"],
@@ -1182,7 +1186,7 @@ async def run_pipeline(
                     else:
                         step_status["summarize"] = "done"
                 else:
-                    haiku_conc = max(1, int(cfg.get("HAIKU_CONCURRENCY", "6")))
+                    haiku_conc = max(1, int(cfg.get("HAIKU_CONCURRENCY", "3")))
                     sem = asyncio.Semaphore(haiku_conc)
 
                     # ── Smart resume: reload already-summarized chapters ───────
@@ -1228,6 +1232,10 @@ async def run_pipeline(
 
                     async def _summarize_chunk(ch: dict) -> dict:
                         async with sem:
+                            chunk_start = time.time()
+                            delay = float(cfg.get("DELAY_BETWEEN_CHUNKS", "0"))
+                            if delay > 0:
+                                await asyncio.sleep(delay)
                             chunk = {
                                 "id":          f"{req.book_id}_ch{ch['index']}",
                                 "chunk_index": ch["index"],
@@ -1244,6 +1252,8 @@ async def run_pipeline(
                                             ch["index"], type(exc).__name__, str(exc).strip() or repr(exc))
                                 sums = []
                             summary = sums[0] if sums else ""
+                            chunk_dur = time.time() - chunk_start
+                            log.info("Completed summarize pass 1 for chunk %s/%s in %.1fs", ch["index"], len(chapters), chunk_dur)
                             return {
                                 "index":         ch["index"],
                                 "title":         ch["title"],
@@ -1274,6 +1284,7 @@ async def run_pipeline(
                     chunk_summaries = [c["summary"] for c in chapter_results if c.get("summary")]
 
                     if chunk_summaries:
+                        sonnet_start = time.time()
                         full_summary = await run_sonnet_pass_sync(
                             chunk_summaries,
                             req.options.length,
@@ -1284,6 +1295,9 @@ async def run_pipeline(
                             missing_topics=_prev_missing_topics,
                             tashkeel_enabled=tashkeel_enabled,
                         )
+                        log.info("Completed Sonnet main pass in %.1fs", time.time() - sonnet_start)
+                        
+                        review_start = time.time()
                         full_summary = await run_review_pass(
                             full_summary,
                             req.options.length,
@@ -1292,6 +1306,7 @@ async def run_pipeline(
                             model=model_haiku,
                             max_words=summary_max_words or None,
                         )
+                        log.info("Completed Haiku review pass in %.1fs", time.time() - review_start)
                         full_summary = _clean_summary(full_summary)
                         sentences = [s.strip() for s in full_summary.replace(".\n", ". ").split(". ") if s.strip()]
                         quick_summary = ". ".join(sentences[:2]) + "." if sentences else full_summary[:200]
@@ -1416,6 +1431,10 @@ async def run_pipeline(
                     )
                     if translate_step_requested:
                         step_status["translate"] = "done"
+                else:
+                    if translate_step_requested:
+                        step_status["translate"] = "failed"
+                        errors["translate"] = "Model returned empty translation"
             except Exception as exc:
                 log.warning("translation step failed: %s", exc)
                 if translate_step_requested:

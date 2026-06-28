@@ -64,6 +64,11 @@ async def set_cancelled(job_id: str) -> None:
     existing_result = job.get("result") if job else None
     update_data: dict = {"status": "cancelled", "error_msg": "Cancelled by admin"}
     if existing_result is not None:
+        if isinstance(existing_result, dict):
+            existing_result["status"] = "cancelled"
+            existing_result["running_steps"] = []
+            if "current_step" in existing_result:
+                existing_result["current_step"] = None
         update_data["result"] = existing_result
     await update("pipeline_jobs", {"id": job_id}, update_data)
 
@@ -214,7 +219,7 @@ async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None)
     for r in raw_rows:
         d = dict(r)
         d["result"] = {
-            "metadata": d.pop("metadata", None),
+            "metadata": d.get("metadata", None),
             "steps": d.pop("steps", {}),
             "current_step": d.pop("current_step", None),
             "processing_time": d.pop("processing_time", None)

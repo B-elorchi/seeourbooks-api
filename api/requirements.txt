@@ -3,6 +3,7 @@ uvicorn[standard]==0.32.1
 httpx==0.27.2
 anthropic==0.49.0
 openai==1.82.0
+cerebras-cloud-sdk==1.67.0
 boto3==1.35.0
 pydantic==2.9.2
 pydantic-settings==2.6.1
@@ -11,24 +12,24 @@ pypdf==4.3.1
 python-multipart==0.0.9
 asyncpg==0.30.0
 
-# ── Documents pipeline (PDF OCR + structured extraction) ─────────────────────
-# OCR — wraps tesseract.  System packages required on the host:
+# â”€â”€ Documents pipeline (PDF OCR + structured extraction) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# OCR â€” wraps tesseract.  System packages required on the host:
 #   apt-get install -y tesseract-ocr tesseract-ocr-ara tesseract-ocr-eng \
 #                      ghostscript ocrmypdf
 # (the python package below shells out to the system `ocrmypdf` binary)
 ocrmypdf==16.5.0
 
 # Native PDF text extraction (already-searchable PDFs skip the OCR step)
-# Pin >= 1.24.14 — earlier wheels had a "DLL load failed while importing
+# Pin >= 1.24.14 â€” earlier wheels had a "DLL load failed while importing
 # _extra" bug on Windows.
 PyMuPDF==1.24.14
 pdfplumber==0.11.4
 
-# EPUB read/write — used by inject_epub step to enrich existing books with
+# EPUB read/write â€” used by inject_epub step to enrich existing books with
 # AI-generated summaries + covers.
 EbookLib==0.18
 
-# Video generation — slideshow with TTS narration + Ken-Burns + subtitles.
+# Video generation â€” slideshow with TTS narration + Ken-Burns + subtitles.
 # moviepy shells out to ffmpeg (system package) for encoding.
 moviepy==1.0.3
 imageio==2.36.0
@@ -44,7 +45,11 @@ numpy==1.26.4
 # Audio ID3 tag writing (watermarks in MP3 files)
 mutagen==1.47.0
 
-# Supabase Auth JWT verification — both HS256 (legacy projects) and
+# Supabase Auth JWT verification â€” both HS256 (legacy projects) and
 # ES256 / RS256 via JWKS (newer projects with asymmetric signing keys).
 # The [crypto] extra pulls in `cryptography` for asymmetric algorithms.
 PyJWT[crypto]==2.10.1
+celery==5.4.0
+redis==5.0.4
+
+

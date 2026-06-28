@@ -6,6 +6,8 @@ every book ends up with BOTH an English and an Arabic summary. Translation is
 done with a configurable chat model (TRANSLATE_MODEL).
 """
 import logging
+import asyncio
+import re
 
 from api.config.settings import settings
 from api.services.ai_client import chat_complete
@@ -34,45 +36,62 @@ async def translate_summary(
     tgt_name = "Arabic" if target_lang == "ar" else "English"
     tashkeel = AR_TASHKEEL_INSTRUCTION if (target_lang == "ar" and tashkeel_enabled) else ""
 
-    prompt = (
-        f"Translate the following book summary from {src_name} into {tgt_name}.\n"
-        f"Requirements:\n"
-        f"- Produce natural, fluent, publication-quality {tgt_name} — NOT a literal "
-        f"word-for-word translation.\n"
-        f"- Preserve ALL the content, structure, paragraphs, and meaning.\n"
-        f"- Do not add, remove, or summarise — translate the whole text faithfully.\n"
-        f"- Return ONLY the translated text, no preamble or notes.{tashkeel}\n\n"
-        f"=== TEXT ({src_name}) ===\n{text}"
-    )
+    async def _translate_chunk(chunk_text: str) -> str:
+        prompt = (
+            f"Translate the following book summary from {src_name} into {tgt_name}.\n"
+            f"Requirements:\n"
+            f"- Produce natural, fluent, publication-quality {tgt_name} — NOT a literal "
+            f"word-for-word translation.\n"
+            f"- Preserve ALL the content, structure, paragraphs, and meaning.\n"
+            f"- Do not add, remove, or summarise — translate the whole text faithfully.\n"
+            f"- Return ONLY the translated text, no preamble or notes.{tashkeel}\n\n"
+            f"=== TEXT ({src_name}) ===\n{chunk_text}"
+        )
 
-    # Output token budget. Arabic — especially fully diacritised (tashkeel) —
-    # tokenises ~10-12 tokens PER WORD, far more than the source word count
-    # suggests. The old `words * 3` budget cut a ~680-word English summary to
-    # roughly a third in Arabic (truncated translation → short Arabic audio).
-    # Allocate generously when translating INTO Arabic.
-    words = len(text.split())
-    if target_lang == "ar":
-        approx_tokens = min(8000, words * 12 + 1000)
-    else:
-        approx_tokens = min(8000, words * 3 + 500)
-    try:
-        out = await chat_complete(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=approx_tokens,
-        )
-        out = (out or "").strip()
-        # Strip common preamble phrases the model adds despite the instruction.
-        # E.g. "هَذِهِ تَرْجَمَةُ النَّصِّ بِالتَّشْكِيلِ الكَامِلِ:\n\n"
-        # or   "Here is the translation:\n\n"
-        _preamble_re = (
-            r"^(هَذِهِ تَرْجَمَةُ|هذه ترجمة|إليكم الترجمة|الترجمة:|"
-            r"here is the translation|here's the translation|"
-            r"below is the translation|translation:)\s*[:\n]+"
-        )
-        import re as _re
-        out = _re.sub(_preamble_re, "", out, count=1, flags=_re.IGNORECASE).strip()
-        return out
-    except Exception as exc:
-        log.warning("translate_summary failed (%s→%s): %s", source_lang, target_lang, exc)
-        return ""
+        words = len(chunk_text.split())
+        approx_tokens = min(4096, words * 3 + 500)
+            
+        try:
+            out = await chat_complete(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=approx_tokens,
+            )
+            out = (out or "").strip()
+            # Strip common preamble phrases the model adds despite the instruction.
+            _preamble_re = (
+                r"^(هَذِهِ تَرْجَمَةُ|هذه ترجمة|إليكم الترجمة|الترجمة:|"
+                r"here is the translation|here's the translation|"
+                r"below is the translation|translation:)\s*[:\n]+"
+            )
+            out = re.sub(_preamble_re, "", out, count=1, flags=re.IGNORECASE).strip()
+            return out
+        except Exception as exc:
+            log.warning("translate_chunk failed (%s→%s): %s", source_lang, target_lang, exc)
+            return ""
+
+    # Split text into chunks to bypass max_tokens limits (especially for Arabic tashkeel)
+    paragraphs = text.split("\n\n")
+    chunks = []
+    current_chunk = []
+    current_words = 0
+    
+    for p in paragraphs:
+        w = len(p.split())
+        if current_words + w > 1500 and current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+            current_chunk = [p]
+            current_words = w
+        else:
+            current_chunk.append(p)
+            current_words += w
+            
+    if current_chunk:
+        chunks.append("\n\n".join(current_chunk))
+
+    # Translate all chunks in parallel
+    results = await asyncio.gather(*[_translate_chunk(c) for c in chunks])
+    
+    # Filter out empty results and join
+    final_text = "\n\n".join(r for r in results if r)
+    return final_text

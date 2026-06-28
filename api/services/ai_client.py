@@ -202,15 +202,24 @@ async def _fallback_enabled() -> bool:
 # ── Client factories ──────────────────────────────────────────────────────────
 
 def _is_openrouter(model: str) -> bool:
-    return "/" in model
+    return "/" in model and not model.startswith("cerebras/")
 
 
 def _is_anthropic(model: str) -> bool:
     return model.startswith("claude-") and "/" not in model
 
 
+def _is_cerebras(model: str) -> bool:
+    return model.startswith("cerebras/")
+
+
 def _anthropic_client() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+
+
+def _cerebras_client():
+    from cerebras.cloud.sdk import AsyncCerebras
+    return AsyncCerebras(api_key=settings.CEREBRAS_API_KEY)
 
 
 def _openai_client() -> openai.AsyncOpenAI:
@@ -343,7 +352,16 @@ async def _chat_complete_single(
         )
         return msg.content[0].text
 
-    # Native OpenAI
+    if _is_cerebras(model):
+        client = _cerebras_client()
+        cerebras_model = model.split("cerebras/", 1)[-1]
+        resp = await client.chat.completions.create(
+            model=cerebras_model,
+            messages=_prepend_system(system, messages),
+            max_completion_tokens=max_tokens,
+        )
+        # Usage tracking optional for cerebras if available
+        return resp.choices[0].message.content or ""    # Native OpenAI
     client = _openai_client()
     resp = await client.chat.completions.create(
         model=model,
@@ -407,6 +425,21 @@ async def chat_stream(
         async with client.messages.stream(**kwargs) as stream:
             async for token in stream.text_stream:
                 yield token
+        return
+
+    if _is_cerebras(model):
+        client = _cerebras_client()
+        cerebras_model = model.split("cerebras/", 1)[-1]
+        stream = await client.chat.completions.create(
+            model=cerebras_model,
+            messages=_prepend_system(system, messages),
+            max_completion_tokens=max_tokens,
+            stream=True,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
         return
 
     # Native OpenAI

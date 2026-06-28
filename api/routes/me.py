@@ -102,3 +102,43 @@ async def my_documents(
         log.warning("my_documents: DB unreachable — %s", exc)
         return {"count": 0, "documents": [], "error": str(exc)[:200]}
     return {"count": len(rows), "documents": rows}
+
+
+@router.get("/usage")
+async def my_usage(user: AuthUser = Depends(require_user)) -> dict:
+    """Token usage metrics (per book, per provider) for the caller's jobs. No USD costs."""
+    try:
+        # We need usage_logs joined with pipeline_jobs to know token consumption.
+        # Since find() is a wrapper around PostgREST, we can use resource embedding.
+        jobs = await find(
+            "pipeline_jobs",
+            filters=user.owner_filter(),
+            select="id, book_id, usage_logs(provider, units, unit_type)",
+            limit=1000,
+        )
+    except Exception as exc:
+        log.warning("my_usage: DB unreachable — %s", exc)
+        return {"total_tokens": 0, "by_book": {}, "by_provider": {}}
+
+    total_tokens = 0
+    by_book = Counter()
+    by_provider = Counter()
+
+    for j in jobs:
+        book_id = j.get("book_id", "unknown")
+        logs = j.get("usage_logs") or []
+        for ul in logs:
+            if ul.get("unit_type") not in ("tokens", "chars"):
+                continue
+            units = int(ul.get("units", 0))
+            provider = ul.get("provider", "unknown")
+            
+            total_tokens += units
+            by_book[book_id] += units
+            by_provider[provider] += units
+
+    return {
+        "total_tokens": total_tokens,
+        "by_book": dict(by_book.most_common()),
+        "by_provider": dict(by_provider.most_common()),
+    }
