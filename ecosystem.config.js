@@ -17,7 +17,7 @@ module.exports = {
 		{
 			name: "seeourbooks-worker",
 			script: "/usr/local/bin/celery",
-			args: "-A api.worker worker --loglevel=info --concurrency=4",
+			args: "-A api.celery_app worker --loglevel=info --concurrency=4",
 			cwd: "/home/seeourbooks/seeourbooks-api",
 			interpreter: "none",
 			autorestart: true,
