@@ -44,12 +44,13 @@ async def translate_summary(
             f"word-for-word translation.\n"
             f"- Preserve ALL the content, structure, paragraphs, and meaning.\n"
             f"- Do not add, remove, or summarise — translate the whole text faithfully.\n"
-            f"- Return ONLY the translated text, no preamble or notes.{tashkeel}\n\n"
+            f"- Return ONLY the translated text, no preamble or notes.\n"
+            f"- DO NOT repeat or include any of the original {src_name} text in your output.{tashkeel}\n\n"
             f"=== TEXT ({src_name}) ===\n{chunk_text}"
         )
 
         words = len(chunk_text.split())
-        approx_tokens = min(4096, words * 3 + 500)
+        approx_tokens = min(8192, words * 4 + 1000)
             
         try:
             out = await chat_complete(
@@ -78,7 +79,7 @@ async def translate_summary(
     
     for p in paragraphs:
         w = len(p.split())
-        if current_words + w > 1500 and current_chunk:
+        if current_words + w > 800 and current_chunk:
             chunks.append("\n\n".join(current_chunk))
             current_chunk = [p]
             current_words = w

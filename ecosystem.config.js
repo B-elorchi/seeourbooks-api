@@ -3,7 +3,7 @@ module.exports = {
 		{
 			name: "seeourbooks-api",
 			script: "/home/seeourbooks/seeourbooks-api/venv/bin/uvicorn",
-			args: "api.main:app --host 0.0.0.0 --port 8000",
+			args: "api.main:app --host 0.0.0.0 --port 8005",
 			cwd: "/home/seeourbooks/seeourbooks-api",
 			interpreter: "none",
 			autorestart: true,
