@@ -202,9 +202,9 @@ async def run_sonnet_pass_sync(
             max_tokens=min(4096, target * 2),
         )
         if language == "ar":
-            clean_len = len(_strip_tashkeel(result))
-            if clean_len < 3000:
-                log.info("Arabic summary too short (%d chars without tashkeel). Expanding...", clean_len)
+            clean_words = len(_strip_tashkeel(result).split())
+            if clean_words < 3000:
+                log.info("Arabic summary too short (%d words). Expanding...", clean_words)
                 expansion_prompt = "النص السابق قصير جداً. الرجاء توسيع وتفصيل الملخص بشكل كبير ليصبح طويلاً ومفصلاً مع الحفاظ على الأسلوب المطلوب."
                 result = await chat_complete(
                     model=model,
