@@ -147,7 +147,7 @@ async def get_output(book_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
-async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None) -> list[dict]:
+async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None, date_filter: str | None = None) -> list[dict]:
     """
     Return a lightweight job list — only the columns needed by the sidebar.
     On Postgres: extracts result->'metadata' (title, author) instead of the
@@ -174,11 +174,16 @@ async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None)
         "done":    "status = 'done'",
         "failed":  "status IN ('failed', 'partial', 'cancelled')",
     }
-    where = _STATUS_CLAUSES.get(status or "", "") if status else ""
+    where_parts = []
+    if status and status in _STATUS_CLAUSES:
+        where_parts.append(_STATUS_CLAUSES[status])
+    if date_filter:
+        where_parts.append(f"DATE(created_at) = '{date_filter}'")
+    where_str = " AND ".join(where_parts)
 
     if settings.DB_BACKEND == "postgres":
         from api.services.db._postgres import _pool_or_raise
-        where_clause = f"WHERE {where}" if where else ""
+        where_clause = f"WHERE {where_str}" if where_str else ""
         sql = f"""
             SELECT id, book_id, status, created_at, input, retry_count, max_retries,
                    result->'metadata' AS metadata,
@@ -196,7 +201,9 @@ async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None)
     else:
         # Supabase fallback
         filters = {}
-        if where:
+        if date_filter:
+            filters["created_at"] = ("gte", f"{date_filter}T00:00:00Z")
+        if status:
             # Map simplified status labels to Supabase filter format
             if status == "running":
                 filters["status"] = ("in", ["running", "queued"])
