@@ -15,9 +15,34 @@ MAX_RETRIES = 8  # auto-retry attempts after first failure (QA + network + model
 _cancelled_jobs: set[str] = set()
 
 
-def is_cancelled(job_id: str) -> bool:
+async def is_cancelled(job_id: str) -> bool:
     """Return True if a cancel has been requested for this job."""
-    return job_id in _cancelled_jobs
+    if job_id in _cancelled_jobs:
+        return True
+    
+    from api.config.settings import settings
+    if settings.DB_BACKEND == "postgres":
+        from api.services.db._postgres import _pool_or_raise
+        sql = "SELECT status FROM pipeline_jobs WHERE id = "
+        try:
+            async with _pool_or_raise().acquire() as conn:
+                row = await conn.fetchrow(sql, job_id)
+                if row and row["status"] == "cancelled":
+                    _cancelled_jobs.add(job_id)
+                    return True
+        except Exception:
+            pass
+    else:
+        from api.services.db._supabase import find
+        try:
+            res = await find("pipeline_jobs", filters={"id": job_id}, select="status")
+            if res and res[0].get("status") == "cancelled":
+                _cancelled_jobs.add(job_id)
+                return True
+        except Exception:
+            pass
+            
+    return False
 
 
 async def create_job(book_id: str, input_data: dict, user_id: str | None = None) -> str:

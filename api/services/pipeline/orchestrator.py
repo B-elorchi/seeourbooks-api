@@ -841,7 +841,7 @@ async def run_pipeline(
     async def _checkpoint() -> None:
         if not job_id:
             return
-        if is_cancelled(job_id):
+        if await is_cancelled(job_id):
             raise JobCancelledError(f"Job {job_id} was cancelled")
         try:
             lang = req.language

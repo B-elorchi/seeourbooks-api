@@ -224,7 +224,7 @@ async def _ingest_then_run(
             return
 
         # Check for cancellation between ingest and pipeline phases.
-        if is_cancelled(job_id):
+        if await is_cancelled(job_id):
             await set_cancelled(job_id)
             return
 
