@@ -256,6 +256,24 @@ def _extract_image_url_from_message(message: dict) -> str | None:
     if isinstance(content, str) and content.startswith("data:"):
         return content
 
+    # Path 4: tool_calls (some OpenRouter models return image data via a tool call)
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        for tc in tool_calls:
+            if isinstance(tc, dict) and tc.get("type") == "function":
+                func = tc.get("function")
+                if isinstance(func, dict):
+                    args = func.get("arguments")
+                    if isinstance(args, str):
+                        import json
+                        try:
+                            args_json = json.loads(args)
+                            if "url" in args_json: return args_json["url"]
+                            if "image_url" in args_json: return args_json["image_url"]
+                            if "image" in args_json: return args_json["image"]
+                        except Exception:
+                            pass
+
     return None
 
 
