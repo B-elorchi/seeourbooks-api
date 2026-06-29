@@ -1579,10 +1579,8 @@ async def run_pipeline(
                 return
             if audio_blocked:
                 step_status["audio_full"] = "failed"
-                errors["audio_full"] = (
-                    f"Blocked: summary coverage {summary_qa.get('score')}% is below the "
-                    f"required {qa_threshold}%. Improve the summary, then retry."
-                )
+                _reason = "some chapters failed to summarize." if _summarize_partial else f"summary coverage {summary_qa.get('score')}% is below the required {qa_threshold}%."
+                errors["audio_full"] = f"Blocked: {_reason} Improve the summary, then retry."
                 await _persist_step_result(job_id, "audio_full", "failed",
                                            error_msg=errors["audio_full"])
                 await _checkpoint()
@@ -1640,10 +1638,8 @@ async def run_pipeline(
                 return
             if audio_blocked:
                 step_status["audio_chapters"] = "failed"
-                errors["audio_chapters"] = (
-                    f"Blocked: summary coverage {summary_qa.get('score')}% is below the "
-                    f"required {qa_threshold}%. Improve the summary, then retry."
-                )
+                _reason = "some chapters failed to summarize." if _summarize_partial else f"summary coverage {summary_qa.get('score')}% is below the required {qa_threshold}%."
+                errors["audio_chapters"] = f"Blocked: {_reason} Improve the summary, then retry."
                 await _persist_step_result(job_id, "audio_chapters", "failed",
                                            error_msg=errors["audio_chapters"])
                 await _checkpoint()
@@ -1750,10 +1746,8 @@ async def run_pipeline(
                 return
             if audio_blocked:
                 step_status["audio_full_translate"] = "failed"
-                errors["audio_full_translate"] = (
-                    f"Blocked: summary coverage {summary_qa.get('score')}% is below the "
-                    f"required {qa_threshold}%."
-                )
+                _reason = "some chapters failed to summarize." if _summarize_partial else f"summary coverage {summary_qa.get('score')}% is below the required {qa_threshold}%."
+                errors["audio_full_translate"] = f"Blocked: {_reason}"
                 await _persist_step_result(job_id, "audio_full_translate", "failed",
                                            error_msg=errors["audio_full_translate"])
                 await _checkpoint()
@@ -1810,10 +1804,8 @@ async def run_pipeline(
                 return
             if audio_blocked:
                 step_status["audio_chapters_translate"] = "failed"
-                errors["audio_chapters_translate"] = (
-                    f"Blocked: summary coverage {summary_qa.get('score')}% is below the "
-                    f"required {qa_threshold}%."
-                )
+                _reason = "some chapters failed to summarize." if _summarize_partial else f"summary coverage {summary_qa.get('score')}% is below the required {qa_threshold}%."
+                errors["audio_chapters_translate"] = f"Blocked: {_reason}"
                 await _persist_step_result(job_id, "audio_chapters_translate", "failed",
                                            error_msg=errors["audio_chapters_translate"])
                 await _checkpoint()
