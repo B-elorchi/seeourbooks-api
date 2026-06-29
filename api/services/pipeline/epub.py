@@ -287,6 +287,8 @@ def _build_front_matter(
     translated_lang: str | None = None,
     audio_url: str | None,
     mindmap_url: str | None,
+    audio_url_translated: str | None = None,
+    mindmap_url_translated: str | None = None,
 ) -> object:
     """
     Front-matter page: full summary + full audio link + mindmap link.
@@ -326,6 +328,19 @@ def _build_front_matter(
             f'</div>'
         )
 
+    if audio_url_translated and translated_lang:
+        is_tr_arabic   = translated_lang.lower() == 'ar'
+        audio_label_tr  = 'الصوت الكامل (مترجم)' if is_tr_arabic else 'Full Audio (Translated)'
+        dl_label_tr     = 'تحميل' if is_tr_arabic else 'Download MP3'
+        body_parts.append(
+            f'<div class="asset-box">'
+            f'<h3>🎤 {audio_label_tr}</h3>'
+            f'<a class="asset-link" href="{escape(audio_url_translated)}">{escape(audio_url_translated)}</a>'
+            f'<p style="font-size:0.85em;color:#777;margin-top:0.4em">'
+            f'<a href="{escape(audio_url_translated)}">{dl_label_tr} ↓</a></p>'
+            f'</div>'
+        )
+
     # ── Mind map ──────────────────────────────────────────────────────────────
     if mindmap_url:
         mm_label = "خريطة الذهن" if is_arabic else "Mind Map"
@@ -333,6 +348,17 @@ def _build_front_matter(
             f'<div class="asset-box">'
             f'<h3>🗺 {mm_label}</h3>'
             f'<a class="asset-link" href="{escape(mindmap_url)}">{escape(mindmap_url)}</a>'
+            f'</div>'
+        )
+
+
+    if mindmap_url_translated and translated_lang:
+        is_tr_arabic   = translated_lang.lower() == 'ar'
+        mm_label_tr = 'خريطة ذهنية (مترجمة)' if is_tr_arabic else 'Mind Map (Translated)'
+        body_parts.append(
+            f'<div class="asset-box">'
+            f'<h3>🧠 {mm_label_tr}</h3>'
+            f'<a class="asset-link" href="{escape(mindmap_url_translated)}">{escape(mindmap_url_translated)}</a>'
             f'</div>'
         )
 
@@ -428,6 +454,19 @@ def _build_chapter_insights(
     body_parts.append('</div>')  # close .chapter-insights
 
     safe_slug = f"{slug}_ch{idx}"
+
+    if translated_lang:
+        tr_mm = ch.get(f"mindmap_{translated_lang}_url")
+        if tr_mm:
+            is_tr_arabic   = translated_lang.lower() == 'ar'
+            tr_mm_label    = 'خريطة ذهنية (مترجمة)' if is_tr_arabic else 'Chapter Mind Map (Translated)'
+            body_parts += [
+                f'<div class="asset-box">',
+                f'<h3>🧠 {tr_mm_label}</h3>',
+                f'<a class="asset-link" href="{escape(tr_mm)}">{escape(tr_mm)}</a>',
+                f'</div>',
+            ]
+
     html = _xhtml_page(
         uid      = safe_slug,
         title    = f"{insights_label}: {ch_title}",
@@ -535,6 +574,8 @@ def _inject_sync(
     chapter_mindmap: dict[int, dict] | None,
     audio_url: str | None,
     mindmap_url: str | None,
+    audio_url_translated: str | None = None,
+    mindmap_url_translated: str | None = None,
 ) -> None:
     try:
         from ebooklib import epub
@@ -642,6 +683,7 @@ def _inject_sync(
         summary_text=summary_text, language=language,
         translated_summary=translated_summary, translated_lang=translated_lang,
         audio_url=audio_url, mindmap_url=mindmap_url,
+        audio_url_translated=audio_url_translated, mindmap_url_translated=mindmap_url_translated,
     )
     book.add_item(front_item)
     log.info("Front matter page added: %s", front_item.file_name)
@@ -871,6 +913,8 @@ async def inject_summary_into_epub(
     chapter_mindmap: dict[int, dict] | None = None,
     audio_url:       str | None = None,
     mindmap_url:     str | None = None,
+    audio_url_translated: str | None = None,
+    mindmap_url_translated: str | None = None,
 ) -> str:
     """
     Inject AI content into `epub_path` (or create from scratch if None/missing).
@@ -887,6 +931,7 @@ async def inject_summary_into_epub(
         chapters=chapters, chapter_audio=chapter_audio,
         chapter_mindmap=chapter_mindmap,
         audio_url=audio_url, mindmap_url=mindmap_url,
+        audio_url_translated=audio_url_translated, mindmap_url_translated=mindmap_url_translated,
     )
     await loop.run_in_executor(None, fn)
     return output_path

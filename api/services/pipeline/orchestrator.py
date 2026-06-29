@@ -2358,6 +2358,8 @@ async def run_pipeline(
                     chapter_mindmap  = chapter_mindmap,
                     audio_url        = (full_audio or {}).get("url"),
                     mindmap_url      = mindmap_url,
+                    audio_url_translated   = (translated_audio or {}).get("url") if "translated_audio" in locals() else None,
+                    mindmap_url_translated = translated_mindmap_url if "translated_mindmap_url" in locals() else None,
                 )
                 # Storage key uses the clean filename: books/{id}/{id}_{lang}.epub
                 key = f"books/{req.book_id}/{req.book_id}_{req.language}.epub"
