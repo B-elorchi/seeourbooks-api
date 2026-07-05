@@ -61,7 +61,7 @@ async def _reduce_chunk_summaries(
 
     lang_name   = "Arabic" if language == "ar" else "English"
     batch_budget = max(max_chars // 3, 20_000)
-    sem = asyncio.Semaphore(4)   # bound fan-out so we don't trip rate limits
+    sem = asyncio.Semaphore(10)   # bound fan-out so we don't trip rate limits
 
     async def _reduce_one(batch: list[str]) -> str:
         combined = "\n\n---\n\n".join(batch)

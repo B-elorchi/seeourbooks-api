@@ -41,10 +41,10 @@ from html.parser import HTMLParser
 import asyncio
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import APIRouter, BackgroundTasks, Request
+from pydantic import BaseModel, Field
 
-from api.jobs.store import create_job, set_failed, set_cancelled, is_cancelled, get_output
+from api.jobs.store import create_job, set_failed, set_cancelled, is_cancelled, get_output, list_jobs
 from api.models.requests import PipelineReq, PipelineOptions, VALID_STEPS
 from api.routes.pipeline import _run_job, JobCancelledError
 from api.services.db import find, insert, upsert, update
@@ -68,6 +68,7 @@ class V2PipelineReq(BaseModel):
     source:   str = "catalog"
     steps:    list[str] = []
     options:  PipelineOptions = PipelineOptions()
+    force:    bool = False
 
     def validate_steps(self) -> None:
         unknown = [s for s in self.steps if s not in VALID_STEPS]
@@ -136,13 +137,14 @@ async def v2_pipeline_run(req: V2PipelineReq, background_tasks: BackgroundTasks,
     # Look for a previous completed/partial result so we can reuse existing
     # summaries when the user only asks for a subset of steps (e.g. just cover).
     previous_result = None
-    try:
-        prev_job = await get_output(book_id)
-        if prev_job:
-            previous_result = prev_job.get("result")
-            log.info("v2: found previous result for book %s — will reuse done steps", book_id)
-    except Exception as exc:
-        log.debug("v2: could not load previous result for %s: %s", book_id, exc)
+    if not req.force:
+        try:
+            prev_job = await get_output(book_id)
+            if prev_job:
+                previous_result = prev_job.get("result")
+                log.info("v2: found previous result for book %s — will reuse done steps", book_id)
+        except Exception as exc:
+            log.debug("v2: could not load previous result for %s: %s", book_id, exc)
 
     # Attach user_id from API key if present
     api_user = await get_api_key_user(request)
@@ -745,3 +747,15 @@ def _strip_gutenberg(text: str) -> str:
             end_pos = idx
             break
     return text[start_pos:end_pos].strip()
+
+@router.get("/my-jobs")
+async def get_my_jobs(request: Request, limit: int = 50, offset: int = 0, status: str | None = None, date: str | None = None):
+    api_user = await get_api_key_user(request)
+    user_id = api_user.user_id if api_user else None
+    
+    try:
+        return await list_jobs(limit=limit, offset=offset, status=status or None, date_filter=date or None, user_id=user_id)
+    except Exception as exc:
+        log.warning("my-jobs: DB unreachable - %s", exc)
+        return []
+

@@ -12,24 +12,29 @@ pypdf==4.3.1
 python-multipart==0.0.9
 asyncpg==0.30.0
 
-# â”€â”€ Documents pipeline (PDF OCR + structured extraction) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# OCR â€” wraps tesseract.  System packages required on the host:
+# ── Documents pipeline (PDF OCR + structured extraction) ──────────────────────
+# OCR — wraps tesseract.  System packages required on the host:
 #   apt-get install -y tesseract-ocr tesseract-ocr-ara tesseract-ocr-eng \
 #                      ghostscript ocrmypdf
 # (the python package below shells out to the system `ocrmypdf` binary)
 ocrmypdf==16.5.0
 
 # Native PDF text extraction (already-searchable PDFs skip the OCR step)
-# Pin >= 1.24.14 â€” earlier wheels had a "DLL load failed while importing
+# Pin >= 1.24.14 — earlier wheels had a "DLL load failed while importing
 # _extra" bug on Windows.
 PyMuPDF==1.24.14
 pdfplumber==0.11.4
 
-# EPUB read/write â€” used by inject_epub step to enrich existing books with
+# EPUB read/write — used by inject_epub step to enrich existing books with
 # AI-generated summaries + covers.
 EbookLib==0.18
 
-# Video generation â€” slideshow with TTS narration + Ken-Burns + subtitles.
+# YouTube transcript extraction — used by /api/document/youtube. v1.x replaced
+# the YouTubeTranscriptApi.get_transcript() classmethod with an instance method
+# (YouTubeTranscriptApi().fetch(...)) — keep the route code and this pin in sync.
+youtube-transcript-api==1.2.4
+
+# Video generation — slideshow with TTS narration + Ken-Burns + subtitles.
 # moviepy shells out to ffmpeg (system package) for encoding.
 moviepy==1.0.3
 imageio==2.36.0
@@ -45,11 +50,9 @@ numpy==1.26.4
 # Audio ID3 tag writing (watermarks in MP3 files)
 mutagen==1.47.0
 
-# Supabase Auth JWT verification â€” both HS256 (legacy projects) and
+# Supabase Auth JWT verification — both HS256 (legacy projects) and
 # ES256 / RS256 via JWKS (newer projects with asymmetric signing keys).
 # The [crypto] extra pulls in `cryptography` for asymmetric algorithms.
 PyJWT[crypto]==2.10.1
 celery==5.4.0
 redis==5.0.4
-
-

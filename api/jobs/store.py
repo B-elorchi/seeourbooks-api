@@ -172,7 +172,7 @@ async def get_output(book_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
-async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None, date_filter: str | None = None) -> list[dict]:
+async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None, date_filter: str | None = None, user_id: str | None = None) -> list[dict]:
     """
     Return a lightweight job list — only the columns needed by the sidebar.
     On Postgres: extracts result->'metadata' (title, author) instead of the
@@ -199,16 +199,30 @@ async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None,
         "done":    "status = 'done'",
         "failed":  "status IN ('failed', 'partial', 'cancelled')",
     }
-    where_parts = []
-    if status and status in _STATUS_CLAUSES:
-        where_parts.append(_STATUS_CLAUSES[status])
-    if date_filter:
-        where_parts.append(f"DATE(created_at) = '{date_filter}'")
-    where_str = " AND ".join(where_parts)
 
     if settings.DB_BACKEND == "postgres":
         from api.services.db._postgres import _pool_or_raise
-        where_clause = f"WHERE {where_str}" if where_str else ""
+        # Build the WHERE clause with parameter PLACEHOLDERS only — never
+        # interpolate caller-controlled values (date_filter, user_id) directly
+        # into the SQL string. All real values are passed positionally to
+        # conn.fetch() below, so asyncpg escapes them safely.
+        where_parts: list[str] = []
+        params: list = []
+        if status and status in _STATUS_CLAUSES:
+            where_parts.append(_STATUS_CLAUSES[status])
+        if date_filter:
+            params.append(date_filter)
+            where_parts.append(f"DATE(created_at) = ${len(params)}")
+        if user_id:
+            params.append(user_id)
+            where_parts.append(f"user_id = ${len(params)}")
+        where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+        params.append(limit)
+        limit_idx = len(params)
+        params.append(offset)
+        offset_idx = len(params)
+
         sql = f"""
             SELECT id, book_id, status, created_at, input, retry_count, max_retries,
                    result->'metadata' AS metadata,
@@ -218,10 +232,10 @@ async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None,
             FROM pipeline_jobs
             {where_clause}
             ORDER BY created_at DESC
-            LIMIT $1 OFFSET $2
+            LIMIT ${limit_idx} OFFSET ${offset_idx}
         """
         async with _pool_or_raise().acquire() as conn:
-            rows = await conn.fetch(sql, limit, offset)
+            rows = await conn.fetch(sql, *params)
         raw_rows = [dict(r) for r in rows]
     else:
         # Supabase fallback
@@ -236,7 +250,9 @@ async def list_jobs(limit: int = 50, offset: int = 0, status: str | None = None,
                 filters["status"] = "done"
             elif status == "failed":
                 filters["status"] = ("in", ["failed", "partial", "cancelled"])
-        
+        if user_id:
+            filters["user_id"] = user_id
+
         raw_rows = await find(
             "pipeline_jobs",
             filters=filters or None,
