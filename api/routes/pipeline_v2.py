@@ -50,10 +50,25 @@ from api.routes.pipeline import _run_job, JobCancelledError
 from api.services.db import find, insert, upsert, update
 from api.services.config.runtime import get_config_value
 from api.auth.apikey import get_api_key_user
+from api.auth import get_current_user
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v2/pipeline")
+
+
+async def _resolve_user_id(request: Request) -> str | None:
+    """
+    Resolve the calling user's id from either auth scheme this endpoint accepts:
+      1. Supabase JWT (Authorization: Bearer ...) — used by the omni client.
+      2. X-API-Key — used by server-to-server integrations.
+    Tried in that order; returns None if neither is present (anonymous/admin call).
+    """
+    user = await get_current_user(request)
+    if user:
+        return user.id
+    api_user = await get_api_key_user(request)
+    return api_user.user_id if api_user else None
 
 # Global concurrency limit for top-level pipeline jobs.
 # Prevents a batch of 100 books from concurrently opening 100 DB connections
@@ -146,9 +161,8 @@ async def v2_pipeline_run(req: V2PipelineReq, background_tasks: BackgroundTasks,
         except Exception as exc:
             log.debug("v2: could not load previous result for %s: %s", book_id, exc)
 
-    # Attach user_id from API key if present
-    api_user = await get_api_key_user(request)
-    user_id = api_user.user_id if api_user else None
+    # Attach the calling user's id (Supabase JWT or API key) if present.
+    user_id = await _resolve_user_id(request)
 
     # Create the job row now so the client gets an id to poll immediately.
     job_id = await create_job(book_id, pipeline_req.model_dump(), user_id=user_id)
@@ -750,9 +764,14 @@ def _strip_gutenberg(text: str) -> str:
 
 @router.get("/my-jobs")
 async def get_my_jobs(request: Request, limit: int = 50, offset: int = 0, status: str | None = None, date: str | None = None):
-    api_user = await get_api_key_user(request)
-    user_id = api_user.user_id if api_user else None
-    
+    # NOTE: the omni client authenticates via Supabase JWT (Authorization: Bearer),
+    # not X-API-Key — resolving only the API-key user here left user_id always
+    # None, so every caller saw every user's jobs. _resolve_user_id checks both.
+    user_id = await _resolve_user_id(request)
+    if not user_id:
+        # No verified identity — never return the unfiltered global job list.
+        return []
+
     try:
         return await list_jobs(limit=limit, offset=offset, status=status or None, date_filter=date or None, user_id=user_id)
     except Exception as exc:
