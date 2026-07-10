@@ -429,6 +429,7 @@ def _extract_youtube_transcript_sync(video_id: str, languages: list[str]) -> tup
     must run this in a thread executor. Returns (transcript_text, title, uploader).
     """
     import yt_dlp
+    from api.config.settings import settings  # noqa: PLC0415
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     ydl_opts = {
@@ -440,6 +441,16 @@ def _extract_youtube_transcript_sync(video_id: str, languages: list[str]) -> tup
         "no_warnings": True,
         "logger": log,  # route yt-dlp's own messages through our logger instead of stderr
     }
+    cookies_file = settings.YOUTUBE_COOKIES_FILE
+    if cookies_file and os.path.exists(cookies_file):
+        # Authenticated requests are much less likely to hit YouTube's
+        # "Sign in to confirm you're not a bot" challenge than anonymous
+        # requests from a datacenter IP.
+        ydl_opts["cookiefile"] = cookies_file
+    elif cookies_file:
+        log.warning("YOUTUBE_COOKIES_FILE=%s is set but the file does not exist — "
+                    "fetching without cookies", cookies_file)
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 

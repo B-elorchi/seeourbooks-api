@@ -156,6 +156,14 @@ class Settings(BaseSettings):
     # Leave empty to disable EPUB injection entirely.
     BOOK_FILES_BASE_URL: str = ""
 
+    # ── YouTube transcript extraction (yt-dlp) ────────────────────────────────
+    # Path to a Netscape-format cookies.txt on this host, exported from a real,
+    # logged-in YouTube session in a browser (e.g. via the "Get cookies.txt
+    # LOCALLY" extension). Authenticated requests are far less likely to hit
+    # YouTube's "Sign in to confirm you're not a bot" challenge than anonymous
+    # datacenter-IP requests. Leave empty to fetch without cookies.
+    YOUTUBE_COOKIES_FILE: str = ""
+
     # ── Video generation (slideshow with TTS narration) ──────────────────────
     # Provider:
     #   moviepy      — CPU-only, ships everywhere, ~$0 marginal cost (default)
