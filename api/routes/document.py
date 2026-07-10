@@ -23,6 +23,8 @@ Document upload route:
     5. Pipeline   — same engine as /api/pipeline/run (summary, cover,
                     audio, mindmap, epub …).
 """
+import asyncio
+import functools
 import json as json_module
 import logging
 import os
@@ -388,17 +390,102 @@ class YouTubeReq(BaseModel):
     language: str = "en"
     steps: str = ""
 
+
+def _json3_events_to_text(data: dict) -> str:
+    """Flatten a YouTube json3 caption payload into plain text, one line per event."""
+    lines = []
+    for event in data.get("events", []):
+        text = "".join(seg.get("utf8", "") for seg in (event.get("segs") or [])).strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def _plain_subtitle_to_text(raw: str) -> str:
+    """Fallback parser for vtt/srv/ttml caption formats — strips markup, timestamps,
+    and sequence numbers, keeping only the spoken text lines."""
+    text = re.sub(r"<[^>]+>", "", raw)
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.upper().startswith("WEBVTT"):
+            continue
+        if re.match(r"^\d+$", line):          # srv sequence number
+            continue
+        if "-->" in line or re.match(r"^\d{2}:\d{2}", line):  # timestamp line
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _extract_youtube_transcript_sync(video_id: str, languages: list[str]) -> tuple[str, str, str]:
+    """
+    Fetch a YouTube video's captions via yt-dlp (replaces youtube-transcript-api,
+    which was getting IP-blocked by YouTube on most requests from this server —
+    see api/requirements.txt for details). yt-dlp emulates several official
+    YouTube client types internally and is far more resilient to that blocking.
+
+    Runs synchronously — yt-dlp's Python API has no async form — so callers
+    must run this in a thread executor. Returns (transcript_text, title, uploader).
+    """
+    import yt_dlp
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    ydl_opts = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": languages,
+        "quiet": True,
+        "no_warnings": True,
+        "logger": log,  # route yt-dlp's own messages through our logger instead of stderr
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    title = info.get("title") or f"YouTube Video {video_id}"
+    uploader = info.get("uploader") or "YouTube"
+
+    manual = info.get("subtitles") or {}
+    auto = info.get("automatic_captions") or {}
+
+    # Manual (human-uploaded) captions are higher quality than auto-generated
+    # ones, so prefer them for each language before falling back to auto.
+    track = None
+    for lang in languages:
+        track = manual.get(lang) or auto.get(lang)
+        if track:
+            break
+    if not track:
+        # Nothing in the requested languages — fall back to any manual track
+        # rather than failing outright.
+        for entries in manual.values():
+            track = entries
+            break
+    if not track:
+        raise RuntimeError(f"No captions available for video {video_id} in {languages}")
+
+    entry = next((e for e in track if e.get("ext") == "json3"), track[0])
+    resp = httpx.get(entry["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    resp.raise_for_status()
+
+    if entry.get("ext") == "json3":
+        full_text = _json3_events_to_text(resp.json())
+    else:
+        full_text = _plain_subtitle_to_text(resp.text)
+
+    if not full_text.strip():
+        raise RuntimeError(f"Captions for video {video_id} were empty after parsing")
+
+    return full_text, title, uploader
+
+
 @router.post("/youtube", status_code=202)
 async def youtube_upload(
     req: YouTubeReq,
     background_tasks: BackgroundTasks,
     user: AuthUser | None = Depends(get_current_user),
 ):
-    import re
-    import uuid
-    from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api.formatters import TextFormatter
-
     # Extract video ID
     match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", req.url)
     if not match:
@@ -406,33 +493,30 @@ async def youtube_upload(
     video_id = match.group(1)
 
     try:
-        # youtube-transcript-api v1.x dropped the YouTubeTranscriptApi.get_transcript()
-        # classmethod in favour of an instance method: ytt_api.fetch(...).
-        fetched_transcript = YouTubeTranscriptApi().fetch(video_id, languages=['en', 'ar'])
-        formatter = TextFormatter()
-        full_text = formatter.format_transcript(fetched_transcript)
+        loop = asyncio.get_running_loop()
+        fn = functools.partial(_extract_youtube_transcript_sync, video_id, ["en", "ar"])
+        full_text, video_title, uploader = await loop.run_in_executor(None, fn)
     except Exception as e:
         log.exception("Failed to fetch YouTube transcript")
         raise HTTPException(400, f"Could not extract transcript: {e}")
 
     book_id = f"yt_{video_id}_{uuid.uuid4().hex[:4]}"
-    title = f"YouTube Video {video_id}"
     steps_list = [s.strip() for s in req.steps.split(",") if s.strip()]
 
     placeholder_req = PipelineReq(
         book_id=book_id,
-        title=title,
+        title=video_title,
         language=req.language,
         steps=steps_list,
         options=PipelineOptions(length="10min", style="narrative"),
         source="youtube",
     )
-    
+
     job_id = await create_job(book_id, placeholder_req.model_dump(), user_id=user.id if user else None)
 
     background_tasks.add_task(
         _run_youtube_pipeline,
-        job_id, book_id, title, full_text, req.language, steps_list
+        job_id, book_id, video_title, uploader, full_text, req.language, steps_list
     )
 
     return {
@@ -446,6 +530,7 @@ async def _run_youtube_pipeline(
     job_id: str,
     book_id: str,
     title: str,
+    author: str,
     full_text: str,
     language: str,
     steps_list: list[str],
@@ -457,11 +542,11 @@ async def _run_youtube_pipeline(
         chapters = _split_chapters(full_text)
         if not chapters:
             chapters = [Chapter(index=1, title="Transcript", text=full_text)]
-            
+
         req = PipelineReq(
             book_id=book_id,
             title=title,
-            author="YouTube",
+            author=author,
             language=language,
             chapters=chapters,
             steps=steps_list,

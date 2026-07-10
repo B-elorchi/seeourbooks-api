@@ -29,10 +29,16 @@ pdfplumber==0.11.4
 # AI-generated summaries + covers.
 EbookLib==0.18
 
-# YouTube transcript extraction — used by /api/document/youtube. v1.x replaced
-# the YouTubeTranscriptApi.get_transcript() classmethod with an instance method
-# (YouTubeTranscriptApi().fetch(...)) — keep the route code and this pin in sync.
-youtube-transcript-api==1.2.4
+# YouTube transcript extraction — used by /api/document/youtube.
+# Replaced youtube-transcript-api: it scrapes the plain web watch page only,
+# and was getting IP-blocked by YouTube on the large majority of requests
+# from this server (cloud/datacenter IPs are broadly pre-flagged regardless
+# of request volume). yt-dlp emulates several official YouTube client types
+# internally and is far more resilient — it's also updated within days
+# whenever YouTube changes its extraction defenses, so unlike the rest of
+# this file it's worth bumping this pin periodically rather than leaving it
+# fixed indefinitely.
+yt-dlp==2026.7.4
 
 # Video generation — slideshow with TTS narration + Ken-Burns + subtitles.
 # moviepy shells out to ffmpeg (system package) for encoding.
