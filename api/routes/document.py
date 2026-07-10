@@ -447,6 +447,18 @@ def _extract_youtube_transcript_sync(video_id: str, languages: list[str]) -> tup
         # or otherwise download-blocked even though captions are readable).
         # This makes that failure non-fatal so caption extraction still proceeds.
         "ignore_no_formats_error": True,
+        # Explicitly try multiple internal YouTube client types instead of
+        # letting yt-dlp auto-select just one. When cookies are present,
+        # yt-dlp tends to prefer the "web" client (cookie-based auth), which
+        # has stricter PO-token requirements and can silently return an empty
+        # caption list for some videos. android_vr/android don't have that
+        # limitation and are tried first here; web is kept as a fallback for
+        # anything that specifically requires cookie auth.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android_vr", "android", "web"],
+            }
+        },
     }
     cookies_file = settings.YOUTUBE_COOKIES_FILE
     if cookies_file and os.path.exists(cookies_file):
