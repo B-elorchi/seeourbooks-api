@@ -440,6 +440,13 @@ def _extract_youtube_transcript_sync(video_id: str, languages: list[str]) -> tup
         "quiet": True,
         "no_warnings": True,
         "logger": log,  # route yt-dlp's own messages through our logger instead of stderr
+        # We only need captions, never a video/audio stream (skip_download=True
+        # above), but yt-dlp still resolves a download format as part of
+        # building info_dict and raises a hard "Requested format is not
+        # available" error if the video has none (e.g. members-only, restricted,
+        # or otherwise download-blocked even though captions are readable).
+        # This makes that failure non-fatal so caption extraction still proceeds.
+        "ignore_no_formats_error": True,
     }
     cookies_file = settings.YOUTUBE_COOKIES_FILE
     if cookies_file and os.path.exists(cookies_file):
