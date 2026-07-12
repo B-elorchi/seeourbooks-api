@@ -482,16 +482,29 @@ def _extract_youtube_transcript_sync(video_id: str, languages: list[str]) -> tup
     # Manual (human-uploaded) captions are higher quality than auto-generated
     # ones, so prefer them for each language before falling back to auto.
     track = None
+    
+    # 1. Exact match in requested languages
     for lang in languages:
         track = manual.get(lang) or auto.get(lang)
         if track:
             break
+            
+    # 2. Prefix match in requested languages (e.g. 'en-US' or 'en-orig' for 'en')
     if not track:
-        # Nothing in the requested languages — fall back to any manual track
-        # rather than failing outright.
-        for entries in manual.values():
-            track = entries
-            break
+        for lang in languages:
+            track = next((manual[k] for k in manual if k.startswith(f"{lang}-")), None)
+            if track: break
+            track = next((auto[k] for k in auto if k.startswith(f"{lang}-")), None)
+            if track: break
+
+    # 3. Fallback to ANY manual track
+    if not track and manual:
+        track = next(iter(manual.values()))
+
+    # 4. Fallback to ANY automatic track
+    if not track and auto:
+        track = next(iter(auto.values()))
+
     if not track:
         raise RuntimeError(f"No captions available for video {video_id} in {languages}")
 
