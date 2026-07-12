@@ -479,6 +479,8 @@ def _extract_youtube_transcript_sync(video_id: str, languages: list[str]) -> tup
     manual = info.get("subtitles") or {}
     auto = info.get("automatic_captions") or {}
 
+    log.info("yt-dlp subtitles: manual keys=%s, auto keys=%s", list(manual.keys()), list(auto.keys()))
+
     # Manual (human-uploaded) captions are higher quality than auto-generated
     # ones, so prefer them for each language before falling back to auto.
     track = None
