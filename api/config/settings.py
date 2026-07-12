@@ -164,7 +164,10 @@ class Settings(BaseSettings):
     # datacenter-IP requests. Leave empty to fetch without cookies.
     YOUTUBE_COOKIES_FILE: str = ""
 
-    # ── Video generation (slideshow with TTS narration) ──────────────────────
+    # Optional proxy for YouTube if the server IP is hard-banned (e.g. "http://user:pass@ip:port")
+    YOUTUBE_PROXY: str = ""
+
+    # 🎬 Video generation (slideshow with TTS narration) ──────────────────────
     # Provider:
     #   moviepy      — CPU-only, ships everywhere, ~$0 marginal cost (default)
     #   svd          — Stable Video Diffusion (needs GPU host with 10GB+ VRAM)

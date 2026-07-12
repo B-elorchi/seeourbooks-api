@@ -460,6 +460,9 @@ def _extract_youtube_transcript_sync(video_id: str, languages: list[str]) -> tup
             }
         },
     }
+    if settings.YOUTUBE_PROXY:
+        ydl_opts["proxy"] = settings.YOUTUBE_PROXY
+
     cookies_file = settings.YOUTUBE_COOKIES_FILE
     if cookies_file and os.path.exists(cookies_file):
         # Authenticated requests are much less likely to hit YouTube's
