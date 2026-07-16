@@ -239,11 +239,12 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
 
-    # ── Supabase Auth ─────────────────────────────────────────────────────────
-    # JWT secret for verifying Supabase-issued access tokens.
-    # Get it from: Supabase Dashboard → Project Settings → API → JWT Secret.
-    # When EMPTY, auth is DISABLED — all endpoints stay public (good for local dev).
-    SUPABASE_JWT_SECRET: str = ""
+    # ── Authentication ─────────────────────────────────────────────────────────
+    # If using WordPress JWT Auth, set the secret here to verify tokens.
+    # Leave empty to disable auth entirely.
+    WP_JWT_SECRET: str = ""
+    # Example: "https://boutaina.elorchi.com"
+    WP_API_URL: str = ""
     # Comma-separated emails that grant the "admin" role.
     # Anyone NOT in this list is treated as a normal user.
     # Leave empty to make every authenticated user an admin (single-tenant mode).
