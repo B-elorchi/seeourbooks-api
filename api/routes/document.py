@@ -553,14 +553,38 @@ def _extract_youtube_transcript_sync(video_id: str, languages: list[str]) -> tup
         raise RuntimeError(f"No captions available for video {video_id} in {languages}")
 
     entry = next((e for e in track if e.get("ext") == "json3"), track[0])
+    target_url = entry["url"]
     
     client_args = {"headers": {"User-Agent": "Mozilla/5.0"}, "timeout": 30.0}
     if settings.YOUTUBE_PROXY:
         client_args["proxy"] = settings.YOUTUBE_PROXY
         
+    from urllib.parse import quote
+    
+    proxies = [
+        target_url, # Direct or via YOUTUBE_PROXY
+        f"https://api.allorigins.win/raw?url={quote(target_url, safe='')}",
+        f"https://corsproxy.io/?{quote(target_url, safe='')}",
+        f"https://api.codetabs.com/v1/proxy?quest={target_url}",
+        f"https://thingproxy.freeboard.io/fetch/{quote(target_url, safe='')}"
+    ]
+    
+    resp = None
+    last_error = None
     with httpx.Client(**client_args) as client:
-        resp = client.get(entry["url"])
-        resp.raise_for_status()
+        for p_url in proxies:
+            try:
+                resp = client.get(p_url)
+                resp.raise_for_status()
+                break
+            except Exception as e:
+                log.warning(f"YouTube transcript proxy {p_url} failed: {e}")
+                last_error = e
+                resp = None
+                continue
+                
+    if not resp:
+        raise RuntimeError(f"Failed to fetch YouTube subtitles through all proxies: {last_error}")
 
     if entry.get("ext") == "json3":
         full_text = _json3_events_to_text(resp.json())
