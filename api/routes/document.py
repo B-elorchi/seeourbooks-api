@@ -49,15 +49,54 @@ router = APIRouter(prefix="/document", tags=["document"])
 from fastapi.responses import StreamingResponse
 import httpx
 
+epub_semaphore = asyncio.Semaphore(2)
+yt_semaphore = asyncio.Semaphore(2)
+
 @router.get("/proxy/epub")
-async def proxy_epub(url: str):
+async def proxy_epub(url: str, custom_proxy: str | None = None):
+    from api.config.settings import settings
+    from urllib.parse import quote
+    
     async def fetch_stream():
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            async with client.stream("GET", url) as response:
-                if response.status_code != 200:
-                    raise HTTPException(status_code=400, detail="Failed to fetch EPUB")
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+        async with epub_semaphore:
+            user_proxy = custom_proxy or settings.GUTENBERG_PROXY
+            
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+                if user_proxy and (user_proxy.startswith("http:") or user_proxy.startswith("https:") or user_proxy.startswith("socks5:")):
+                    client_proxy = httpx.AsyncClient(proxy=user_proxy, follow_redirects=True, timeout=60.0)
+                    try:
+                        async with client_proxy.stream("GET", url) as response:
+                            if response.status_code == 200:
+                                async for chunk in response.aiter_bytes():
+                                    yield chunk
+                                return
+                    except Exception as e:
+                        log.warning(f"Custom proxy {user_proxy} failed: {e}")
+                    finally:
+                        await client_proxy.aclose()
+                
+                # Fallback to public web proxies
+                proxies = [
+                    f"https://api.allorigins.win/raw?url={quote(url, safe='')}",
+                    f"https://corsproxy.io/?{quote(url, safe='')}",
+                    f"https://api.codetabs.com/v1/proxy?quest={url}",
+                    f"https://thingproxy.freeboard.io/fetch/{quote(url, safe='')}",
+                    url # Direct fallback
+                ]
+                
+                for p_url in proxies:
+                    try:
+                        async with client.stream("GET", p_url) as response:
+                            if response.status_code == 200:
+                                async for chunk in response.aiter_bytes():
+                                    yield chunk
+                                return
+                    except Exception as e:
+                        log.warning(f"Proxy URL {p_url} failed: {e}")
+                        continue
+                        
+                raise HTTPException(status_code=400, detail="Failed to fetch EPUB through all proxies")
+                
     return StreamingResponse(fetch_stream(), media_type="application/epub+zip")
 
 MAX_FILE_SIZE = 80 * 1024 * 1024   # 80 MB
@@ -541,9 +580,10 @@ async def youtube_upload(
     video_id = match.group(1)
 
     try:
-        loop = asyncio.get_running_loop()
-        fn = functools.partial(_extract_youtube_transcript_sync, video_id, ["en", "ar"])
-        full_text, video_title, uploader = await loop.run_in_executor(None, fn)
+        async with yt_semaphore:
+            loop = asyncio.get_running_loop()
+            fn = functools.partial(_extract_youtube_transcript_sync, video_id, ["en", "ar"])
+            full_text, video_title, uploader = await loop.run_in_executor(None, fn)
     except Exception as e:
         log.exception("Failed to fetch YouTube transcript")
         raise HTTPException(400, f"Could not extract transcript: {e}")

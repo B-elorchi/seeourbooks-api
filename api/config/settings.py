@@ -167,6 +167,9 @@ class Settings(BaseSettings):
     # Optional proxy for YouTube if the server IP is hard-banned (e.g. "http://user:pass@ip:port")
     YOUTUBE_PROXY: str = ""
 
+    # Optional proxy for Gutenberg EPUB downloading
+    GUTENBERG_PROXY: str = ""
+
     # 🎬 Video generation (slideshow with TTS narration) ──────────────────────
     # Provider:
     #   moviepy      — CPU-only, ships everywhere, ~$0 marginal cost (default)
