@@ -553,8 +553,14 @@ def _extract_youtube_transcript_sync(video_id: str, languages: list[str]) -> tup
         raise RuntimeError(f"No captions available for video {video_id} in {languages}")
 
     entry = next((e for e in track if e.get("ext") == "json3"), track[0])
-    resp = httpx.get(entry["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-    resp.raise_for_status()
+    
+    client_args = {"headers": {"User-Agent": "Mozilla/5.0"}, "timeout": 30.0}
+    if settings.YOUTUBE_PROXY:
+        client_args["proxy"] = settings.YOUTUBE_PROXY
+        
+    with httpx.Client(**client_args) as client:
+        resp = client.get(entry["url"])
+        resp.raise_for_status()
 
     if entry.get("ext") == "json3":
         full_text = _json3_events_to_text(resp.json())
@@ -579,21 +585,12 @@ async def youtube_upload(
         raise HTTPException(400, "Invalid YouTube URL")
     video_id = match.group(1)
 
-    try:
-        async with yt_semaphore:
-            loop = asyncio.get_running_loop()
-            fn = functools.partial(_extract_youtube_transcript_sync, video_id, ["en", "ar"])
-            full_text, video_title, uploader = await loop.run_in_executor(None, fn)
-    except Exception as e:
-        log.exception("Failed to fetch YouTube transcript")
-        raise HTTPException(400, f"Could not extract transcript: {e}")
-
     book_id = f"yt_{video_id}_{uuid.uuid4().hex[:4]}"
     steps_list = [s.strip() for s in req.steps.split(",") if s.strip()]
 
     placeholder_req = PipelineReq(
         book_id=book_id,
-        title=video_title,
+        title=f"YouTube Video {video_id}",
         language=req.language,
         steps=steps_list,
         options=PipelineOptions(length="10min", style="narrative"),
@@ -603,8 +600,8 @@ async def youtube_upload(
     job_id = await create_job(book_id, placeholder_req.model_dump(), user_id=user.id if user else None)
 
     background_tasks.add_task(
-        _run_youtube_pipeline,
-        job_id, book_id, video_title, uploader, full_text, req.language, steps_list
+        _run_youtube_pipeline_deferred,
+        job_id, book_id, video_id, req.language, steps_list
     )
 
     return {
@@ -613,6 +610,26 @@ async def youtube_upload(
         "status": "queued",
         "status_url": f"/api/pipeline/status/{job_id}",
     }
+
+async def _run_youtube_pipeline_deferred(
+    job_id: str,
+    book_id: str,
+    video_id: str,
+    language: str,
+    steps_list: list[str],
+) -> None:
+    from api.services.usage_logger import set_job_context
+    set_job_context(job_id)
+    try:
+        async with yt_semaphore:
+            loop = asyncio.get_running_loop()
+            fn = functools.partial(_extract_youtube_transcript_sync, video_id, ["en", "ar"])
+            full_text, video_title, uploader = await loop.run_in_executor(None, fn)
+            
+        await _run_youtube_pipeline(job_id, book_id, video_title, uploader, full_text, language, steps_list)
+    except Exception as e:
+        log.exception("Failed to fetch YouTube transcript in background")
+        await set_failed(job_id, f"Could not extract transcript: {e}")
 
 async def _run_youtube_pipeline(
     job_id: str,
